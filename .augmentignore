@@ -1,0 +1,6 @@
+proxy/logs/**
+proxy/proxy/logs/**
+proxy/.env
+proxy/.env.*
+.git/**
+node_modules/**

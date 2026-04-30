@@ -1,0 +1,5 @@
+{
+  "accessToken": "fake-augment-access-token",
+  "tenantURL": "http://127.0.0.1:8765",
+  "scopes": ["email", "profile", "offline_access"]
+}

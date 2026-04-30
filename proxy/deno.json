@@ -1,0 +1,15 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --allow-read --allow-write --watch src/server.ts",
+    "start": "deno run --allow-net --allow-env --allow-read --allow-write src/server.ts",
+    "check": "deno check src/server.ts"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.ns", "dom", "dom.iterable"]
+  },
+  "fmt": {
+    "semiColons": true,
+    "singleQuote": false
+  }
+}
