@@ -425,3 +425,278 @@ The operation was aborted due to timeout
 ```
 
 restart proxy after pulling the latest code so the optimized lookup is active.
+
+## Hooks, MCP, And Commands
+
+This section summarizes the extension points found from `augment.mjs` and the official `auggie/` examples cloned in this workspace.
+
+### Custom Slash Commands
+
+Auggie supports reusable slash commands as Markdown files.
+
+Project-local commands:
+
+```text
+.augment/commands/code-review.md
+.augment/commands/tests.md
+```
+
+User-global commands:
+
+```text
+~/.augment/commands/code-review.md
+```
+
+Example command file:
+
+```markdown
+---
+description: Review a file for correctness and maintainability
+---
+
+Review the target file or directory: $ARGUMENTS
+
+Focus on:
+- bugs
+- security
+- maintainability
+- tests
+```
+
+Usage:
+
+```bash
+auggie "/code-review proxy/src"
+```
+
+The official examples are in:
+
+```text
+auggie/examples/commands/
+```
+
+### `.augmentignore`
+
+Auggie indexing respects `.gitignore` and `.augmentignore`.
+
+For this proxy project, keep generated logs and secrets out of indexing:
+
+```text
+proxy/logs/**
+proxy/proxy/logs/**
+proxy/.env
+proxy/.env.*
+.git/**
+node_modules/**
+```
+
+This prevents proxy request logs from becoming new files that Auggie then tries to index again.
+
+### MCP: FileSystem Context
+
+The official TypeScript SDK example uses MCP by spawning Auggie:
+
+```ts
+const context = await FileSystemContext.create({
+  directory: workspaceDir,
+  auggiePath: "auggie",
+  debug: true,
+});
+```
+
+Equivalent conceptually:
+
+```bash
+auggie --mcp
+```
+
+Authentication is read from either:
+
+```bash
+AUGMENT_API_TOKEN
+AUGMENT_API_URL
+```
+
+or:
+
+```text
+~/.augment/session.json
+```
+
+For this proxy, use the wrapper so MCP traffic points to local proxy:
+
+```bash
+AUGMENT_PROXY_URL=http://127.0.0.1:8765 ./run-augment-proxy.sh --mcp
+```
+
+If an external MCP client needs a command entry, use:
+
+```json
+{
+  "mcpServers": {
+    "augment-filesystem": {
+      "command": "bash",
+      "args": ["/home/vscode/projects/augmentproxy/run-augment-proxy.sh", "--mcp"]
+    }
+  }
+}
+```
+
+### MCP Through Augment Settings
+
+The proxy currently mocks these endpoints and records requests:
+
+```text
+/settings/get-mcp-tenant-settings
+/settings/get-mcp-user-settings
+/settings/get-mcp-tenant-configs
+/settings/get-mcp-user-configs
+/settings/upsert-mcp-tenant-config
+/settings/upsert-mcp-user-config
+/settings/remove-mcp-tenant-config
+/settings/remove-mcp-user-config
+```
+
+Current mock behavior returns empty MCP configs. To make server configs persistent, implement these endpoints in `proxy/src/fake-augment.ts` with a local JSON store such as:
+
+```json
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "type": "stdio",
+      "command": "bash",
+      "args": ["/home/vscode/projects/augmentproxy/run-augment-proxy.sh", "--mcp"]
+    }
+  ]
+}
+```
+
+### Hooks: Native Format
+
+`augment.mjs` recognizes native hook events:
+
+```text
+PreToolUse
+PostToolUse
+Stop
+SessionStart
+SessionEnd
+Notification
+```
+
+Native config shape:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo",
+            "args": ["before shell execution"],
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo",
+            "args": ["after file edit"],
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Matchers are regex strings. Common matcher examples:
+
+```text
+Bash
+Read
+Edit|Write
+MCP:.*
+```
+
+### Hooks: Alternative Short Format
+
+`augment.mjs` also maps this shorter format into native events:
+
+```json
+{
+  "hooks": {
+    "beforeShellExecution": [
+      { "command": "echo", "args": ["before bash"], "timeout": 5000 }
+    ],
+    "afterShellExecution": [
+      { "command": "echo", "args": ["after bash"], "timeout": 5000 }
+    ],
+    "beforeMCPExecution": [
+      { "command": "echo", "args": ["before mcp"], "timeout": 5000 }
+    ],
+    "afterMCPExecution": [
+      { "command": "echo", "args": ["after mcp"], "timeout": 5000 }
+    ],
+    "beforeReadFile": [
+      { "command": "echo", "args": ["before read"], "timeout": 5000 }
+    ],
+    "afterFileEdit": [
+      { "command": "echo", "args": ["after edit"], "timeout": 5000 }
+    ],
+    "stop": [
+      { "command": "echo", "args": ["agent stopped"], "timeout": 5000 }
+    ]
+  }
+}
+```
+
+Alternative mappings inferred from `augment.mjs`:
+
+```text
+beforeShellExecution -> PreToolUse matcher Bash
+beforeMCPExecution   -> PreToolUse matcher MCP:.*
+beforeReadFile       -> PreToolUse matcher Read
+afterFileEdit        -> PostToolUse matcher Edit|Write
+afterShellExecution  -> PostToolUse matcher Bash
+afterMCPExecution    -> PostToolUse matcher MCP:.*
+stop                 -> Stop
+```
+
+### Hook Storage Notes
+
+The exact file path can vary by Auggie version/config source. Practical places to try:
+
+```text
+.augment/hooks.json
+.augment/config.json
+~/.augment/hooks.json
+~/.augment/config.json
+```
+
+After adding hooks, restart Auggie. If hooks do not fire, check `/tmp/augmentproxy-logs` for settings/config requests, then persist the relevant settings endpoint in the proxy.
+
+### Proxy Support Status
+
+Currently implemented:
+
+- Records MCP settings requests.
+- Returns empty MCP config mocks.
+- Supports native tool call nodes from OpenAI `tool_calls`.
+- Supports tool result history conversion.
+
+Not yet implemented:
+
+- Persistent MCP settings store.
+- Hook config injection from proxy settings endpoints.
+- Remote MCP auth secret storage.

@@ -112,3 +112,14 @@ proxy/.env.*
 ```
 
 如果日志写在项目目录中，Augment 会把新生成的日志继续当作 workspace 文件索引，导致待索引总量不断变化，进度百分比可能回退。
+
+## Hooks, MCP, Commands
+
+The cloned `auggie/` repo confirms these useful extension points:
+
+- Custom slash commands live in `.augment/commands/*.md` or `~/.augment/commands/*.md`.
+- FileSystem Context can be exposed through MCP by spawning `auggie --mcp`.
+- Hooks can be configured in native Augment event format or a shorter alternative format.
+- `.gitignore` and `.augmentignore` are respected during workspace indexing.
+
+See detailed examples in `proxy/README.md`.
