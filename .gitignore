@@ -1,2 +1,12 @@
 logs/
 augment.mjs
+.env
+.env.*
+node_modules/
+dist/
+auggie/
+proxy/.env
+proxy/.env.*
+proxy/logs/
+proxy/proxy/logs/
+.DS_Store
