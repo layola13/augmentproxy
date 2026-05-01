@@ -654,6 +654,7 @@ export async function forwardAugmentStream(config: ProxyConfig, ctx: RequestCont
       let buffer = "";
       const thinkingFilter = new ThinkingStreamFilter();
       const thinkingBuffer: string[] = [];
+      let visibleText = "";
       let emittedVisibleText = false;
       let sawDone = false;
       let upstreamChunks = 0;
@@ -738,6 +739,7 @@ export async function forwardAugmentStream(config: ProxyConfig, ctx: RequestCont
               const visible = thinkingFilter.push(parsed.content);
               if (visible) {
                 emittedVisibleText = true;
+                visibleText += visible;
                 safeEnqueue({ text: visible, delta: visible, request_id: requestId });
               }
             }
@@ -746,6 +748,7 @@ export async function forwardAugmentStream(config: ProxyConfig, ctx: RequestCont
         const flushed = thinkingFilter.flush();
         if (flushed.visible) {
           emittedVisibleText = true;
+          visibleText += flushed.visible;
           safeEnqueue({ text: flushed.visible, delta: flushed.visible, request_id: requestId });
         }
         const mergedToolCalls = mergeStreamToolCalls(streamToolCalls);
@@ -767,6 +770,7 @@ export async function forwardAugmentStream(config: ProxyConfig, ctx: RequestCont
         if (!emittedVisibleText && toolNodes.length === 0 && allThinking.length > 0) {
           const fallbackText = allThinking.join("\n\n");
           logWarn(config, "openai:stream:reasoning-as-text", { requestId, chars: fallbackText.length });
+          visibleText += fallbackText;
           safeEnqueue({ text: fallbackText, delta: fallbackText, request_id: requestId });
           emittedVisibleText = true;
         }
@@ -778,7 +782,8 @@ export async function forwardAugmentStream(config: ProxyConfig, ctx: RequestCont
           return;
         }
         if (finalNodes.length > 0) safeEnqueue({ text: "", nodes: finalNodes, request_id: requestId });
-        safeEnqueue({ text: "", done: true, stop_reason: "stop", request_id: requestId });
+        logInfo(config, "openai:stream:final", { requestId, visibleChars: visibleText.length, nodes: finalNodes.length });
+        safeEnqueue({ text: visibleText, response_text: visibleText, completion: visibleText, done: true, stop_reason: "stop", request_id: requestId });
         finish();
       } catch (error) {
         logError(config, "openai:stream:error", { requestId, error: String(error) });
