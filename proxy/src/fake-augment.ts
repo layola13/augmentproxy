@@ -26,6 +26,27 @@ function now(): string {
   return new Date().toISOString();
 }
 
+function historySummaryParams(config: ProxyConfig): string {
+  return JSON.stringify({
+    prompt: config.augmentHistorySummaryPrompt,
+    history_tail_size_tokens_to_exclude: config.augmentHistoryTailTokens,
+    max_history_chars: config.augmentHistoryMaxChars,
+    input_budget_trigger_ratio: 0.95,
+  });
+}
+
+function modelInfoRegistry(config: ProxyConfig): string {
+  return JSON.stringify({
+    [config.openaiModel]: {
+      humanName: config.openaiModel,
+      description: "OpenAI-compatible upstream model via augmentproxy",
+      encoding: "o200k_base",
+      context: config.augmentModelContextTokens,
+      maxOutput: config.augmentModelMaxOutputTokens,
+    },
+  });
+}
+
 export function fakeToken(): JsonObject {
   return {
     access_token: "fake-augment-access-token",
@@ -56,6 +77,11 @@ export function fakeModels(config: ProxyConfig): JsonObject {
     ],
     feature_flags: {
       additional_chat_models: config.openaiModel,
+      agent_chat_model: config.openaiModel,
+      enable_model_registry: true,
+      model_info_registry: modelInfoRegistry(config),
+      history_summary_min_version: "0.0.0",
+      history_summary_params: historySummaryParams(config),
       enable_hindsight: false,
       bypass_language_filter: true,
       small_sync_threshold: 1048576,

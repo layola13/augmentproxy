@@ -1,12 +1,12 @@
 import type { ProxyConfig, RequestContext } from "./types.ts";
 import { jsonResponse, textResponse } from "./http.ts";
 import {
+  fakeBatchUpload,
   fakeBillingSummary,
+  fakeCheckpointBlobs,
   fakeCloudAgent,
   fakeContextList,
   fakeCreditInfo,
-  fakeBatchUpload,
-  fakeCheckpointBlobs,
   fakeFindMissing,
   fakeGeneric,
   fakeModels,
@@ -16,9 +16,18 @@ import {
   fakeToken,
   fakeWorkspace,
 } from "./fake-augment.ts";
+import { handleCodebaseRetrieval } from "./codebase-retrieval.ts";
 import { recordRequest } from "./request-recorder.ts";
-import { forwardAugmentJson, forwardAugmentStream, forwardCompletion } from "./openai-adapter.ts";
-import { indexBatchUpload, indexCheckpoint, indexFindMissing } from "./indexer.ts";
+import {
+  forwardAugmentJson,
+  forwardAugmentStream,
+  forwardCompletion,
+} from "./openai-adapter.ts";
+import {
+  indexBatchUpload,
+  indexCheckpoint,
+  indexFindMissing,
+} from "./indexer.ts";
 
 function normalized(path: string): string {
   return path.replace(/^\/+/, "").replace(/\/+$/, "");
@@ -33,7 +42,8 @@ function isJsonChat(path: string): boolean {
 }
 
 function isCompletion(path: string): boolean {
-  return path === "completion" || path === "completion/request" || path === "completion/complete" || path === "chat-input-completion";
+  return path === "completion" || path === "completion/request" ||
+    path === "completion/complete" || path === "chat-input-completion";
 }
 
 function shouldRecord(path: string): boolean {
@@ -51,7 +61,10 @@ function shouldRecord(path: string): boolean {
     path.startsWith("indexed-commits/");
 }
 
-export async function routeAugment(config: ProxyConfig, ctx: RequestContext): Promise<Response> {
+export async function routeAugment(
+  config: ProxyConfig,
+  ctx: RequestContext,
+): Promise<Response> {
   const path = normalized(ctx.path);
 
   if (ctx.method === "GET" && (path === "" || path === "health")) {
@@ -84,10 +97,12 @@ export async function routeAugment(config: ProxyConfig, ctx: RequestContext): Pr
     return await forwardCompletion(config, ctx);
   }
 
-  if (path === "completion/resolve" || path === "completion/cancel" || path === "resolve-completions") {
+  if (
+    path === "completion/resolve" || path === "completion/cancel" ||
+    path === "resolve-completions"
+  ) {
     return jsonResponse({ ok: true });
   }
-
 
   if (path === "find-missing") {
     await recordRequest(config, ctx, "mock-find-missing-capture-recorded");
@@ -134,7 +149,6 @@ export async function routeAugment(config: ProxyConfig, ctx: RequestContext): Pr
     return jsonResponse(fakeWorkspace(path));
   }
 
-
   if (path === "agents/list-remote-tools") {
     await recordRequest(config, ctx, "mock-list-remote-tools-recorded");
     return jsonResponse({ tools: [] });
@@ -145,7 +159,15 @@ export async function routeAugment(config: ProxyConfig, ctx: RequestContext): Pr
     return jsonResponse({ is_safe: true });
   }
 
-  if (path === "record-user-events" || path === "client-metrics" || path.includes("feedback")) {
+  if (path === "agents/codebase-retrieval") {
+    await recordRequest(config, ctx, "codebase-retrieval-recorded");
+    return jsonResponse(await handleCodebaseRetrieval(config, ctx));
+  }
+
+  if (
+    path === "record-user-events" || path === "client-metrics" ||
+    path.includes("feedback")
+  ) {
     return jsonResponse({ ok: true });
   }
 

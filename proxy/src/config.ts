@@ -34,6 +34,13 @@ function normalizeLogDir(value: string): string {
   return value;
 }
 
+const defaultHistorySummaryPrompt = [
+  "Create a compact continuation summary for this agent conversation.",
+  "Preserve the user's explicit instructions, current objective, important decisions, files changed or inspected, commands run, test results, unresolved errors, and the next concrete steps.",
+  "Do not invent facts. Prefer exact paths, symbols, command names, and error messages over general descriptions.",
+  "Write the summary so the agent can continue the same task after context compaction without re-reading unrelated history.",
+].join("\n");
+
 export function loadConfig(): ProxyConfig {
   const openaiApiKey = env("OPENAI_API_KEY");
   if (!openaiApiKey) {
@@ -48,6 +55,11 @@ export function loadConfig(): ProxyConfig {
     openaiUserAgent: env("OPENAI_USER_AGENT", "codex-cli"),
     upstreamAppName: env("OPENAI_UPSTREAM_APP_NAME", "Codex"),
     sanitizeUpstreamPrompts: envBoolean("OPENAI_SANITIZE_UPSTREAM_PROMPTS", false),
+    augmentModelContextTokens: envNumber("AUGMENT_MODEL_CONTEXT_TOKENS", 200000),
+    augmentModelMaxOutputTokens: envNumber("AUGMENT_MODEL_MAX_OUTPUT_TOKENS", 16000),
+    augmentHistoryTailTokens: envNumber("AUGMENT_HISTORY_TAIL_TOKENS", 32000),
+    augmentHistoryMaxChars: envNumber("AUGMENT_HISTORY_MAX_CHARS", 2000000),
+    augmentHistorySummaryPrompt: env("AUGMENT_HISTORY_SUMMARY_PROMPT", defaultHistorySummaryPrompt),
     fakeAugmentEmail: env("FAKE_AUGMENT_EMAIL", "proxy@example.local"),
     fakeAugmentUserId: env("FAKE_AUGMENT_USER_ID", "user_proxy_local"),
     requestLogDir: normalizeLogDir(env("AUGMENT_REQUEST_LOG_DIR", "logs")),

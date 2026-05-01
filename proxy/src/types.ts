@@ -9,6 +9,11 @@ export interface ProxyConfig {
   openaiUserAgent: string;
   upstreamAppName: string;
   sanitizeUpstreamPrompts: boolean;
+  augmentModelContextTokens: number;
+  augmentModelMaxOutputTokens: number;
+  augmentHistoryTailTokens: number;
+  augmentHistoryMaxChars: number;
+  augmentHistorySummaryPrompt: string;
   fakeAugmentEmail: string;
   fakeAugmentUserId: string;
   requestLogDir: string;
@@ -49,4 +54,5 @@ export interface OpenAIChatRequest {
   max_tokens?: number;
   tools?: JsonObject[];
   tool_choice?: "auto";
+  stream_options?: JsonObject;
 }

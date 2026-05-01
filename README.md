@@ -153,6 +153,10 @@ See detailed examples in `proxy/README.md`.
   - 修复 OpenAI 工具协议顺序：
     - 历史消息重排为 `assistant(tool_calls) -> tool_result -> user`，避免 tool result 落在 user 之后。
     - 增加严格清洗：只保留“完整且连续”的 tool result 序列；不完整序列会降级为纯 assistant 文本，避免上游返回 `invalid params, tool call result does not follow tool call (2013)`。
+  - 修复重复编辑失败抖动：
+    - 对 `str-replace-editor` 增加“已应用替换自动过滤”（当 `old_str` 已不存在且 `new_str` 已在文件中时，自动跳过该 entry）。
+    - 对 `str-replace-editor` 增加非空替换校验，避免把空替换列表发送给工具导致“no changes / failed”循环。
+    - 系统提示词增加约束：编辑失败后必须先重新读取文件再构造新替换，不允许直接重复同一编辑调用。
 
 ### 从 `augment.mjs` 提炼到的系统提示词设计（关键特征）
 
