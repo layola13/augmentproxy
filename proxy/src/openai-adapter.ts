@@ -1905,6 +1905,46 @@ function estimatePromptTokens(request: OpenAIChatRequest): number {
   return Math.ceil(chars / 4);
 }
 
+function estimateTextTokens(value: string): number {
+  return Math.ceil(value.length / 4);
+}
+
+function estimateJsonTokens(value: JsonValue | undefined): number {
+  if (value === undefined) return 0;
+  return estimateTextTokens(JSON.stringify(value));
+}
+
+function estimateMessageTokens(message: OpenAIMessage): number {
+  return estimateTextTokens(message.content) + estimateJsonTokens(message.tool_calls);
+}
+
+function estimateToolResultTokens(messages: OpenAIMessage[]): number {
+  return messages.reduce((sum, message) => {
+    return message.role === "tool" ? sum + estimateMessageTokens(message) : sum;
+  }, 0);
+}
+
+function estimateSystemPromptTokens(messages: OpenAIMessage[]): number {
+  const first = messages[0];
+  return first?.role === "system" ? estimateMessageTokens(first) : 0;
+}
+
+function estimateCurrentMessageTokens(messages: OpenAIMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "user") return estimateMessageTokens(message);
+  }
+  return 0;
+}
+
+function estimateAssistantResponseTokens(usage: JsonObject): number {
+  return numberField(usage.completion_tokens) ?? 0;
+}
+
+function estimateToolDefinitionTokens(request: OpenAIChatRequest): number {
+  return estimateJsonTokens(request.tools);
+}
+
 function tokenUsageNode(
   config: ProxyConfig,
   request: OpenAIChatRequest,
@@ -1927,11 +1967,25 @@ function augmentTokenUsage(
     : {};
   const promptTokens = numberField(record.prompt_tokens) ?? estimatePromptTokens(request);
   const completionTokens = numberField(record.completion_tokens) ?? 0;
+  const systemPromptTokens = estimateSystemPromptTokens(request.messages);
+  const currentMessageTokens = estimateCurrentMessageTokens(request.messages);
+  const toolDefinitionsTokens = estimateToolDefinitionTokens(request);
+  const toolResultTokens = estimateToolResultTokens(request.messages);
+  const assistantResponseTokens = estimateAssistantResponseTokens(record);
+  const knownPromptTokens = systemPromptTokens + currentMessageTokens +
+    toolDefinitionsTokens + toolResultTokens;
+  const chatHistoryTokens = Math.max(0, promptTokens - knownPromptTokens);
   return {
     input_tokens: promptTokens,
     output_tokens: completionTokens,
     cache_read_input_tokens: numberField(record.cached_tokens) ?? 0,
     cache_creation_input_tokens: 0,
+    system_prompt_tokens: systemPromptTokens,
+    chat_history_tokens: chatHistoryTokens,
+    current_message_tokens: currentMessageTokens,
+    tool_definitions_tokens: toolDefinitionsTokens,
+    tool_result_tokens: toolResultTokens,
+    assistant_response_tokens: assistantResponseTokens,
     max_context_tokens: config.augmentModelContextTokens,
     max_output_tokens: config.augmentModelMaxOutputTokens,
   };
