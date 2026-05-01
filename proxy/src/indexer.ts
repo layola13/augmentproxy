@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue, ProxyConfig, RequestContext } from "./types.ts";
+import { logInfo } from "./logger.ts";
 
 interface UploadBlob {
   blobName: string;
@@ -43,11 +44,26 @@ function qdrantHeaders(): HeadersInit {
   return { "content-type": "application/json" };
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function qdrantRequest(config: ProxyConfig, path: string, init?: RequestInit): Promise<Response> {
-  return await fetch(`${config.qdrantUrl}${path}`, {
-    ...init,
-    headers: { ...qdrantHeaders(), ...(init?.headers ?? {}) },
-  });
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      const response = await fetch(`${config.qdrantUrl}${path}`, {
+        ...init,
+        headers: { ...qdrantHeaders(), ...(init?.headers ?? {}) },
+      });
+      if (response.status !== 429 && response.status < 500) return response;
+      lastError = new Error(`Qdrant HTTP ${response.status}: ${await response.text().catch(() => "")}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(150 * 2 ** attempt);
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 
@@ -212,13 +228,16 @@ async function upsertChunks(config: ProxyConfig, chunks: TextChunk[], embeddings
       },
     });
   }
-  const response = await qdrantRequest(config, `/collections/${encodeURIComponent(config.qdrantCollection)}/points?wait=true`, {
-    method: "PUT",
-    body: JSON.stringify({ points }),
-  });
-  if (!response.ok) throw new Error(`Qdrant upsert failed: ${response.status} ${await response.text()}`);
-}
 
+  for (let offset = 0; offset < points.length; offset += 16) {
+    const batch = points.slice(offset, offset + 16);
+    const response = await qdrantRequest(config, `/collections/${encodeURIComponent(config.qdrantCollection)}/points?wait=true`, {
+      method: "PUT",
+      body: JSON.stringify({ points: batch }),
+    });
+    if (!response.ok) throw new Error(`Qdrant upsert failed: ${response.status} ${await response.text()}`);
+  }
+}
 
 async function existingBlobNames(config: ProxyConfig, names: string[]): Promise<Set<string>> {
   const existing = new Set<string>();
@@ -284,17 +303,22 @@ async function existingBlobNames(config: ProxyConfig, names: string[]): Promise<
 }
 
 export async function indexFindMissing(config: ProxyConfig, ctx: RequestContext): Promise<JsonObject> {
+  const start = Date.now();
   const names = parseFindMissing(ctx);
+  logInfo(config, "index:find-missing:start", { requestId: ctx.requestId, names: names.length });
   if (config.indexingMode === "complete") return { unknown_memory_names: [], nonindexed_blob_names: [] };
   if (config.indexingMode === "capture") return { unknown_memory_names: names, nonindexed_blob_names: [] };
   const existing = await existingBlobNames(config, names);
   for (const name of existing) indexedBlobs.add(name);
   const unknown = names.filter((name) => !existing.has(name) && !indexedBlobs.has(name));
+  logInfo(config, "index:find-missing:end", { requestId: ctx.requestId, names: names.length, existing: existing.size, unknown: unknown.length, ms: Date.now() - start });
   return { unknown_memory_names: unknown, nonindexed_blob_names: [] };
 }
 
 export async function indexBatchUpload(config: ProxyConfig, ctx: RequestContext): Promise<JsonObject> {
+  const start = Date.now();
   const blobs = parseUploadBlobs(ctx);
+  logInfo(config, "index:batch-upload:start", { requestId: ctx.requestId, blobs: blobs.length });
   if (config.indexingMode !== "real") {
     return { blob_names: blobs.map((blob) => blob.blobName) };
   }
@@ -309,6 +333,7 @@ export async function indexBatchUpload(config: ProxyConfig, ctx: RequestContext)
     indexedBlobs.add(blob.blobName);
     uploaded.push(blob.blobName);
   }
+  logInfo(config, "index:batch-upload:end", { requestId: ctx.requestId, blobs: uploaded.length, ms: Date.now() - start });
   return { blob_names: uploaded };
 }
 

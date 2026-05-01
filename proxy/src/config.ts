@@ -4,9 +4,17 @@ function env(name: string, fallback = ""): string {
   return Deno.env.get(name)?.trim() || fallback;
 }
 
+
 function envNumber(name: string, fallback: number): number {
   const value = Number(env(name));
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function envBoolean(name: string, fallback: boolean): boolean {
+  const value = env(name).toLowerCase();
+  if (["1", "true", "yes", "on"].includes(value)) return true;
+  if (["0", "false", "no", "off"].includes(value)) return false;
+  return fallback;
 }
 
 function normalizeBaseUrl(value: string): string {
@@ -37,10 +45,12 @@ export function loadConfig(): ProxyConfig {
     openaiBaseUrl: normalizeBaseUrl(env("OPENAI_BASE_URL", "https://api.openai.com")),
     openaiApiKey,
     openaiModel: env("OPENAI_MODEL", "gpt-4o-mini"),
+    openaiUserAgent: env("OPENAI_USER_AGENT", "codex-cli"),
+    upstreamAppName: env("OPENAI_UPSTREAM_APP_NAME", "Codex"),
+    sanitizeUpstreamPrompts: envBoolean("OPENAI_SANITIZE_UPSTREAM_PROMPTS", false),
     fakeAugmentEmail: env("FAKE_AUGMENT_EMAIL", "proxy@example.local"),
     fakeAugmentUserId: env("FAKE_AUGMENT_USER_ID", "user_proxy_local"),
     requestLogDir: normalizeLogDir(env("AUGMENT_REQUEST_LOG_DIR", "logs")),
-    userAgent: env("AUGMENT_PROXY_USER_AGENT", "augment-intercept-proxy/0.1.0"),
     indexingMode: env("AUGMENT_INDEXING_MODE", "capture").toLowerCase(),
     embedBaseUrl: normalizeEmbedBaseUrl(env("EMBED_BASE_URL", "http://127.0.0.1:11434")),
     embedApiKey: env("EMBED_API_KEY"),
@@ -50,6 +60,7 @@ export function loadConfig(): ProxyConfig {
     qdrantCollection: env("QDRANT_COLLECTION", "augmentproxy_workspace"),
     indexChunkChars: envNumber("INDEX_CHUNK_CHARS", 1800),
     indexChunkOverlap: envNumber("INDEX_CHUNK_OVERLAP", 200),
+    logLevel: env("LOG_LEVEL", "info").toLowerCase(),
   };
 }
 

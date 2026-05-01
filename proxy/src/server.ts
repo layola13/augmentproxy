@@ -2,6 +2,7 @@ import { loadConfigFromEnvFile } from "./config.ts";
 import { augmentError } from "./http.ts";
 import { parseRequest } from "./http.ts";
 import { routeAugment } from "./augment-router.ts";
+import { logError, logInfo } from "./logger.ts";
 
 const config = await loadConfigFromEnvFile();
 
@@ -13,9 +14,13 @@ console.log(`Request logs: ${config.requestLogDir}`);
 Deno.serve({ port: config.port }, async (request) => {
   try {
     const ctx = await parseRequest(request);
-    return await routeAugment(config, ctx);
+    const start = Date.now();
+    logInfo(config, "request:start", { requestId: ctx.requestId, method: ctx.method, path: ctx.path });
+    const response = await routeAugment(config, ctx);
+    logInfo(config, "request:end", { requestId: ctx.requestId, method: ctx.method, path: ctx.path, status: response.status, ms: Date.now() - start });
+    return response;
   } catch (error) {
-    console.error(error);
+    logError(config, "request:error", { error: error instanceof Error ? error.message : String(error) });
     return augmentError(error instanceof Error ? error.message : String(error), 500, "proxy_error");
   }
 });

@@ -39,6 +39,20 @@
 ./run-augment-proxy.sh
 ```
 
+## 上游伪装为 Codex
+
+代理转发到大模型上游时默认使用 Codex-like 标识，避免上游因为请求头或 prompt 中包含 Augment/Auggie 名称而卡住或限流：
+
+```env
+OPENAI_USER_AGENT=codex-cli
+OPENAI_UPSTREAM_APP_NAME=Codex
+OPENAI_SANITIZE_UPSTREAM_PROMPTS=false
+```
+
+- `OPENAI_USER_AGENT`：设置转发到 `/chat/completions` 的 `user-agent`。
+- `OPENAI_SANITIZE_UPSTREAM_PROMPTS=false`：默认不改 prompt，避免误改真实路径、目录名、文件名。
+- 本地 Augment 协议、登录模拟、工具节点返回不变；只影响发给大模型供应商的请求。
+
 ## Qdrant For Real Indexing
 
 真实 indexing 需要先启动 Qdrant：

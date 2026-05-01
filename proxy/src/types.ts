@@ -6,10 +6,12 @@ export interface ProxyConfig {
   openaiBaseUrl: string;
   openaiApiKey: string;
   openaiModel: string;
+  openaiUserAgent: string;
+  upstreamAppName: string;
+  sanitizeUpstreamPrompts: boolean;
   fakeAugmentEmail: string;
   fakeAugmentUserId: string;
   requestLogDir: string;
-  userAgent: string;
   indexingMode: string;
   embedBaseUrl: string;
   embedApiKey: string;
@@ -19,6 +21,7 @@ export interface ProxyConfig {
   qdrantCollection: string;
   indexChunkChars: number;
   indexChunkOverlap: number;
+  logLevel: string;
 }
 
 export interface RequestContext {

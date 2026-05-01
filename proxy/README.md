@@ -25,10 +25,28 @@ PROXY_PORT=8765
 OPENAI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 OPENAI_API_KEY=...
 OPENAI_MODEL=mimo-v2.5-pro
+OPENAI_USER_AGENT=codex-cli
+OPENAI_UPSTREAM_APP_NAME=Codex
+OPENAI_SANITIZE_UPSTREAM_PROMPTS=false
 AUGMENT_REQUEST_LOG_DIR=proxy/logs
 ```
 
 环境变量会覆盖 `.env` 中的同名值。
+
+## Upstream Identity / Codex-like Requests
+
+Some OpenAI-compatible providers behave differently when request headers or prompts contain app-specific names. The proxy therefore sends upstream model requests with a Codex-like identity by default:
+
+```env
+OPENAI_USER_AGENT=codex-cli
+OPENAI_UPSTREAM_APP_NAME=Codex
+OPENAI_SANITIZE_UPSTREAM_PROMPTS=false
+```
+
+- `OPENAI_USER_AGENT` sets the upstream `user-agent` header for `/chat/completions` requests.
+- `OPENAI_SANITIZE_UPSTREAM_PROMPTS=false` keeps prompts unchanged by default, avoiding accidental rewrites of real paths, directory names, and filenames.
+- Local Augment protocol responses are unchanged; only the request sent to the model provider is sanitized.
+- Only set `OPENAI_SANITIZE_UPSTREAM_PROMPTS=true` for a provider that explicitly requires app-name sanitization.
 
 ## Point Augment To Proxy
 
@@ -700,3 +718,67 @@ Not yet implemented:
 - Persistent MCP settings store.
 - Hook config injection from proxy settings endpoints.
 - Remote MCP auth secret storage.
+
+## Runtime Error Notes
+
+### Qdrant `connection closed before message completed`
+
+This can happen when large vector upserts overload or reset the local Qdrant HTTP connection. The proxy now retries Qdrant requests and writes vector points in small batches of 16.
+
+If it still happens:
+
+```bash
+cd proxy
+docker compose -f docker-compose.qdrant.yml restart qdrant
+```
+
+### Upstream `http2 error: stream error received`
+
+This is an upstream model provider transport error while streaming. The proxy catches the failed `fetch()` and returns an Augment-style upstream stream error instead of crashing.
+
+### Heartbeat `stream controller cannot close or enqueue`
+
+This happens when the client closes a stream while the heartbeat timer is still trying to write. The proxy now uses guarded enqueue/close helpers and clears heartbeat safely.
+
+## Augment `UND_ERR_HEADERS_TIMEOUT`
+
+If Auggie reports:
+
+```text
+API Error: unavailable: fetch failed (UND_ERR_HEADERS_TIMEOUT: Headers Timeout Error)
+```
+
+it means Auggie did not receive response headers from the proxy quickly enough. This can happen when the proxy waits for a slow upstream model before returning the stream response.
+
+`chat-stream` now returns headers immediately and sends an initial heartbeat chunk before contacting the upstream model. Heartbeats continue every 5 seconds while waiting for upstream tokens.
+
+## Native Augment Thinking Nodes
+
+Augment supports thinking as response node `type=8`:
+
+```json
+{
+  "id": 1000,
+  "type": 8,
+  "thinking": { "content": "reasoning text" }
+}
+```
+
+The proxy maps upstream reasoning into this native node format from two sources:
+
+- XML-like text tags: `<think>`, `<thinking>`, `<reason>`
+- OpenAI-compatible reasoning fields: `reasoning_content`, `reasoning`, `thinking`, `reason`
+
+For streamed responses, the proxy buffers upstream text, extracts reasoning, then emits visible text plus `type=8` thinking nodes. This avoids showing raw `<think>...</think>` tags as normal assistant text.
+
+## Streaming Thinking Filter
+
+For streamed responses, visible text is emitted immediately. The proxy only buffers text inside these tags:
+
+```text
+<think>...</think>
+<thinking>...</thinking>
+<reason>...</reason>
+```
+
+The buffered reasoning is emitted at the end as native Augment `type=8` thinking nodes. This prevents long reasoning from blocking visible output for minutes.
