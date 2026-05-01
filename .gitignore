@@ -10,3 +10,4 @@ proxy/.env.*
 proxy/logs/
 proxy/proxy/logs/
 .DS_Store
+tmp/

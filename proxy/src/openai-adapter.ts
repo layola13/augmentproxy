@@ -252,6 +252,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- Use tools only through the provided function-calling interface. Do not write XML, Markdown tool blocks, or prose pretending to be a tool call.",
     "- Every function call argument must be one complete JSON object that satisfies the tool schema. Never call a tool with {} unless that tool schema explicitly has no required fields.",
     "- Do not invent paths. Use paths from the current request, conversation, workspace context, search results, or directory listings.",
+    "- Path safety policy: never access /, /home, or any path outside /home/<current-user>/. Restrict file and directory operations to the current user's home workspace only.",
     "- If a required argument is unknown, first use a discovery tool with a known directory/path or answer from available context; do not emit an invalid call.",
     "- If a tool fails validation, repair the next tool call by providing the missing required JSON field; do not repeat the same invalid call.",
     "- For project evaluation, inspect the workspace root/directory first, then read specific files discovered from listings, then synthesize a final answer.",
@@ -269,6 +270,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
   lines.push(
     "Critical tool argument formats:",
     "- view: requires a concrete path. Valid examples: {\"path\":\"<known-file>\",\"type\":\"file\"} or {\"path\":\"<known-directory>\",\"type\":\"directory\"}. Invalid: {}, {\"type\":\"file\"}, {\"path\":\"\"}.",
+    "- view-range-untruncated: requires reference_id, start_line, end_line from a prior view result. Do not pass path to this tool.",
     "- codebase-retrieval: requires information_request. Valid example: {\"information_request\":\"Find the modules responsible for request routing, OpenAI adaptation, indexing, and configuration.\"}. Invalid: {}.",
     "- launch-process: requires command. Prefer simple commands and set cwd only when known. Valid example: {\"command\":\"pwd && ls -la\",\"cwd\":\"<known-directory>\"}.",
     "- save-file / str-replace-editor: only use when editing is explicitly needed, and provide the complete required schema fields.",
@@ -340,7 +342,7 @@ function toolDescriptionForModel(tool: JsonObject): string {
     : "This tool has no required JSON fields; use {} only if no optional fields are needed.";
   const examples: Record<string, string> = {
     "view": 'Example arguments: {"path":"<known-file-or-directory>","type":"file"}. Never use {}.',
-    "view-range-untruncated": 'Example arguments: {"reference_id":"<reference-id>","start_line":1,"end_line":80}. Never use {}.',
+    "view-range-untruncated": 'Example arguments: {"reference_id":"<reference-id>","start_line":1,"end_line":80}. Never pass path. Never use {}.',
     "codebase-retrieval": 'Example arguments: {"information_request":"Find files and modules relevant to the user request."}. Never use {}.',
     "launch-process": 'Example arguments: {"command":"pwd && ls -la","wait":true,"max_wait_seconds":60,"cwd":"<known-directory>"}. Never use {} or an empty command.',
     "read-process": 'Example arguments: {"terminal_id":1,"wait":true,"max_wait_seconds":60}. Never use undefined terminal_id.',
@@ -379,7 +381,11 @@ function thinkingNodes(thinking: string[], startingId = 1000): JsonObject[] {
 
 function workspaceFallbackPath(ctx: RequestContext): string | undefined {
   const body = objectBody(ctx);
-  if (typeof body.path === "string" && body.path) return body.path;
+  if (typeof body.path === "string" && body.path) {
+    const extracted = firstAbsolutePathFromText(body.path);
+    if (extracted) return extracted;
+    return body.path;
+  }
   const discovered = collectWorkspacePaths(body);
   return discovered[0];
 }
@@ -517,13 +523,15 @@ function parseToolCall(
   const fn = record.function;
   if (!fn || typeof fn !== "object" || Array.isArray(fn)) return undefined;
   const fnRecord = fn as JsonObject;
-  const name = normalizeToolName(typeof fnRecord.name === "string" && fnRecord.name ? fnRecord.name : "unknown");
-  const argumentsJson = normalizeToolArguments(
-    name,
+  const normalizedName = normalizeToolName(typeof fnRecord.name === "string" && fnRecord.name ? fnRecord.name : "unknown");
+  let name = normalizedName;
+  let argumentsJson = normalizeToolArguments(
+    normalizedName,
     typeof fnRecord.arguments === "string" ? fnRecord.arguments : JSON.stringify(fnRecord.arguments ?? {}),
     fallbackPath,
     launchCommandFallback,
   );
+  ({ name, argumentsJson } = repairMisusedToolCall(name, argumentsJson));
   const id = typeof record.id === "string" && record.id ? record.id : `tool_${crypto.randomUUID()}`;
   return { id, name, argumentsJson };
 }
@@ -560,7 +568,19 @@ function normalizeToolArguments(
   let args: JsonObject;
   try {
     const parsed = JSON.parse(repairArgumentsJson(argumentsJson) || "{}");
-    args = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as JsonObject : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      args = parsed as JsonObject;
+    } else if (typeof parsed === "string" && parsed.trim()) {
+      try {
+        const nested = JSON.parse(repairArgumentsJson(parsed));
+        args = nested && typeof nested === "object" && !Array.isArray(nested) ? nested as JsonObject : {};
+        if (Object.keys(args).length === 0) args.raw_input = parsed;
+      } catch {
+        args = { raw_input: parsed };
+      }
+    } else {
+      args = {};
+    }
   } catch {
     args = {};
     const pathMatch = argumentsJson.match(/(?:path|file_path|filepath|filename|file|absolute_path)\s*[:=]\s*["']?([^"'\n,}]+)["']?/i);
@@ -569,26 +589,60 @@ function normalizeToolArguments(
     else if (argumentsJson.trim()) args.raw_input = argumentsJson;
   }
 
-  if ((toolName === "view" || toolName === "view-range-untruncated") && typeof args.path !== "string") {
+  if ((toolName === "view") && typeof args.path !== "string") {
     const candidate = args.file_path ?? args.filepath ?? args.filename ?? args.file ?? args.absolute_path;
     if (typeof candidate === "string") args.path = candidate;
     else if (fallbackPath) args.path = fallbackPath;
   }
-  if ((toolName === "view" || toolName === "view-range-untruncated") && typeof args.path === "string") args.path = repairViewPath(args.path, fallbackPath);
-  if ((toolName === "view" || toolName === "view-range-untruncated") && args.path === "." && fallbackPath) args.path = fallbackPath;
+  if ((toolName === "view") && typeof args.path === "string") args.path = repairViewPath(args.path, fallbackPath);
+  if ((toolName === "view") && args.path === "." && fallbackPath) args.path = fallbackPath;
+  if ((toolName === "view-range-untruncated") && typeof args.path === "string") args.path = repairViewPath(args.path, fallbackPath);
   if ((toolName === "launch-process") && typeof args.command !== "string") {
     const candidate = args.cmd ?? args.shell_command;
+    const extracted = extractCommandFromText(argumentsJson);
     if (typeof candidate === "string") args.command = candidate;
+    else if (extracted) args.command = extracted;
     else if (typeof args.raw_input === "string" && isLikelyShellCommand(args.raw_input)) args.command = args.raw_input;
     else if (launchCommandFallback) args.command = launchCommandFallback;
+    else if (typeof args.cwd === "string") args.command = "pwd && ls -la";
   }
+  if ((toolName === "launch-process") && typeof args.cwd === "string") args.cwd = repairViewPath(args.cwd, fallbackPath);
   if ((toolName === "launch-process") && typeof args.cwd !== "string" && fallbackPath) args.cwd = fallbackPath;
   if ((toolName === "launch-process") && typeof args.wait !== "boolean") args.wait = true;
   if ((toolName === "launch-process") && typeof args.max_wait_seconds !== "number") args.max_wait_seconds = 120;
   if (toolName === "codebase-retrieval" && typeof args.information_request !== "string") {
     args.information_request = "Provide an overview of this workspace and identify the key files relevant to the user's request.";
   }
+  if (toolName === "codebase-retrieval" && typeof args.workspace_folder !== "string") {
+    const workspaceFolder = workspaceFolderFromPath(fallbackPath);
+    if (workspaceFolder) args.workspace_folder = workspaceFolder;
+  }
   return JSON.stringify(args);
+}
+
+function repairMisusedToolCall(
+  toolName: string,
+  argumentsJson: string,
+): { name: string; argumentsJson: string } {
+  if (toolName !== "view-range-untruncated") return { name: toolName, argumentsJson };
+  try {
+    const parsed = JSON.parse(argumentsJson || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { name: toolName, argumentsJson };
+    const args = parsed as JsonObject;
+    const hasReferenceId = typeof args.reference_id === "string" && args.reference_id.trim() !== "";
+    const hasStart = typeof args.start_line === "number";
+    const hasEnd = typeof args.end_line === "number";
+    const hasPath = typeof args.path === "string" && args.path.trim() !== "";
+    if (!hasReferenceId && !hasStart && !hasEnd && hasPath) {
+      const downgraded: JsonObject = { path: args.path };
+      if (typeof args.type === "string" && args.type) downgraded.type = args.type;
+      else downgraded.type = "file";
+      return { name: "view", argumentsJson: JSON.stringify(downgraded) };
+    }
+  } catch {
+    // Keep original tool call when arguments are not parseable.
+  }
+  return { name: toolName, argumentsJson };
 }
 
 function repairArgumentsJson(argumentsJson: string): string {
@@ -608,7 +662,20 @@ function repairArgumentsJson(argumentsJson: string): string {
 }
 
 function cleanExtractedPath(path: string): string {
-  return path.trim().replace(/["'`}\])]+$/g, "");
+  let cleaned = path.trim().replace(/^["'`]+|["'`]+$/g, "");
+  cleaned = cleaned.replace(/["'`}\])]+$/g, "");
+  cleaned = cleaned.replace(/\s+-\s+(?:read|view)\s+(?:file|directory)\s*$/i, "");
+  cleaned = cleaned.replace(/\s+\|\s*(?:read|view)\s+(?:file|directory)\s*$/i, "");
+  return cleaned.trim();
+}
+
+function firstAbsolutePathFromText(value: string): string | undefined {
+  const matches = value.match(/(?:\/|[A-Za-z]:\/)[^\s"'`<>，。！？；;:(){}[\]]+/g) ?? [];
+  for (const candidate of matches) {
+    const cleaned = cleanExtractedPath(candidate);
+    if (cleaned) return cleaned;
+  }
+  return undefined;
 }
 
 const VIEW_PATH_EXTENSION_CANDIDATES = [
@@ -699,6 +766,17 @@ function pathDirname(path: string): string | undefined {
   return normalized.slice(0, idx);
 }
 
+const WORKSPACE_MARKER_FILES = [
+  ".git",
+  "deno.json",
+  "package.json",
+  "pyproject.toml",
+  "go.mod",
+  "Cargo.toml",
+  "build.zig",
+  "README.md",
+];
+
 function pathExists(path: string): boolean {
   try {
     Deno.statSync(path);
@@ -720,6 +798,35 @@ function hasFileExtension(path: string): boolean {
   return /\.[^/\\.]+$/.test(pathBasename(path));
 }
 
+function workspaceFolderFromPath(path?: string): string | undefined {
+  if (!path) return undefined;
+  let candidate = canonicalizePath(normalizePathSlashes(path.trim()));
+  if (!candidate) return undefined;
+  if (!directoryExists(candidate)) candidate = pathDirname(candidate) ?? candidate;
+  if (!directoryExists(candidate)) return undefined;
+
+  const homePrefix = allowedHomePrefix();
+  const normalizedHome = homePrefix ? canonicalizePath(homePrefix) : undefined;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (!directoryExists(candidate)) break;
+    const hasMarker = WORKSPACE_MARKER_FILES.some((entry) => pathExists(joinPath(candidate, entry)));
+    if (hasMarker) return candidate;
+    const parent = pathDirname(candidate);
+    if (!parent || parent === candidate) break;
+    if (normalizedHome && (candidate === normalizedHome || !candidate.startsWith(`${normalizedHome}/`))) break;
+    candidate = parent;
+  }
+  return directoryExists(candidate) ? candidate : undefined;
+}
+
+function extensionCompletionMatch(baseLower: string, nameLower: string): boolean {
+  if (!nameLower.startsWith(baseLower) || nameLower === baseLower) return false;
+  const suffix = nameLower.slice(baseLower.length);
+  if (suffix.startsWith(".")) return true;
+  if (!baseLower.includes(".")) return false;
+  return /^[a-z0-9_-]+$/i.test(suffix);
+}
+
 function uniqueExtensionSibling(path: string): string | undefined {
   const dir = pathDirname(path);
   const base = pathBasename(path);
@@ -729,7 +836,7 @@ function uniqueExtensionSibling(path: string): string | undefined {
   for (const entry of Deno.readDirSync(dir)) {
     if (!entry.isFile) continue;
     const nameLower = entry.name.toLowerCase();
-    if (nameLower.startsWith(`${baseLower}.`)) matches.push(entry.name);
+    if (extensionCompletionMatch(baseLower, nameLower)) matches.push(entry.name);
   }
   if (matches.length === 1) return joinPath(dir, matches[0]);
   if (matches.length > 1) return undefined;
@@ -778,6 +885,35 @@ function uniqueFilePrefixSibling(path: string): string | undefined {
   return undefined;
 }
 
+function canonicalizePath(path: string): string {
+  let normalized = normalizePathSlashes(path).replace(/\/+/g, "/");
+  if (normalized.length > 1) normalized = normalized.replace(/\/+$/g, "");
+  return normalized;
+}
+
+function allowedHomePrefix(): string | undefined {
+  const user = (Deno.env.get("USER") ?? "").trim().replace(/^\/+|\/+$/g, "");
+  if (!user) return undefined;
+  return `/home/${user}`;
+}
+
+function allowedHomeHint(): string {
+  const prefix = allowedHomePrefix();
+  return prefix ? `${prefix}/...` : "/home/<user>/...";
+}
+
+function isPathWithinAllowedHome(path: string): boolean {
+  const normalized = canonicalizePath(path);
+  if (!isAbsolutePath(normalized)) return false;
+  if (normalized === "/" || normalized === "/home") return false;
+  const userPrefix = allowedHomePrefix();
+  if (userPrefix) {
+    const prefix = canonicalizePath(userPrefix);
+    return normalized === prefix || normalized.startsWith(`${prefix}/`);
+  }
+  return /^\/home\/[^/]+(?:\/.*)?$/.test(normalized);
+}
+
 function repairViewPath(path: string, fallbackPath?: string): string {
   const cleaned = cleanExtractedPath(path);
   if (!cleaned) return cleaned;
@@ -821,18 +957,41 @@ function repairViewPath(path: string, fallbackPath?: string): string {
     const repairedDir = uniqueDirectoryPrefixSibling(candidate);
     if (repairedDir) return repairedDir;
   }
+  for (const candidate of ordered) {
+    const dir = pathDirname(candidate);
+    const base = pathBasename(candidate);
+    if (!dir || !directoryExists(dir)) continue;
+    if (base.length <= 1) return dir;
+    if (hasFileExtension(base)) return dir;
+  }
   return cleaned;
 }
 
 function invalidToolReason(toolName: string, argumentsJson: string): string | undefined {
   try {
     const args = JSON.parse(argumentsJson || "{}") as JsonObject;
-    if ((toolName === "view" || toolName === "view-range-untruncated") && typeof args.path !== "string") {
+    if ((toolName === "view") && typeof args.path !== "string") {
       return `Tool ${toolName} requires a concrete path. Retry with valid JSON like {"path":"README.md","type":"file"}.`;
+    }
+    if ((toolName === "view") && typeof args.path === "string" && !isPathWithinAllowedHome(args.path)) {
+      return `Tool ${toolName} path is outside the allowed scope. Use an absolute path under ${allowedHomeHint()}.`;
+    }
+    if ((toolName === "view") && typeof args.path === "string" && !pathExists(args.path)) {
+      return `Tool ${toolName} path does not exist: ${args.path}. Use an existing path from a directory listing result.`;
+    }
+    if (toolName === "view-range-untruncated") {
+      const missing = ["reference_id", "start_line", "end_line"].filter((key) => args[key] === undefined || args[key] === null || args[key] === "");
+      if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}.`;
+      if (typeof args.path === "string" && args.path) {
+        return `Tool ${toolName} does not accept path. Use {"reference_id":"<id>","start_line":1,"end_line":80}, or use view for path-based reads.`;
+      }
     }
     if (toolName === "launch-process") {
       const missing = ["command", "wait", "max_wait_seconds", "cwd"].filter((key) => args[key] === undefined || args[key] === null || args[key] === "");
       if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}. Retry with valid JSON like {"command":"pwd && ls -la","wait":true,"max_wait_seconds":60,"cwd":"/known/directory"}.`;
+      if (typeof args.cwd === "string" && !isPathWithinAllowedHome(args.cwd)) {
+        return `Tool ${toolName} cwd is outside the allowed scope. Use an absolute cwd under ${allowedHomeHint()}.`;
+      }
     }
     if (toolName === "read-process") {
       const missing = ["terminal_id", "wait", "max_wait_seconds"].filter((key) => args[key] === undefined || args[key] === null || args[key] === "");
@@ -849,11 +1008,10 @@ function invalidToolReason(toolName: string, argumentsJson: string): string | un
       const missing = ["reference_id", "search_term"].filter((key) => typeof args[key] !== "string" || args[key] === "");
       if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}.`;
     }
-    if (toolName === "view-range-untruncated") {
-      const missing = ["reference_id", "start_line", "end_line"].filter((key) => args[key] === undefined || args[key] === null || args[key] === "");
-      if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}.`;
-    }
     if (toolName === "codebase-retrieval" && typeof args.information_request !== "string") return `Tool ${toolName} requires information_request.`;
+    if (toolName === "codebase-retrieval" && typeof args.workspace_folder !== "string") {
+      return `Tool ${toolName} requires workspace_folder to avoid ambiguous workspace resolution.`;
+    }
     if (toolName === "reorganize_tasklist" && typeof args.markdown !== "string") return `Tool ${toolName} requires markdown.`;
     if ((toolName === "update_tasks" || toolName === "add_tasks") && !Array.isArray(args.tasks)) return `Tool ${toolName} requires tasks array.`;
   } catch {
@@ -969,11 +1127,45 @@ function hasMeaningfulVisibleText(content: string): boolean {
 function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
   const byKey = new Map<string, JsonObject>();
   const order: string[] = [];
+  let anonymousCounter = 0;
+  let lastKey: string | undefined;
+
+  const completeJsonObject = (value: string | undefined): boolean => {
+    if (!value || !value.trim()) return false;
+    try {
+      JSON.parse(value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   for (const call of toolCalls) {
-    const index = typeof call.index === "number" ? call.index : order.length;
+    const index = typeof call.index === "number" ? call.index : undefined;
     const id = typeof call.id === "string" && call.id ? call.id : undefined;
-    const key = id ?? `index:${index}`;
+    const sourceFunction = call.function && typeof call.function === "object" && !Array.isArray(call.function)
+      ? call.function as JsonObject
+      : undefined;
+    const sourceName = sourceFunction && typeof sourceFunction.name === "string" && sourceFunction.name ? sourceFunction.name : undefined;
+    const sourceArguments = sourceFunction && typeof sourceFunction.arguments === "string" ? sourceFunction.arguments : undefined;
+
+    let key: string | undefined;
+    if (id && byKey.has(id)) key = id;
+    else if (typeof index === "number") key = `index:${index}`;
+    else if (id) key = id;
+    else if (lastKey) {
+      if (!sourceName) key = lastKey;
+      else {
+        const last = byKey.get(lastKey);
+        const lastFn = last?.function && typeof last.function === "object" && !Array.isArray(last.function)
+          ? last.function as JsonObject
+          : undefined;
+        const lastName = lastFn && typeof lastFn.name === "string" ? lastFn.name : "";
+        const lastArgs = lastFn && typeof lastFn.arguments === "string" ? lastFn.arguments : undefined;
+        if (!lastName || sourceName.startsWith(lastName) || lastName.startsWith(sourceName) || !completeJsonObject(lastArgs)) key = lastKey;
+      }
+    }
+    if (!key) key = `anon:${anonymousCounter++}`;
     let merged = byKey.get(key);
     if (!merged) {
       merged = { id: id ?? `tool_${crypto.randomUUID()}`, type: "function", function: {} };
@@ -984,21 +1176,27 @@ function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
     if (id) merged.id = id;
     if (typeof call.type === "string") merged.type = call.type;
 
-    const sourceFunction = call.function;
-    if (!sourceFunction || typeof sourceFunction !== "object" || Array.isArray(sourceFunction)) continue;
+    if (!sourceFunction) continue;
 
     const mergedFunction = (merged.function && typeof merged.function === "object" && !Array.isArray(merged.function))
       ? merged.function as JsonObject
       : {};
-    const sourceFunctionRecord = sourceFunction as JsonObject;
-
-    if (typeof sourceFunctionRecord.name === "string" && sourceFunctionRecord.name) {
-      mergedFunction.name = `${typeof mergedFunction.name === "string" ? mergedFunction.name : ""}${sourceFunctionRecord.name}`;
+    const mergedName = typeof mergedFunction.name === "string" ? mergedFunction.name : "";
+    if (sourceName) {
+      if (!mergedName) mergedFunction.name = sourceName;
+      else if (sourceName === mergedName || mergedName.startsWith(sourceName)) mergedFunction.name = mergedName;
+      else if (sourceName.startsWith(mergedName)) mergedFunction.name = sourceName;
+      else mergedFunction.name = `${mergedName}${sourceName}`;
     }
-    if (typeof sourceFunctionRecord.arguments === "string") {
-      mergedFunction.arguments = `${typeof mergedFunction.arguments === "string" ? mergedFunction.arguments : ""}${sourceFunctionRecord.arguments}`;
+    if (typeof sourceArguments === "string") {
+      const mergedArgs = typeof mergedFunction.arguments === "string" ? mergedFunction.arguments : "";
+      if (!mergedArgs) mergedFunction.arguments = sourceArguments;
+      else if (sourceArguments === mergedArgs || mergedArgs.startsWith(sourceArguments)) mergedFunction.arguments = mergedArgs;
+      else if (sourceArguments.startsWith(mergedArgs)) mergedFunction.arguments = sourceArguments;
+      else mergedFunction.arguments = `${mergedArgs}${sourceArguments}`;
     }
     merged.function = mergedFunction;
+    lastKey = key;
   }
 
   const mergedCalls = order.map((key) => byKey.get(key)).filter((call): call is JsonObject => {
