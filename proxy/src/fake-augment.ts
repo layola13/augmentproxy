@@ -82,6 +82,7 @@ export function fakeModels(config: ProxyConfig): JsonObject {
       model_info_registry: modelInfoRegistry(config),
       history_summary_min_version: "0.0.0",
       history_summary_params: historySummaryParams(config),
+      beachhead_enable_sub_agent_tool: true,
       enable_hindsight: false,
       bypass_language_filter: true,
       small_sync_threshold: 1048576,

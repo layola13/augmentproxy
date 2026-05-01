@@ -599,6 +599,8 @@ function toolDescriptionForModel(tool: JsonObject): string {
       'Example arguments: {"terminal_id":1}. Never use undefined terminal_id.',
     "write-process":
       'Example arguments: {"terminal_id":1,"input_text":"text"}. Never use undefined terminal_id.',
+    "sub-agent":
+      'Example arguments: {"action":"run","name":"reviewer","instruction":"Inspect the failing tests and report concise findings."}. To retrieve a completed agent result, use {"action":"output","name":"reviewer"}.',
   };
   const example = examples[name] ??
     "Arguments must be a valid JSON object matching the schema.";
@@ -1709,6 +1711,12 @@ function invalidToolCallHint(
   const reason = typeof first.reason === "string"
     ? first.reason
     : "The tool-call arguments were invalid.";
+  if (
+    name === "str-replace-editor" &&
+    reason.includes("no unapplied str_replace_entries")
+  ) {
+    return "The requested edit appears to have already been applied or no longer matches the current file. Re-read the file and continue from the current contents.";
+  }
   return `Tool call rejected (${name}): ${reason}`;
 }
 
