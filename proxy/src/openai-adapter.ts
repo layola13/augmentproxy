@@ -98,13 +98,12 @@ function historyToMessages(history: JsonValue): OpenAIMessage[] {
     const record = item as JsonObject;
 
     const requestNodes = asArray(record.request_nodes);
-    const userText = requestNodes.map(nodeText).filter(Boolean).join("\n") || text(record.request_message).trim();
-    if (userText) messages.push({ role: "user", content: userText });
-
     // Auggie stores tool results in the next turn's request_nodes. For OpenAI
     // chat-completions, those tool messages must appear immediately after the
     // assistant tool_calls that produced them, before the next assistant turn.
     appendToolResultMessages(messages, requestNodes);
+    const userText = requestNodes.map(nodeText).filter(Boolean).join("\n") || text(record.request_message).trim();
+    if (userText) messages.push({ role: "user", content: userText });
 
     const responseNodes = asArray(record.response_nodes);
     const toolCalls = responseNodes.map(nodeToolUse).filter((call): call is JsonObject => Boolean(call));
@@ -146,7 +145,7 @@ function buildMessages(config: ProxyConfig, ctx: RequestContext): OpenAIMessage[
 
   const messages: OpenAIMessage[] = [];
   if (systemParts.length > 0) messages.push({ role: "system", content: sanitizeUpstreamText(config, systemParts.join("\n\n")) });
-  messages.push(...sanitizeMessages(config, pruneOrphanToolMessages(historyToMessages(body.chat_history))));
+  messages.push(...sanitizeMessages(config, historyToMessages(body.chat_history)));
   appendToolResultMessages(messages, body.nodes);
 
   const userParts: string[] = [];
@@ -162,33 +161,59 @@ function buildMessages(config: ProxyConfig, ctx: RequestContext): OpenAIMessage[
 
   const userContent = userParts.length > 0 ? userParts.join("\n\n") : "Continue.";
   messages.push({ role: "user", content: sanitizeUpstreamText(config, userContent) });
-  return messages;
+  return pruneOrphanToolMessages(messages);
 }
 
 function pruneOrphanToolMessages(messages: OpenAIMessage[]): OpenAIMessage[] {
   const output: OpenAIMessage[] = [];
-  const pendingToolIds = new Set<string>();
-  for (const message of messages) {
-    if (message.role === "assistant") {
-      const messageRecord = message as unknown as JsonObject;
-      const toolCalls = Array.isArray(messageRecord.tool_calls) ? messageRecord.tool_calls as JsonValue[] : [];
-      for (const call of toolCalls) {
-        if (!call || typeof call !== "object" || Array.isArray(call)) continue;
-        const id = (call as JsonObject).id;
-        if (typeof id === "string" && id) pendingToolIds.add(id);
-      }
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role !== "assistant") {
+      if (message.role !== "tool") output.push(message);
+      continue;
+    }
+
+    const assistantRecord = message as unknown as JsonObject;
+    const toolCalls = Array.isArray(assistantRecord.tool_calls) ? assistantRecord.tool_calls as JsonValue[] : [];
+    if (toolCalls.length === 0) {
       output.push(message);
       continue;
     }
-    if (message.role === "tool") {
-      const id = (message as unknown as JsonObject).tool_call_id;
-      if (typeof id === "string" && pendingToolIds.has(id)) {
-        pendingToolIds.delete(id);
-        output.push(message);
-      }
-      continue;
+
+    const expectedOrder: string[] = [];
+    const expectedIds = new Set<string>();
+    for (const call of toolCalls) {
+      if (!call || typeof call !== "object" || Array.isArray(call)) continue;
+      const id = (call as JsonObject).id;
+      if (typeof id !== "string" || !id || expectedIds.has(id)) continue;
+      expectedIds.add(id);
+      expectedOrder.push(id);
     }
-    output.push(message);
+
+    let j = i + 1;
+    const toolById = new Map<string, OpenAIMessage>();
+    while (j < messages.length && messages[j].role === "tool") {
+      const toolRecord = messages[j] as unknown as JsonObject;
+      const toolCallId = typeof toolRecord.tool_call_id === "string" ? toolRecord.tool_call_id : "";
+      if (expectedIds.has(toolCallId) && !toolById.has(toolCallId)) {
+        toolById.set(toolCallId, messages[j]);
+      }
+      j++;
+    }
+
+    if (expectedIds.size > 0 && toolById.size === expectedIds.size) {
+      output.push(message);
+      for (const id of expectedOrder) {
+        const toolMessage = toolById.get(id);
+        if (toolMessage) output.push(toolMessage);
+      }
+    } else if (message.content.trim()) {
+      // Keep assistant text but drop invalid/incomplete tool_calls to avoid
+      // provider-side protocol errors.
+      output.push({ role: "assistant", content: message.content });
+    }
+
+    i = j - 1;
   }
   return output;
 }
