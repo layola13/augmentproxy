@@ -56,8 +56,7 @@ function sanitizeUpstreamText(config: ProxyConfig, value: string): string {
   return value
     .replace(/augment\.mjs/gi, "codex-cli")
     .replace(/\bAugment\s+Code\b/gi, config.upstreamAppName)
-    .replace(/\bAuggie\b/gi, config.upstreamAppName)
-    .replace(/\bAugment\b/gi, config.upstreamAppName);
+    .replace(/\bAuggie\b/gi, config.upstreamAppName);
 }
 
 function sanitizeMessages(config: ProxyConfig, messages: OpenAIMessage[]): OpenAIMessage[] {
@@ -102,12 +101,15 @@ function historyToMessages(history: JsonValue): OpenAIMessage[] {
     const userText = requestNodes.map(nodeText).filter(Boolean).join("\n") || text(record.request_message).trim();
     if (userText) messages.push({ role: "user", content: userText });
 
+    // Auggie stores tool results in the next turn's request_nodes. For OpenAI
+    // chat-completions, those tool messages must appear immediately after the
+    // assistant tool_calls that produced them, before the next assistant turn.
+    appendToolResultMessages(messages, requestNodes);
+
     const responseNodes = asArray(record.response_nodes);
     const toolCalls = responseNodes.map(nodeToolUse).filter((call): call is JsonObject => Boolean(call));
     const responseText = responseNodes.map(nodeText).filter(Boolean).join("\n") || text(record.response_text).trim();
     if (responseText || toolCalls.length > 0) messages.push({ role: "assistant", content: responseText, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
-
-    appendToolResultMessages(messages, requestNodes);
 
     if (messages.length === 0) {
       const roleRaw = text(record.role || record.speaker || record.type).toLowerCase();
@@ -140,10 +142,11 @@ function buildMessages(config: ProxyConfig, ctx: RequestContext): OpenAIMessage[
   addIfPresent(systemParts, "Workspace guidelines", body.workspace_guidelines);
   addIfPresent(systemParts, "Rules", body.rules);
   addIfPresent(systemParts, "Skills", body.skills);
+  systemParts.push(toolUseSystemPrompt(ctx));
 
   const messages: OpenAIMessage[] = [];
   if (systemParts.length > 0) messages.push({ role: "system", content: sanitizeUpstreamText(config, systemParts.join("\n\n")) });
-  messages.push(...sanitizeMessages(config, historyToMessages(body.chat_history)));
+  messages.push(...sanitizeMessages(config, pruneOrphanToolMessages(historyToMessages(body.chat_history))));
   appendToolResultMessages(messages, body.nodes);
 
   const userParts: string[] = [];
@@ -160,6 +163,133 @@ function buildMessages(config: ProxyConfig, ctx: RequestContext): OpenAIMessage[
   const userContent = userParts.length > 0 ? userParts.join("\n\n") : "Continue.";
   messages.push({ role: "user", content: sanitizeUpstreamText(config, userContent) });
   return messages;
+}
+
+function pruneOrphanToolMessages(messages: OpenAIMessage[]): OpenAIMessage[] {
+  const output: OpenAIMessage[] = [];
+  const pendingToolIds = new Set<string>();
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      const messageRecord = message as unknown as JsonObject;
+      const toolCalls = Array.isArray(messageRecord.tool_calls) ? messageRecord.tool_calls as JsonValue[] : [];
+      for (const call of toolCalls) {
+        if (!call || typeof call !== "object" || Array.isArray(call)) continue;
+        const id = (call as JsonObject).id;
+        if (typeof id === "string" && id) pendingToolIds.add(id);
+      }
+      output.push(message);
+      continue;
+    }
+    if (message.role === "tool") {
+      const id = (message as unknown as JsonObject).tool_call_id;
+      if (typeof id === "string" && pendingToolIds.has(id)) {
+        pendingToolIds.delete(id);
+        output.push(message);
+      }
+      continue;
+    }
+    output.push(message);
+  }
+  return output;
+}
+
+function hasPriorTurns(ctx: RequestContext): boolean {
+  const body = objectBody(ctx);
+  if (asArray(body.chat_history).length > 0) return true;
+  for (const node of asArray(body.nodes)) {
+    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+    if ((node as JsonObject).tool_result_node) return true;
+  }
+  return false;
+}
+
+function hasDirectoryListingResult(ctx: RequestContext, path: string): boolean {
+  const body = objectBody(ctx);
+  const normalized = cleanExtractedPath(path);
+  const isListingText = (content: string): boolean => {
+    if (!content) return false;
+    const lower = content.toLowerCase();
+    if (!lower.includes("files and directories")) return false;
+    return content.includes(normalized);
+  };
+
+  for (const node of asArray(body.nodes)) {
+    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+    const result = (node as JsonObject).tool_result_node;
+    if (!result || typeof result !== "object" || Array.isArray(result)) continue;
+    const content = text((result as JsonObject).content);
+    if (isListingText(content)) return true;
+  }
+
+  for (const item of asArray(body.chat_history).slice(-10)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    for (const node of asArray(record.request_nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const result = (node as JsonObject).tool_result_node;
+      if (!result || typeof result !== "object" || Array.isArray(result)) continue;
+      const content = text((result as JsonObject).content);
+      if (isListingText(content)) return true;
+    }
+  }
+
+  return false;
+}
+
+function toolUseSystemPrompt(ctx: RequestContext): string {
+  const body = objectBody(ctx);
+  const workspacePath = typeof body.path === "string" && body.path ? body.path : undefined;
+  const toolDefinitions = Array.isArray(body.tool_definitions) ? body.tool_definitions : [];
+  const toolSummaries = toolDefinitions
+    .filter((item): item is JsonObject => !!item && typeof item === "object" && !Array.isArray(item) && typeof (item as JsonObject).name === "string")
+    .map((tool) => toolPromptSummary(tool))
+    .filter(Boolean);
+
+  const lines = [
+    "Auggie/Codex-style tool protocol:",
+    "- You are an autonomous coding agent. Keep working until the user's request is fully resolved; do not stop after only announcing a plan or after one tool call.",
+    "- Before using tools, briefly state what you are about to inspect or do. After tool results, continue from those exact results instead of repeating the same call.",
+    "- Use tools only through the provided function-calling interface. Do not write XML, Markdown tool blocks, or prose pretending to be a tool call.",
+    "- Every function call argument must be one complete JSON object that satisfies the tool schema. Never call a tool with {} unless that tool schema explicitly has no required fields.",
+    "- Do not invent paths. Use paths from the current request, conversation, workspace context, search results, or directory listings.",
+    "- If a required argument is unknown, first use a discovery tool with a known directory/path or answer from available context; do not emit an invalid call.",
+    "- If a tool fails validation, repair the next tool call by providing the missing required JSON field; do not repeat the same invalid call.",
+    "- For project evaluation, inspect the workspace root/directory first, then read specific files discovered from listings, then synthesize a final answer.",
+    "- Final-answer format is mandatory: after the main answer, append a section titled \"Next Steps\" with 1-3 numbered, concrete, executable follow-up actions tailored to the user's goal. Do not omit this section.",
+    "- If you already have a directory listing result, do not call view on the same root directory again in later turns. Move forward by reading specific files or using codebase-retrieval with a concrete information_request.",
+  ];
+  if (workspacePath) {
+    lines.push(`- Current workspace/path from the client: ${workspacePath}. Use it as the starting directory when you need to inspect this project.`);
+    if (!hasPriorTurns(ctx) && !hasDirectoryListingResult(ctx, workspacePath)) {
+      lines.push(`- For the initial directory inspection only, call view with {"path":"${workspacePath}","type":"directory"}. Do not repeat that same directory call in later turns unless new information requires it.`);
+    } else if (hasDirectoryListingResult(ctx, workspacePath)) {
+      lines.push(`- Directory listing for ${workspacePath} is already available in prior tool results. Do NOT call view on ${workspacePath} again; continue with concrete files/subdirectories from that listing.`);
+    }
+  }
+  lines.push(
+    "Critical tool argument formats:",
+    "- view: requires a concrete path. Valid examples: {\"path\":\"<known-file>\",\"type\":\"file\"} or {\"path\":\"<known-directory>\",\"type\":\"directory\"}. Invalid: {}, {\"type\":\"file\"}, {\"path\":\"\"}.",
+    "- codebase-retrieval: requires information_request. Valid example: {\"information_request\":\"Find the modules responsible for request routing, OpenAI adaptation, indexing, and configuration.\"}. Invalid: {}.",
+    "- launch-process: requires command. Prefer simple commands and set cwd only when known. Valid example: {\"command\":\"pwd && ls -la\",\"cwd\":\"<known-directory>\"}.",
+    "- save-file / str-replace-editor: only use when editing is explicitly needed, and provide the complete required schema fields.",
+  );
+  if (toolSummaries.length > 0) {
+    lines.push("Available tool schemas from this client:");
+    lines.push(...toolSummaries.slice(0, 30));
+  }
+  return lines.join("\n");
+}
+
+function toolPromptSummary(tool: JsonObject): string {
+  const name = typeof tool.name === "string" ? normalizeToolName(tool.name) : "unknown";
+  const schema = parseToolSchema(tool);
+  const required = Array.isArray(schema.required) ? schema.required.filter((item) => typeof item === "string") : [];
+  const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+    ? Object.keys(schema.properties as JsonObject)
+    : [];
+  const requiredText = required.length > 0 ? required.join(", ") : "none";
+  const propertyText = properties.length > 0 ? properties.slice(0, 12).join(", ") : "unspecified";
+  return `- ${name}: required=[${requiredText}], fields=[${propertyText}]`;
 }
 
 
@@ -192,12 +322,33 @@ function buildOpenAITools(ctx: RequestContext): JsonObject[] {
       type: "function",
       function: {
         name: tool.name,
-        description: typeof tool.description === "string" ? tool.description : "",
+        description: toolDescriptionForModel(tool),
         parameters: parseToolSchema(tool),
       },
     });
   }
   return tools;
+}
+
+function toolDescriptionForModel(tool: JsonObject): string {
+  const base = typeof tool.description === "string" ? tool.description.trim() : "";
+  const name = typeof tool.name === "string" ? normalizeToolName(tool.name) : "unknown";
+  const schema = parseToolSchema(tool);
+  const required = Array.isArray(schema.required) ? schema.required.filter((item) => typeof item === "string") as string[] : [];
+  const requirements = required.length > 0
+    ? `Required JSON fields: ${required.join(", ")}. Do not call this tool unless every required field is present and non-empty.`
+    : "This tool has no required JSON fields; use {} only if no optional fields are needed.";
+  const examples: Record<string, string> = {
+    "view": 'Example arguments: {"path":"<known-file-or-directory>","type":"file"}. Never use {}.',
+    "view-range-untruncated": 'Example arguments: {"reference_id":"<reference-id>","start_line":1,"end_line":80}. Never use {}.',
+    "codebase-retrieval": 'Example arguments: {"information_request":"Find files and modules relevant to the user request."}. Never use {}.',
+    "launch-process": 'Example arguments: {"command":"pwd && ls -la","wait":true,"max_wait_seconds":60,"cwd":"<known-directory>"}. Never use {} or an empty command.',
+    "read-process": 'Example arguments: {"terminal_id":1,"wait":true,"max_wait_seconds":60}. Never use undefined terminal_id.',
+    "kill-process": 'Example arguments: {"terminal_id":1}. Never use undefined terminal_id.',
+    "write-process": 'Example arguments: {"terminal_id":1,"input_text":"text"}. Never use undefined terminal_id.',
+  };
+  const example = examples[name] ?? "Arguments must be a valid JSON object matching the schema.";
+  return [base, requirements, example].filter(Boolean).join("\n\n");
 }
 
 
@@ -229,17 +380,150 @@ function thinkingNodes(thinking: string[], startingId = 1000): JsonObject[] {
 function workspaceFallbackPath(ctx: RequestContext): string | undefined {
   const body = objectBody(ctx);
   if (typeof body.path === "string" && body.path) return body.path;
+  const discovered = collectWorkspacePaths(body);
+  return discovered[0];
+}
+
+function collectWorkspacePaths(value: JsonValue, output: string[] = [], seen = new Set<JsonValue>()): string[] {
+  if (output.length >= 20 || value === null || value === undefined) return output;
+  if (typeof value === "string") {
+    for (const match of value.matchAll(/\/[^\s"'`<>]+/g)) {
+      const path = cleanExtractedPath(match[0]);
+      if (path.includes("/home/") || path.includes("/workspace") || path.includes("/projects/")) {
+        if (!output.includes(path)) output.push(path);
+      }
+    }
+    return output;
+  }
+  if (typeof value !== "object") return output;
+  if (seen.has(value)) return output;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) collectWorkspacePaths(item, output, seen);
+    return output;
+  }
+  const record = value as JsonObject;
+  for (const key of ["path", "cwd", "workspace", "workspace_path", "root", "root_path", "project_path"]) {
+    const item = record[key];
+    if (typeof item === "string" && item.startsWith("/")) {
+      const path = cleanExtractedPath(item);
+      if (!output.includes(path)) output.push(path);
+    }
+  }
+  for (const item of Object.values(record)) collectWorkspacePaths(item, output, seen);
+  return output;
+}
+
+function normalizeCommandCandidate(command: string): string | undefined {
+  const trimmed = command.trim().replace(/^["'`]+|["'`]+$/g, "");
+  if (!trimmed) return undefined;
+  if (trimmed.length > 300) return undefined;
+  return trimmed;
+}
+
+function isLikelyShellCommand(command: string): boolean {
+  if (!command) return false;
+  if (/[{}[\]]/.test(command)) return false;
+  if (/^https?:\/\//i.test(command)) return false;
+  if (/[;&|><]/.test(command)) return true;
+  const firstToken = command.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+  return [
+    "pwd",
+    "ls",
+    "cat",
+    "rg",
+    "grep",
+    "find",
+    "git",
+    "npm",
+    "pnpm",
+    "yarn",
+    "deno",
+    "node",
+    "python",
+    "python3",
+    "bash",
+    "sh",
+    "head",
+    "tail",
+    "awk",
+    "sed",
+    "make",
+    "docker",
+    "curl",
+  ].includes(firstToken);
+}
+
+function extractCommandFromText(input: string): string | undefined {
+  const patterns = [
+    /(?:\b(?:run|execute|command|cmd)\b|执行命令|运行命令|执行|运行)[^`"\n]{0,30}`([^`\n]{1,220})`/i,
+    /(?:\b(?:run|execute|command|cmd)\b|执行命令|运行命令|执行|运行)[^"'“”\n]{0,30}[“"]([^"”\n]{1,220})[”"]/i,
+    /(?:\b(?:run|execute|command|cmd)\b|执行命令|运行命令|执行|运行)[^"'“”\n]{0,30}['"]([^'"\n]{1,220})['"]/i,
+  ];
+  for (const pattern of patterns) {
+    const match = input.match(pattern);
+    const candidate = match?.[1] ? normalizeCommandCandidate(match[1]) : undefined;
+    if (candidate && isLikelyShellCommand(candidate)) return candidate;
+  }
+
+  for (const match of input.matchAll(/`([^`\n]{1,220})`/g)) {
+    const candidate = normalizeCommandCandidate(match[1]);
+    if (candidate && isLikelyShellCommand(candidate)) return candidate;
+  }
+
+  for (const match of input.matchAll(/[“"]([^"”\n]{1,220})[”"]/g)) {
+    const candidate = normalizeCommandCandidate(match[1]);
+    if (candidate && isLikelyShellCommand(candidate)) return candidate;
+  }
+
   return undefined;
 }
 
-function parseToolCall(call: JsonValue, fallbackPath?: string): { id: string; name: string; argumentsJson: string } | undefined {
+function inferLaunchCommandFromContext(ctx: RequestContext): string | undefined {
+  const body = objectBody(ctx);
+  const texts: string[] = [];
+  for (const key of ["message", "prompt", "instruction"]) {
+    const value = body[key];
+    if (typeof value === "string" && value.trim()) texts.push(value);
+  }
+  for (const node of asArray(body.nodes)) {
+    const rendered = nodeText(node).trim();
+    if (rendered) texts.push(rendered);
+  }
+  for (const item of asArray(body.chat_history).slice(-4)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    for (const node of asArray(record.request_nodes)) {
+      const rendered = nodeText(node).trim();
+      if (rendered) texts.push(rendered);
+    }
+    const requestMessage = text(record.request_message).trim();
+    if (requestMessage) texts.push(requestMessage);
+  }
+  for (const value of texts) {
+    const candidate = extractCommandFromText(value);
+    if (candidate) return candidate;
+  }
+  return undefined;
+}
+
+function parseToolCall(
+  call: JsonValue,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+): { id: string; name: string; argumentsJson: string } | undefined {
   if (!call || typeof call !== "object" || Array.isArray(call)) return undefined;
   const record = call as JsonObject;
   const fn = record.function;
   if (!fn || typeof fn !== "object" || Array.isArray(fn)) return undefined;
   const fnRecord = fn as JsonObject;
   const name = normalizeToolName(typeof fnRecord.name === "string" && fnRecord.name ? fnRecord.name : "unknown");
-  const argumentsJson = normalizeToolArguments(name, typeof fnRecord.arguments === "string" ? fnRecord.arguments : JSON.stringify(fnRecord.arguments ?? {}), fallbackPath);
+  const argumentsJson = normalizeToolArguments(
+    name,
+    typeof fnRecord.arguments === "string" ? fnRecord.arguments : JSON.stringify(fnRecord.arguments ?? {}),
+    fallbackPath,
+    launchCommandFallback,
+  );
   const id = typeof record.id === "string" && record.id ? record.id : `tool_${crypto.randomUUID()}`;
   return { id, name, argumentsJson };
 }
@@ -267,15 +551,20 @@ function normalizeToolName(name: string): string {
   return aliases[normalized] ?? normalized;
 }
 
-function normalizeToolArguments(toolName: string, argumentsJson: string, fallbackPath?: string): string {
+function normalizeToolArguments(
+  toolName: string,
+  argumentsJson: string,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+): string {
   let args: JsonObject;
   try {
-    const parsed = JSON.parse(argumentsJson || "{}");
+    const parsed = JSON.parse(repairArgumentsJson(argumentsJson) || "{}");
     args = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as JsonObject : {};
   } catch {
     args = {};
     const pathMatch = argumentsJson.match(/(?:path|file_path|filepath|filename|file|absolute_path)\s*[:=]\s*["']?([^"'\n,}]+)["']?/i);
-    if (pathMatch?.[1]) args.path = pathMatch[1].trim();
+    if (pathMatch?.[1]) args.path = cleanExtractedPath(pathMatch[1]);
     else if (argumentsJson.trim().startsWith("/")) args.path = argumentsJson.trim();
     else if (argumentsJson.trim()) args.raw_input = argumentsJson;
   }
@@ -285,21 +574,308 @@ function normalizeToolArguments(toolName: string, argumentsJson: string, fallbac
     if (typeof candidate === "string") args.path = candidate;
     else if (fallbackPath) args.path = fallbackPath;
   }
+  if ((toolName === "view" || toolName === "view-range-untruncated") && typeof args.path === "string") args.path = repairViewPath(args.path, fallbackPath);
+  if ((toolName === "view" || toolName === "view-range-untruncated") && args.path === "." && fallbackPath) args.path = fallbackPath;
   if ((toolName === "launch-process") && typeof args.command !== "string") {
     const candidate = args.cmd ?? args.shell_command;
     if (typeof candidate === "string") args.command = candidate;
+    else if (typeof args.raw_input === "string" && isLikelyShellCommand(args.raw_input)) args.command = args.raw_input;
+    else if (launchCommandFallback) args.command = launchCommandFallback;
   }
   if ((toolName === "launch-process") && typeof args.cwd !== "string" && fallbackPath) args.cwd = fallbackPath;
+  if ((toolName === "launch-process") && typeof args.wait !== "boolean") args.wait = true;
+  if ((toolName === "launch-process") && typeof args.max_wait_seconds !== "number") args.max_wait_seconds = 120;
+  if (toolName === "codebase-retrieval" && typeof args.information_request !== "string") {
+    args.information_request = "Provide an overview of this workspace and identify the key files relevant to the user's request.";
+  }
   return JSON.stringify(args);
 }
 
-function toolCallsToNodes(toolCalls: JsonValue, startingId = 1, fallbackPath?: string): JsonObject[] {
+function repairArgumentsJson(argumentsJson: string): string {
+  const trimmed = argumentsJson.trim();
+  if (!trimmed) return "{}";
+  try {
+    JSON.parse(trimmed);
+    return trimmed;
+  } catch {
+    // Continue with conservative repairs below.
+  }
+  if (trimmed.startsWith("{") && !trimmed.endsWith("}")) {
+    const quoteCount = (trimmed.match(/(?<!\\)"/g) ?? []).length;
+    return `${trimmed}${quoteCount % 2 === 1 ? '"' : ""}}`;
+  }
+  return trimmed;
+}
+
+function cleanExtractedPath(path: string): string {
+  return path.trim().replace(/["'`}\])]+$/g, "");
+}
+
+const VIEW_PATH_EXTENSION_CANDIDATES = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".mts",
+  ".cts",
+  ".go",
+  ".rs",
+  ".zig",
+  ".py",
+  ".pyi",
+  ".rb",
+  ".php",
+  ".java",
+  ".kt",
+  ".kts",
+  ".scala",
+  ".clj",
+  ".c",
+  ".h",
+  ".cc",
+  ".cpp",
+  ".cxx",
+  ".hpp",
+  ".m",
+  ".mm",
+  ".swift",
+  ".dart",
+  ".lua",
+  ".r",
+  ".sql",
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".fish",
+  ".json",
+  ".jsonc",
+  ".toml",
+  ".md",
+  ".mdx",
+  ".txt",
+  ".rst",
+  ".yaml",
+  ".yml",
+  ".ini",
+  ".cfg",
+  ".conf",
+  ".xml",
+  ".html",
+  ".css",
+  ".scss",
+  ".less",
+];
+
+function normalizePathSlashes(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function isAbsolutePath(path: string): boolean {
+  return path.startsWith("/") || /^[A-Za-z]:\//.test(path);
+}
+
+function joinPath(base: string, child: string): string {
+  if (!base) return child;
+  if (!child) return base;
+  if (base.endsWith("/")) return `${base}${child.replace(/^\/+/, "")}`;
+  return `${base}/${child.replace(/^\/+/, "")}`;
+}
+
+function pathBasename(path: string): string {
+  const normalized = normalizePathSlashes(path).replace(/\/+$/g, "");
+  if (!normalized) return "";
+  const idx = normalized.lastIndexOf("/");
+  return idx >= 0 ? normalized.slice(idx + 1) : normalized;
+}
+
+function pathDirname(path: string): string | undefined {
+  const normalized = normalizePathSlashes(path).replace(/\/+$/g, "");
+  if (!normalized) return undefined;
+  const idx = normalized.lastIndexOf("/");
+  if (idx < 0) return undefined;
+  if (idx === 0) return "/";
+  return normalized.slice(0, idx);
+}
+
+function pathExists(path: string): boolean {
+  try {
+    Deno.statSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function directoryExists(path: string): boolean {
+  try {
+    return Deno.statSync(path).isDirectory;
+  } catch {
+    return false;
+  }
+}
+
+function hasFileExtension(path: string): boolean {
+  return /\.[^/\\.]+$/.test(pathBasename(path));
+}
+
+function uniqueExtensionSibling(path: string): string | undefined {
+  const dir = pathDirname(path);
+  const base = pathBasename(path);
+  if (!dir || !base || !directoryExists(dir)) return undefined;
+  const baseLower = base.toLowerCase();
+  const matches: string[] = [];
+  for (const entry of Deno.readDirSync(dir)) {
+    if (!entry.isFile) continue;
+    const nameLower = entry.name.toLowerCase();
+    if (nameLower.startsWith(`${baseLower}.`)) matches.push(entry.name);
+  }
+  if (matches.length === 1) return joinPath(dir, matches[0]);
+  if (matches.length > 1) return undefined;
+  const stemIndex = baseLower.lastIndexOf("-");
+  if (stemIndex <= 1) return undefined;
+  const stem = baseLower.slice(0, stemIndex);
+  const stemMatches: string[] = [];
+  for (const entry of Deno.readDirSync(dir)) {
+    if (!entry.isFile) continue;
+    const nameLower = entry.name.toLowerCase();
+    if (nameLower.startsWith(`${stem}-`)) stemMatches.push(entry.name);
+  }
+  if (stemMatches.length === 1) return joinPath(dir, stemMatches[0]);
+  return undefined;
+}
+
+function uniqueDirectoryPrefixSibling(path: string): string | undefined {
+  const dir = pathDirname(path);
+  const base = pathBasename(path);
+  if (!dir || !base || !directoryExists(dir)) return undefined;
+  if (base.length < 2 || hasFileExtension(base)) return undefined;
+  const baseLower = base.toLowerCase();
+  const matches: string[] = [];
+  for (const entry of Deno.readDirSync(dir)) {
+    if (!entry.isDirectory) continue;
+    const nameLower = entry.name.toLowerCase();
+    if (nameLower.startsWith(baseLower)) matches.push(entry.name);
+  }
+  if (matches.length === 1) return joinPath(dir, matches[0]);
+  return undefined;
+}
+
+function uniqueFilePrefixSibling(path: string): string | undefined {
+  const dir = pathDirname(path);
+  const base = pathBasename(path);
+  if (!dir || !base || !directoryExists(dir)) return undefined;
+  if (base.length < 2 || hasFileExtension(base)) return undefined;
+  const baseLower = base.toLowerCase();
+  const matches: string[] = [];
+  for (const entry of Deno.readDirSync(dir)) {
+    if (!entry.isFile) continue;
+    const nameLower = entry.name.toLowerCase();
+    if (nameLower.startsWith(baseLower)) matches.push(entry.name);
+  }
+  if (matches.length === 1) return joinPath(dir, matches[0]);
+  return undefined;
+}
+
+function repairViewPath(path: string, fallbackPath?: string): string {
+  const cleaned = cleanExtractedPath(path);
+  if (!cleaned) return cleaned;
+  const fallback = fallbackPath ? normalizePathSlashes(fallbackPath.trim()) : undefined;
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const addCandidate = (value?: string) => {
+    if (!value) return;
+    const normalized = normalizePathSlashes(value.trim());
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    ordered.push(normalized);
+  };
+
+  addCandidate(cleaned);
+  if (fallback && cleaned === ".") addCandidate(fallback);
+  if (fallback && !isAbsolutePath(cleaned)) addCandidate(joinPath(fallback, cleaned.replace(/^\.\//, "")));
+
+  for (const candidate of ordered) {
+    if (pathExists(candidate)) return candidate;
+  }
+
+  const baseCandidates = [...ordered];
+  for (const candidate of baseCandidates) {
+    if (hasFileExtension(candidate)) continue;
+    for (const ext of VIEW_PATH_EXTENSION_CANDIDATES) addCandidate(`${candidate}${ext}`);
+  }
+
+  for (const candidate of ordered) {
+    if (pathExists(candidate)) return candidate;
+  }
+  for (const candidate of ordered) {
+    const repaired = uniqueExtensionSibling(candidate);
+    if (repaired) return repaired;
+  }
+  for (const candidate of ordered) {
+    const repairedFile = uniqueFilePrefixSibling(candidate);
+    if (repairedFile) return repairedFile;
+  }
+  for (const candidate of ordered) {
+    const repairedDir = uniqueDirectoryPrefixSibling(candidate);
+    if (repairedDir) return repairedDir;
+  }
+  return cleaned;
+}
+
+function invalidToolReason(toolName: string, argumentsJson: string): string | undefined {
+  try {
+    const args = JSON.parse(argumentsJson || "{}") as JsonObject;
+    if ((toolName === "view" || toolName === "view-range-untruncated") && typeof args.path !== "string") {
+      return `Tool ${toolName} requires a concrete path. Retry with valid JSON like {"path":"README.md","type":"file"}.`;
+    }
+    if (toolName === "launch-process") {
+      const missing = ["command", "wait", "max_wait_seconds", "cwd"].filter((key) => args[key] === undefined || args[key] === null || args[key] === "");
+      if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}. Retry with valid JSON like {"command":"pwd && ls -la","wait":true,"max_wait_seconds":60,"cwd":"/known/directory"}.`;
+    }
+    if (toolName === "read-process") {
+      const missing = ["terminal_id", "wait", "max_wait_seconds"].filter((key) => args[key] === undefined || args[key] === null || args[key] === "");
+      if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}. Retry only after launch-process returns a terminal_id.`;
+    }
+    if ((toolName === "kill-process" || toolName === "write-process") && (args.terminal_id === undefined || args.terminal_id === null || args.terminal_id === "")) {
+      return `Tool ${toolName} requires terminal_id. Retry only after launch-process returns a terminal_id.`;
+    }
+    if (toolName === "write-process" && typeof args.input_text !== "string") {
+      return `Tool ${toolName} requires input_text.`;
+    }
+    if (toolName === "web-fetch" && typeof args.url !== "string") return `Tool ${toolName} requires url.`;
+    if (toolName === "search-untruncated") {
+      const missing = ["reference_id", "search_term"].filter((key) => typeof args[key] !== "string" || args[key] === "");
+      if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}.`;
+    }
+    if (toolName === "view-range-untruncated") {
+      const missing = ["reference_id", "start_line", "end_line"].filter((key) => args[key] === undefined || args[key] === null || args[key] === "");
+      if (missing.length > 0) return `Tool ${toolName} requires ${missing.join(", ")}.`;
+    }
+    if (toolName === "codebase-retrieval" && typeof args.information_request !== "string") return `Tool ${toolName} requires information_request.`;
+    if (toolName === "reorganize_tasklist" && typeof args.markdown !== "string") return `Tool ${toolName} requires markdown.`;
+    if ((toolName === "update_tasks" || toolName === "add_tasks") && !Array.isArray(args.tasks)) return `Tool ${toolName} requires tasks array.`;
+  } catch {
+    return `Tool ${toolName} arguments are not valid JSON. Retry with a valid JSON object.`;
+  }
+  return undefined;
+}
+
+function toolCallsToNodes(
+  toolCalls: JsonValue,
+  startingId = 1,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+): JsonObject[] {
   if (!Array.isArray(toolCalls)) return [];
   const nodes: JsonObject[] = [];
   let id = startingId;
   for (const call of toolCalls) {
-    const parsed = parseToolCall(call, fallbackPath);
+    const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
     if (!parsed) continue;
+    const invalidReason = invalidToolReason(parsed.name, parsed.argumentsJson);
+    if (invalidReason) continue;
     nodes.push({
       id,
       type: 5,
@@ -312,6 +888,82 @@ function toolCallsToNodes(toolCalls: JsonValue, startingId = 1, fallbackPath?: s
     id += 1;
   }
   return nodes;
+}
+
+function recentToolCallCounts(ctx: RequestContext, fallbackPath?: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  const body = objectBody(ctx);
+  for (const item of asArray(body.chat_history).slice(-8)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    for (const node of asArray(record.response_nodes)) {
+      const call = nodeToolUse(node);
+      if (!call) continue;
+      const parsed = parseToolCall(call, fallbackPath);
+      if (parsed) {
+        const key = toolCallKey(parsed.name, parsed.argumentsJson);
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  return counts;
+}
+
+function toolCallKey(name: string, argumentsJson: string): string {
+  try {
+    return `${name}:${JSON.stringify(JSON.parse(argumentsJson))}`;
+  } catch {
+    return `${name}:${argumentsJson}`;
+  }
+}
+
+function filterRepeatedToolCalls(
+  toolCalls: JsonObject[],
+  recentCounts: Map<string, number>,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+): { valid: JsonObject[]; repeated: JsonObject[] } {
+  const valid: JsonObject[] = [];
+  const repeated: JsonObject[] = [];
+  for (const call of toolCalls) {
+    const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
+    if (!parsed) continue;
+    const key = toolCallKey(parsed.name, parsed.argumentsJson);
+    const seenCount = recentCounts.get(key) ?? 0;
+    // Allow one repeat in case the model is reconciling tool output; start
+    // filtering only after the same call has appeared multiple times.
+    if (seenCount >= 2) repeated.push(call);
+    else valid.push(call);
+  }
+  return { valid, repeated };
+}
+
+function invalidToolCallSummaries(toolCalls: JsonValue, fallbackPath?: string, launchCommandFallback?: string): JsonObject[] {
+  if (!Array.isArray(toolCalls)) return [];
+  const output: JsonObject[] = [];
+  for (const call of toolCalls) {
+    const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
+    if (!parsed) continue;
+    const reason = invalidToolReason(parsed.name, parsed.argumentsJson);
+    if (reason) output.push({ id: parsed.id, name: parsed.name, arguments: parsed.argumentsJson, reason });
+  }
+  return output;
+}
+
+function invalidToolCallHint(invalidToolCalls: JsonObject[]): string | undefined {
+  if (invalidToolCalls.length === 0) return undefined;
+  const first = invalidToolCalls[0];
+  const name = typeof first.name === "string" ? first.name : "unknown";
+  const reason = typeof first.reason === "string" ? first.reason : "The tool-call arguments were invalid.";
+  return `Tool call rejected (${name}): ${reason}`;
+}
+
+function hasMeaningfulVisibleText(content: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed) return false;
+  if (trimmed.length >= 16) return true;
+  const semanticChars = (trimmed.match(/[A-Za-z0-9\u4E00-\u9FFF]/g) ?? []).length;
+  return semanticChars >= 4;
 }
 
 function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
@@ -751,9 +1403,16 @@ export async function forwardAugmentStream(config: ProxyConfig, ctx: RequestCont
           visibleText += flushed.visible;
           safeEnqueue({ text: flushed.visible, delta: flushed.visible, request_id: requestId });
         }
+        const launchCommandFallback = inferLaunchCommandFromContext(ctx);
         const mergedToolCalls = mergeStreamToolCalls(streamToolCalls);
         if (streamToolCalls.length > 0) logInfo(config, "openai:stream:tool-calls", { requestId, fragments: streamToolCalls.length, merged: mergedToolCalls.length });
-        const toolNodes = toolCallsToNodes(mergedToolCalls, 1, fallbackPath);
+        const invalidToolCalls = invalidToolCallSummaries(mergedToolCalls, fallbackPath, launchCommandFallback);
+        if (invalidToolCalls.length > 0) logWarn(config, "openai:stream:invalid-tool-calls-filtered", { requestId, invalidToolCalls });
+        const nonInvalidToolCalls = mergedToolCalls.filter((call) => {
+          const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
+          return parsed && !invalidToolReason(parsed.name, parsed.argumentsJson);
+        });
+        const toolNodes = toolCallsToNodes(nonInvalidToolCalls, 1, fallbackPath, launchCommandFallback);
         if (toolNodes.length > 0) {
           logInfo(config, "openai:stream:tool-nodes", {
             requestId,
@@ -765,25 +1424,34 @@ export async function forwardAugmentStream(config: ProxyConfig, ctx: RequestCont
             fallbackPathUsed: fallbackPath,
           });
         }
+        if (!hasMeaningfulVisibleText(visibleText) && toolNodes.length === 0) {
+          const invalidHint = invalidToolCallHint(invalidToolCalls);
+          if (invalidHint) {
+            visibleText += invalidHint;
+            emittedVisibleText = true;
+            safeEnqueue({ text: invalidHint, delta: invalidHint, request_id: requestId });
+          }
+        }
         const allThinking = [...thinkingBuffer, ...flushed.thinking].filter((item) => item.trim());
         logInfo(config, "openai:stream:end", { requestId, sawDone, finishReason, upstreamChunks, upstreamContentChars, thinkingItems: allThinking.length, toolFragments: streamToolCalls.length });
-        if (!emittedVisibleText && toolNodes.length === 0 && allThinking.length > 0) {
+        if (!hasMeaningfulVisibleText(visibleText) && toolNodes.length === 0 && allThinking.length > 0) {
           const fallbackText = allThinking.join("\n\n");
           logWarn(config, "openai:stream:reasoning-as-text", { requestId, chars: fallbackText.length });
           visibleText += fallbackText;
           safeEnqueue({ text: fallbackText, delta: fallbackText, request_id: requestId });
           emittedVisibleText = true;
         }
-        const thoughtNodes = emittedVisibleText ? [] : thinkingNodes(allThinking);
+        const thoughtNodes = hasMeaningfulVisibleText(visibleText) ? [] : thinkingNodes(allThinking);
         const finalNodes = [...thoughtNodes, ...toolNodes];
-        if (!emittedVisibleText && finalNodes.length === 0) {
+        if (!hasMeaningfulVisibleText(visibleText) && finalNodes.length === 0) {
           logWarn(config, "openai:stream:empty-keepalive", { requestId, sawDone, finishReason, upstreamChunks, upstreamContentChars });
           safeEnqueue({ text: "", heartbeat: true, empty_upstream: true, request_id: requestId });
           return;
         }
         if (finalNodes.length > 0) safeEnqueue({ text: "", nodes: finalNodes, request_id: requestId });
         logInfo(config, "openai:stream:final", { requestId, visibleChars: visibleText.length, nodes: finalNodes.length });
-        safeEnqueue({ text: visibleText, response_text: visibleText, completion: visibleText, done: true, stop_reason: "stop", request_id: requestId });
+        const finalText = emittedVisibleText ? "" : visibleText;
+        safeEnqueue({ text: finalText, response_text: visibleText, completion: visibleText, done: true, stop_reason: "stop", request_id: requestId });
         finish();
       } catch (error) {
         logError(config, "openai:stream:error", { requestId, error: String(error) });
