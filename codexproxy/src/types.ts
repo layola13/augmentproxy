@@ -32,6 +32,7 @@ export interface CodexProxyConfig {
   logDir: string;
   heartbeatMs: number;
   requestTimeoutMs: number;
+  localPruneMinTokens: number;
   keepRecentUserMessages: number;
   keepRecentItems: number;
   keepRecentFunctionCallPairs: number;
@@ -115,6 +116,8 @@ export interface OptimizedInputResult {
   prefixSegments: PrefixSegment[];
   suffixItems: JsonValue[];
   stats: HistoryPruneStats;
+  remoteSummaryInsertIndex: number | null;
+  remoteSummaryHasLocalFallback: boolean;
 }
 
 export interface ContextTokenMetrics {

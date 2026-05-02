@@ -1,6 +1,7 @@
 import { loadCodexPromptAssets } from "./codex-assets.ts";
 import { loadConfigFromEnvFile } from "./config.ts";
 import {
+  applyRemoteCompactSummary,
   buildRemoteCompactPayload,
   buildSummaryMessage,
   optimizeRequestInput,
@@ -74,8 +75,47 @@ function asInputList(value: JsonValue | undefined): JsonValue[] {
   return [value];
 }
 
+function identityOptimizeRequestInput(
+  requestInput: JsonValue[],
+): OptimizedInputResult {
+  const bytes = JSON.stringify(requestInput).length;
+  const stats: HistoryPruneStats = {
+    inputCountBefore: requestInput.length,
+    inputCountAfter: requestInput.length,
+    bytesBefore: bytes,
+    bytesAfter: bytes,
+    preservedFromIndex: requestInput.length,
+    droppedReasoningCount: 0,
+    droppedFunctionCallCount: 0,
+    droppedFunctionCallOutputCount: 0,
+    truncatedToolOutputCount: 0,
+    truncatedFunctionCallCount: 0,
+    dedupedFunctionCallCount: 0,
+    dedupedFunctionCallOutputCount: 0,
+    compactedPinnedUserCodeBlockCount: 0,
+    remoteCompactCandidateCount: 0,
+    remoteCompactCandidateBytes: 0,
+  };
+  return {
+    localInput: [...requestInput],
+    prefixSegments: [],
+    suffixItems: [...requestInput],
+    stats,
+    remoteSummaryInsertIndex: null,
+    remoteSummaryHasLocalFallback: false,
+  };
+}
+
 function normalizeLineEndings(text: string): string {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+export function isCompactEndpointPath(pathname: string): boolean {
+  return pathname === "/v1/responses/compact" || pathname === "/responses/compact";
+}
+
+export function compactEndpointUrl(responsesUrl: string): string {
+  return responsesUrl.replace(/\/responses$/, "/responses/compact");
 }
 
 function copyResponseHeaders(headers: Headers): Headers {
@@ -122,7 +162,11 @@ function toJsonValue(value: unknown): JsonValue {
   return JSON.parse(JSON.stringify(value)) as JsonValue;
 }
 
-function jsonResponse(value: unknown, status = 200, headers?: HeadersInit): Response {
+function jsonResponse(
+  value: unknown,
+  status = 200,
+  headers?: HeadersInit,
+): Response {
   return new Response(JSON.stringify(value), {
     status,
     headers: {
@@ -161,15 +205,23 @@ function rawLooksLikeJson(rawBody: string): boolean {
   }
 }
 
-export function resolveReturnedContentType(headers: Headers, rawBody: string): string {
+export function resolveReturnedContentType(
+  headers: Headers,
+  rawBody: string,
+): string {
   if (rawLooksLikeSse(rawBody)) return "text/event-stream; charset=utf-8";
   if (rawLooksLikeJson(rawBody)) return "application/json; charset=utf-8";
   const existing = headers.get("content-type");
-  if (existing && !existing.toLowerCase().includes("text/event-stream")) return existing;
+  if (existing && !existing.toLowerCase().includes("text/event-stream")) {
+    return existing;
+  }
   return "text/plain; charset=utf-8";
 }
 
-function buildBufferedClientHeaders(headers: Headers, rawBody: string): Headers {
+function buildBufferedClientHeaders(
+  headers: Headers,
+  rawBody: string,
+): Headers {
   const next = copyBufferedResponseHeaders(headers);
   next.set("content-type", resolveReturnedContentType(headers, rawBody));
   return next;
@@ -182,7 +234,8 @@ function contentTextParts(value: JsonValue | undefined): string[] {
     const record = objectValue(item);
     const type = stringValue(record.type) ?? "";
     if (
-      (type === "input_text" || type === "output_text" || type === "summary_text" ||
+      (type === "input_text" || type === "output_text" ||
+        type === "summary_text" ||
         type === "text") &&
       typeof record.text === "string"
     ) {
@@ -213,6 +266,13 @@ function hasToolHistory(input: JsonValue[]): boolean {
   });
 }
 
+export function shouldCompressContext(
+  beforeTokens: number,
+  minTokens: number,
+): boolean {
+  return beforeTokens >= minTokens;
+}
+
 function didMutateLocalInput(stats: HistoryPruneStats): boolean {
   return stats.inputCountAfter !== stats.inputCountBefore ||
     stats.bytesAfter !== stats.bytesBefore ||
@@ -233,11 +293,193 @@ function extractMessageTextFromContent(content: JsonValue | undefined): string {
 function extractLatestUserText(input: JsonValue[]): string {
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const item = objectValue(input[index]);
-    if (stringValue(item.type) !== "message" || stringValue(item.role) !== "user") continue;
+    if (
+      stringValue(item.type) !== "message" || stringValue(item.role) !== "user"
+    ) continue;
     const text = extractMessageTextFromContent(item.content).trim();
     if (text) return text;
   }
   return "";
+}
+
+export function isContinuationRequestText(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  return /(^|\b)(continue|resume|go on|keep going|carry on)(\b|$)/i.test(
+    normalized,
+  ) ||
+    /(继续|接着|接续|往下|继续做|继续吧|别停|不要停|禁止停)/.test(normalized);
+}
+
+type UpdatePlanState = {
+  hasUnfinished: boolean;
+  inProgressStep?: string;
+  pendingStep?: string;
+};
+
+function latestUpdatePlanState(input: JsonValue[]): UpdatePlanState {
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = objectValue(input[index]);
+    if (
+      stringValue(item.type) !== "function_call" ||
+      stringValue(item.name) !== "update_plan"
+    ) {
+      continue;
+    }
+
+    const args = stringValue(item.arguments);
+    if (!args) continue;
+
+    try {
+      const parsed = objectValue(JSON.parse(args) as JsonValue);
+      const plan = Array.isArray(parsed.plan) ? parsed.plan : [];
+      let inProgressStep: string | undefined;
+      let pendingStep: string | undefined;
+      let hasUnfinished = false;
+
+      for (const rawStep of plan) {
+        const step = objectValue(rawStep);
+        const status = stringValue(step.status) ?? "";
+        const text = stringValue(step.step);
+        if (status !== "completed") hasUnfinished = true;
+        if (!inProgressStep && status === "in_progress" && text) {
+          inProgressStep = text;
+        }
+        if (!pendingStep && status === "pending" && text) pendingStep = text;
+      }
+
+      return { hasUnfinished, inProgressStep, pendingStep };
+    } catch {
+      return { hasUnfinished: false };
+    }
+  }
+
+  return { hasUnfinished: false };
+}
+
+function appendInstructionBlock(
+  baseInstructions: string,
+  block: string | undefined,
+): string {
+  if (!block) return baseInstructions;
+  const trimmedBase = baseInstructions.trimEnd();
+  return trimmedBase ? `${trimmedBase}\n\n${block}` : block;
+}
+
+export function buildContinuationGuardInstruction(
+  input: JsonValue[],
+): string | undefined {
+  const latestUserText = extractLatestUserText(input);
+  if (!isContinuationRequestText(latestUserText)) return undefined;
+
+  const planState = latestUpdatePlanState(input);
+  if (!planState.hasUnfinished) return undefined;
+
+  const activePlanLine = planState.inProgressStep
+    ? `The current update_plan still has an in_progress step: "${planState.inProgressStep}".`
+    : planState.pendingStep
+    ? `The current update_plan still has pending work, starting with "${planState.pendingStep}".`
+    : "The current update_plan still has unfinished work.";
+
+  return [
+    "[codexproxy continuation guard]",
+    "The latest user message is asking you to continue the existing task, not to pause or summarize.",
+    activePlanLine,
+    "Keep the current update_plan / todolist history intact; do not clear or restart it.",
+    "Do not end the turn after a commentary-only assistant message.",
+    "If the task is not complete, continue by emitting the next concrete tool call(s) for the current plan.",
+    "Only stop without tool calls if you are truly blocked, and then state the exact blocker.",
+  ].join("\n");
+}
+
+type HistorySanitizeResult = {
+  input: JsonValue[];
+  removedTurnCount: number;
+  removedItemCount: number;
+  lastToolExecutionIndex: number;
+  inspectedTailItemCount: number;
+};
+
+function isToolExecutionItem(item: JsonValue | undefined): boolean {
+  const type = stringValue(objectValue(item).type) ?? "";
+  return type === "function_call" || type === "function_call_output" ||
+    type === "custom_tool_call" || type === "custom_tool_call_output" ||
+    type === "mcp_tool_call" || type === "mcp_tool_call_output" ||
+    type === "tool_search_call" || type === "tool_search_output" ||
+    type === "web_search_call";
+}
+
+function isCommentaryAssistantMessage(item: JsonValue | undefined): boolean {
+  const record = objectValue(item);
+  return stringValue(record.type) === "message" &&
+    stringValue(record.role) === "assistant" &&
+    stringValue(record.phase) === "commentary";
+}
+
+function isStalledTailArtifact(item: JsonValue | undefined): boolean {
+  const type = stringValue(objectValue(item).type) ?? "";
+  return type === "reasoning" || isCommentaryAssistantMessage(item);
+}
+
+function findLastToolExecutionIndex(input: JsonValue[]): number {
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    if (isToolExecutionItem(input[index])) return index;
+  }
+  return -1;
+}
+
+export function sanitizeStalledContinuationHistory(
+  input: JsonValue[],
+): HistorySanitizeResult {
+  const latestUserText = extractLatestUserText(input);
+  if (!isContinuationRequestText(latestUserText)) {
+    return {
+      input,
+      removedTurnCount: 0,
+      removedItemCount: 0,
+      lastToolExecutionIndex: -1,
+      inspectedTailItemCount: 0,
+    };
+  }
+
+  const lastToolExecutionIndex = findLastToolExecutionIndex(input);
+  if (lastToolExecutionIndex < 0) {
+    return {
+      input,
+      removedTurnCount: 0,
+      removedItemCount: 0,
+      lastToolExecutionIndex,
+      inspectedTailItemCount: input.length,
+    };
+  }
+
+  const nextInput: JsonValue[] = [];
+  let removedTurnCount = 0;
+  let removedItemCount = 0;
+  let removingCluster = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const item = input[index];
+    if (index > lastToolExecutionIndex && isStalledTailArtifact(item)) {
+      removedItemCount += 1;
+      if (!removingCluster) {
+        removedTurnCount += 1;
+        removingCluster = true;
+      }
+      continue;
+    }
+
+    removingCluster = false;
+    nextInput.push(item);
+  }
+
+  return {
+    input: nextInput,
+    removedTurnCount,
+    removedItemCount,
+    lastToolExecutionIndex,
+    inspectedTailItemCount: input.length - lastToolExecutionIndex - 1,
+  };
 }
 
 function hasCodeSignals(text: string): boolean {
@@ -246,18 +488,19 @@ function hasCodeSignals(text: string): boolean {
       .test(text) ||
     /\b(implement|fix|refactor|compile|traceback|stack trace|exception|test|bug|patch|diff)\b/i
       .test(text) ||
-    /(?:^|\s)(?:\/[\w./-]+|\w+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|kt|json|md|yaml|yml|toml|sh))/.test(text);
+    /(?:^|\s)(?:\/[\w./-]+|\w+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|kt|json|md|yaml|yml|toml|sh))/
+      .test(text);
 }
 
 function hasDocSignals(text: string): boolean {
   return /\b(doc|docs|documentation|readme|guide|manual|reference|sdk|api reference|model card|spec|specification)\b/i
-      .test(text) ||
+    .test(text) ||
     /(文档|说明|教程|手册|参考|接口文档|API 文档|SDK|README)/i.test(text);
 }
 
 function hasPlanSignals(text: string): boolean {
   return /\b(plan|planning|brainstorm|architecture|design|analyze|analysis|investigate|research|review)\b/i
-      .test(text) ||
+    .test(text) ||
     /(规划|计划|方案|架构|设计|分析|调研|评审|review)/i.test(text);
 }
 
@@ -305,7 +548,9 @@ function maskSecretPreview(value: string | undefined): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   if (trimmed.length <= 10) return `${trimmed.slice(0, 2)}...${trimmed.length}`;
-  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)} (len=${trimmed.length})`;
+  return `${trimmed.slice(0, 6)}...${
+    trimmed.slice(-4)
+  } (len=${trimmed.length})`;
 }
 
 function inspectProxyAccess(headers: Headers): ProxyAuthInspection {
@@ -351,7 +596,10 @@ function inspectProxyAccess(headers: Headers): ProxyAuthInspection {
   };
 }
 
-function isAuthorizedProxyRequest(expectedApiKey: string | undefined, request: Request): boolean {
+function isAuthorizedProxyRequest(
+  expectedApiKey: string | undefined,
+  request: Request,
+): boolean {
   if (!expectedApiKey) return true;
   return inspectProxyAccess(request.headers).token === expectedApiKey;
 }
@@ -362,8 +610,12 @@ function computeContextTokenMetrics(
   afterFinalRequest: JsonObject,
 ): ContextTokenMetrics {
   const before = countContextTokens(buildContextTokenPayload(beforeRequest));
-  const afterLocal = countContextTokens(buildContextTokenPayload(afterLocalRequest));
-  const afterFinal = countContextTokens(buildContextTokenPayload(afterFinalRequest));
+  const afterLocal = countContextTokens(
+    buildContextTokenPayload(afterLocalRequest),
+  );
+  const afterFinal = countContextTokens(
+    buildContextTokenPayload(afterFinalRequest),
+  );
   const ratio = before > 0 ? afterFinal / before : 1;
   const percent = Number((ratio * 100).toFixed(2));
   return { before, afterLocal, afterFinal, ratio, percent };
@@ -403,8 +655,12 @@ async function fetchWithTimeout(
   requestSignal?: AbortSignal,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort("upstream timeout"), timeoutMs);
-  const abortListener = () => controller.abort(requestSignal?.reason ?? "client aborted");
+  const timeout = setTimeout(
+    () => controller.abort("upstream timeout"),
+    timeoutMs,
+  );
+  const abortListener = () =>
+    controller.abort(requestSignal?.reason ?? "client aborted");
   requestSignal?.addEventListener("abort", abortListener, { once: true });
   try {
     return await fetch(url, {
@@ -451,13 +707,88 @@ function parseSseText(rawSse: string, status = 200): UpstreamTurn {
     if (dataText === "[DONE]") continue;
     const data = objectValue(JSON.parse(dataText) as JsonValue);
     events.push({ type: eventType, data });
-    const createdId = stringValue(objectValue(data.response).id) ?? stringValue(data.id);
+    const createdId = stringValue(objectValue(data.response).id) ??
+      stringValue(data.id);
     if (createdId) responseId = createdId;
     const responseUsage = objectValue(objectValue(data.response).usage);
     if (Object.keys(responseUsage).length > 0) usage = responseUsage;
   }
 
   return { events, responseId, usage, rawSse, status };
+}
+
+function completedOutputItems(turn: UpstreamTurn): JsonObject[] {
+  const items: JsonObject[] = [];
+  for (const event of turn.events) {
+    if (event.type !== "response.output_item.done") continue;
+    items.push(objectValue(event.data.item));
+  }
+  return items;
+}
+
+function responseCompletedSuccessfully(turn: UpstreamTurn): boolean {
+  return turn.events.some((event) =>
+    event.type === "response.completed" &&
+    stringValue(objectValue(event.data.response).status) === "completed"
+  );
+}
+
+export function shouldRetryContinuationTurn(turn: UpstreamTurn): boolean {
+  if (!responseCompletedSuccessfully(turn)) return false;
+
+  const items = completedOutputItems(turn);
+  const hasToolCall = items.some((item) => {
+    const type = stringValue(item.type) ?? "";
+    return type === "function_call" || type === "custom_tool_call" ||
+      type === "mcp_tool_call";
+  });
+  if (hasToolCall) return false;
+
+  const nonReasoningItems = items.filter((item) =>
+    stringValue(item.type) !== "reasoning"
+  );
+  if (nonReasoningItems.length === 0) return true;
+
+  const assistantMessages = nonReasoningItems.filter((item) =>
+    stringValue(item.type) === "message" &&
+    stringValue(item.role) === "assistant"
+  );
+  if (assistantMessages.length !== nonReasoningItems.length) return false;
+
+  return assistantMessages.every((item) =>
+    stringValue(item.phase) === "commentary"
+  );
+}
+
+function buildContinuationRetryInstruction(): string {
+  return [
+    "[codexproxy hard continuation retry]",
+    "Your previous attempt ended without any tool call and made no executable progress.",
+    "You must continue the existing task immediately.",
+    "Do not return a reasoning-only or commentary-only turn.",
+    "Emit the next concrete tool call for the current in_progress update_plan step now.",
+    "If you are truly blocked, state the exact blocker in one short sentence.",
+  ].join("\n");
+}
+
+function hasCallableTools(requestBody: JsonObject): boolean {
+  const tools = Array.isArray(requestBody.tools) ? requestBody.tools : [];
+  return tools.length > 0;
+}
+
+function buildContinuationRetryRequest(requestBody: JsonObject): JsonObject {
+  const retryRequestBody: JsonObject = {
+    ...structuredClone(requestBody),
+    instructions: appendInstructionBlock(
+      stringValue(requestBody.instructions) ?? "",
+      buildContinuationRetryInstruction(),
+    ),
+  };
+  delete retryRequestBody.previous_response_id;
+  if (hasCallableTools(requestBody)) {
+    retryRequestBody.tool_choice = "required";
+  }
+  return retryRequestBody;
 }
 
 function buildJsonResponse(turn: UpstreamTurn): JsonObject {
@@ -500,7 +831,9 @@ export function extractResponseText(payload: JsonValue): string {
       parts.push(extractMessageText(outputItem));
       continue;
     }
-    if (type === "compaction" && typeof outputItem.encrypted_content === "string") {
+    if (
+      type === "compaction" && typeof outputItem.encrypted_content === "string"
+    ) {
       parts.push(outputItem.encrypted_content);
       continue;
     }
@@ -617,7 +950,9 @@ async function executeNonStreamRequest(
   requestId: string,
   requestDir: string,
   artifactPrefix: string,
-): Promise<{ raw: string; payload: JsonObject; status: number; headers: Headers }> {
+): Promise<
+  { raw: string; payload: JsonObject; status: number; headers: Headers }
+> {
   const upstreamHeaders = forwardHeaders(
     incomingHeaders,
     target.apiKey,
@@ -659,7 +994,9 @@ async function executeNonStreamRequest(
   );
   if (!upstream.ok) {
     throw new Error(
-      `Upstream returned ${upstream.status}: ${raw.slice(0, 1200) || "<empty body>"}`,
+      `Upstream returned ${upstream.status}: ${
+        raw.slice(0, 1200) || "<empty body>"
+      }`,
     );
   }
 
@@ -690,6 +1027,7 @@ async function forwardFinalResponse(
   requestId: string,
   requestDir: string,
   streamMode: boolean,
+  continuationGuardApplied: boolean,
 ): Promise<Response> {
   const upstreamHeaders = forwardHeaders(
     incomingHeaders,
@@ -763,42 +1101,201 @@ async function forwardFinalResponse(
     elapsedMs: Date.now() - startedAt,
   });
 
-  if (streamMode && upstream.ok && upstream.body && isEventStream(upstream.headers)) {
-    const [clientBody, captureBody] = upstream.body.tee();
-    void (async () => {
-      const raw = await new Response(captureBody).text().catch(() => "");
+  if (
+    streamMode && upstream.ok && upstream.body &&
+    isEventStream(upstream.headers)
+  ) {
+    if (!continuationGuardApplied) {
+      const [clientBody, captureBody] = upstream.body.tee();
+      void (async () => {
+        const raw = await new Response(captureBody).text().catch(() => "");
+        await writeTextArtifact(
+          { requestId, requestDir },
+          "05-final-response.sse",
+          raw,
+        );
+        await writeJsonArtifact(
+          { requestId, requestDir },
+          "05-final-response-meta.json",
+          {
+            status: upstream.status,
+            headers: headersToObject(upstream.headers),
+            returnedContentType: "text/event-stream; charset=utf-8",
+            bytes: raw.length,
+          },
+        );
+        serverLog(
+          runtime.config,
+          "INFO",
+          "codexproxy:upstream:response_stream",
+          {
+            requestId,
+            status: upstream.status,
+            bytes: raw.length,
+            elapsedMs: Date.now() - startedAt,
+          },
+        );
+        await appendEventLog(runtime.config, {
+          requestId,
+          stage: "final_response_stream",
+          status: upstream.status,
+          bytes: raw.length,
+          elapsedMs: Date.now() - startedAt,
+        });
+      })();
+      return new Response(clientBody, {
+        status: upstream.status,
+        headers: buildSseClientHeaders(upstream.headers),
+      });
+    }
+
+    let returnedRaw = await upstream.text().catch(() => "");
+    let returnedStatus = upstream.status;
+    let returnedHeaders = upstream.headers;
+    let returnedElapsedMs = Date.now() - startedAt;
+    let attempt = 1;
+
+    const initialTurn = parseSseText(returnedRaw, upstream.status);
+    if (shouldRetryContinuationTurn(initialTurn)) {
       await writeTextArtifact(
         { requestId, requestDir },
-        "05-final-response.sse",
-        raw,
+        "05-final-response-attempt1.sse",
+        returnedRaw,
       );
       await writeJsonArtifact(
         { requestId, requestDir },
-        "05-final-response-meta.json",
+        "05-final-response-attempt1-meta.json",
         {
-          status: upstream.status,
-          headers: headersToObject(upstream.headers),
+          status: returnedStatus,
+          headers: headersToObject(returnedHeaders),
           returnedContentType: "text/event-stream; charset=utf-8",
-          bytes: raw.length,
+          bytes: returnedRaw.length,
         },
       );
-      serverLog(runtime.config, "INFO", "codexproxy:upstream:response_stream", {
-        requestId,
-        status: upstream.status,
-        bytes: raw.length,
-        elapsedMs: Date.now() - startedAt,
-      });
+      const retryRequestBody = buildContinuationRetryRequest(requestBody);
+      const forcedToolChoice = retryRequestBody.tool_choice === "required";
+      serverLog(
+        runtime.config,
+        "WARN",
+        "codexproxy:continuation:retry_triggered",
+        {
+          requestId,
+          forcedToolChoice,
+        },
+      );
       await appendEventLog(runtime.config, {
         requestId,
-        stage: "final_response_stream",
-        status: upstream.status,
-        bytes: raw.length,
-        elapsedMs: Date.now() - startedAt,
+        stage: "continuation_retry_triggered",
+        forcedToolChoice,
       });
-    })();
-    return new Response(clientBody, {
-      status: upstream.status,
-      headers: buildSseClientHeaders(upstream.headers),
+
+      const retryHeaders = forwardHeaders(
+        incomingHeaders,
+        target.apiKey,
+        "text/event-stream",
+      );
+      await writeJsonArtifact(
+        { requestId, requestDir },
+        "04b-final-request-retry.json",
+        {
+          url: target.url,
+          method: "POST",
+          headers: headersToObject(retryHeaders),
+          body: retryRequestBody,
+        },
+      );
+
+      try {
+        const retryStartedAt = Date.now();
+        const retryUpstream = await fetchWithTimeout(
+          target.url,
+          {
+            method: "POST",
+            headers: retryHeaders,
+            body: JSON.stringify(retryRequestBody),
+          },
+          runtime.config.requestTimeoutMs,
+          requestSignal,
+        );
+        returnedRaw = await retryUpstream.text().catch(() => "");
+        returnedStatus = retryUpstream.status;
+        returnedHeaders = retryUpstream.headers;
+        returnedElapsedMs = Date.now() - retryStartedAt;
+        attempt = 2;
+
+        serverLog(
+          runtime.config,
+          "INFO",
+          "codexproxy:continuation:retry_result",
+          {
+            requestId,
+            status: returnedStatus,
+            bytes: returnedRaw.length,
+            elapsedMs: returnedElapsedMs,
+            forcedToolChoice,
+          },
+        );
+        await appendEventLog(runtime.config, {
+          requestId,
+          stage: "continuation_retry_result",
+          status: returnedStatus,
+          bytes: returnedRaw.length,
+          elapsedMs: returnedElapsedMs,
+          forcedToolChoice,
+        });
+      } catch (error) {
+        serverLog(
+          runtime.config,
+          "ERROR",
+          "codexproxy:continuation:retry_failed",
+          {
+            requestId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        await appendEventLog(runtime.config, {
+          requestId,
+          stage: "continuation_retry_failed",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    await writeTextArtifact(
+      { requestId, requestDir },
+      "05-final-response.sse",
+      returnedRaw,
+    );
+    await writeJsonArtifact(
+      { requestId, requestDir },
+      "05-final-response-meta.json",
+      {
+        status: returnedStatus,
+        headers: headersToObject(returnedHeaders),
+        returnedContentType: "text/event-stream; charset=utf-8",
+        bytes: returnedRaw.length,
+        attempt,
+      },
+    );
+    serverLog(runtime.config, "INFO", "codexproxy:upstream:response_stream", {
+      requestId,
+      status: returnedStatus,
+      bytes: returnedRaw.length,
+      elapsedMs: returnedElapsedMs,
+      attempt,
+    });
+    await appendEventLog(runtime.config, {
+      requestId,
+      stage: "final_response_stream",
+      status: returnedStatus,
+      bytes: returnedRaw.length,
+      elapsedMs: returnedElapsedMs,
+      attempt,
+    });
+
+    return new Response(returnedRaw, {
+      status: returnedStatus,
+      headers: buildSseClientHeaders(returnedHeaders),
     });
   }
 
@@ -819,15 +1316,20 @@ async function forwardFinalResponse(
       bytes: raw.length,
     },
   );
-  serverLog(runtime.config, upstream.ok ? "INFO" : "WARN", "codexproxy:upstream:response_body", {
-    requestId,
-    status: upstream.status,
-    stream: streamMode,
-    contentType: upstreamContentType,
-    returnedContentType: returnedHeaders.get("content-type"),
-    bytes: raw.length,
-    elapsedMs: Date.now() - startedAt,
-  });
+  serverLog(
+    runtime.config,
+    upstream.ok ? "INFO" : "WARN",
+    "codexproxy:upstream:response_body",
+    {
+      requestId,
+      status: upstream.status,
+      stream: streamMode,
+      contentType: upstreamContentType,
+      returnedContentType: returnedHeaders.get("content-type"),
+      bytes: raw.length,
+      elapsedMs: Date.now() - startedAt,
+    },
+  );
   await appendEventLog(runtime.config, {
     requestId,
     stage: "final_response_body",
@@ -854,7 +1356,10 @@ async function forwardFinalResponse(
   }
 
   if (isEventStream(upstream.headers, raw)) {
-    return jsonResponse(buildJsonResponse(parseSseText(raw, upstream.status)), upstream.status);
+    return jsonResponse(
+      buildJsonResponse(parseSseText(raw, upstream.status)),
+      upstream.status,
+    );
   }
 
   return new Response(raw, {
@@ -910,63 +1415,166 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
   });
 
   const originalInput = asInputList(requestBody.input);
-  const inputHasToolHistory = hasToolHistory(originalInput);
-  const optimizeResult = optimizeRequestInput(originalInput, {
-    keepRecentUserMessages: runtime.config.keepRecentUserMessages,
-    keepRecentItems: runtime.config.keepRecentItems,
-    keepRecentFunctionCallPairs: runtime.config.keepRecentFunctionCallPairs,
-    keepRecentReasoningItems: runtime.config.keepRecentReasoningItems,
-    keepFunctionCallName: runtime.config.keepFunctionCallName,
-    oldToolOutputPreviewChars: runtime.config.oldToolOutputPreviewChars,
-    oldFunctionArgumentsPreviewChars: runtime.config.oldFunctionArgumentsPreviewChars,
-    dropOldReasoning: runtime.config.dropOldReasoning,
-  });
+  const sanitizedHistory = {
+    input: originalInput,
+    removedTurnCount: 0,
+    removedItemCount: 0,
+    lastToolExecutionIndex: -1,
+    inspectedTailItemCount: 0,
+  };
+  const preparedInput = originalInput;
+  const originalContextTokens = countContextTokens(
+    buildContextTokenPayload(requestBody),
+  );
+  const inputHasToolHistory = hasToolHistory(preparedInput);
+  const shouldApplyCompression = inputHasToolHistory &&
+    shouldCompressContext(
+      originalContextTokens,
+      runtime.config.localPruneMinTokens,
+    );
+  const optimizeResult = shouldApplyCompression
+    ? optimizeRequestInput(preparedInput, {
+      keepRecentUserMessages: runtime.config.keepRecentUserMessages,
+      keepRecentItems: runtime.config.keepRecentItems,
+      keepRecentFunctionCallPairs: runtime.config.keepRecentFunctionCallPairs,
+      keepRecentReasoningItems: runtime.config.keepRecentReasoningItems,
+      keepFunctionCallName: runtime.config.keepFunctionCallName,
+      oldToolOutputPreviewChars: runtime.config.oldToolOutputPreviewChars,
+      oldFunctionArgumentsPreviewChars:
+        runtime.config.oldFunctionArgumentsPreviewChars,
+      dropOldReasoning: runtime.config.dropOldReasoning,
+    })
+    : identityOptimizeRequestInput(preparedInput);
 
-  const instructions = typeof requestBody.instructions === "string" ? requestBody.instructions : "";
-  const rewrittenInstructions = rewriteCodexInstructions(instructions, runtime.assets);
+  const instructions = typeof requestBody.instructions === "string"
+    ? requestBody.instructions
+    : "";
+  const rewrittenInstructions: RequestRewriteResult = {
+    instructions,
+    matched: false,
+    tail: "",
+  };
+  const continuationGuardInstruction = undefined;
+  const finalInstructions = instructions;
   const streamMode = requestBody.stream === true ||
     request.headers.get("accept")?.includes("text/event-stream") === true;
-  const selectedModel = resolveRequestedModel(requestBody, runtime.config.autoModels);
+  const selectedModel = resolveRequestedModel(
+    requestBody,
+    runtime.config.autoModels,
+  );
 
   await writeJsonArtifact(logContext, "01-local-optimization.json", {
+    compressionSkipped: !shouldApplyCompression,
+    originalContextTokens,
+    localPruneMinTokens: runtime.config.localPruneMinTokens,
     stats: optimizeResult.stats,
     instructionsMatched: rewrittenInstructions.matched,
     instructionsVariant: rewrittenInstructions.variant ?? null,
+    continuationGuardApplied: Boolean(continuationGuardInstruction),
+    stalledContinuationTurnsRemoved: sanitizedHistory.removedTurnCount,
+    stalledContinuationItemsRemoved: sanitizedHistory.removedItemCount,
+    stalledContinuationLastToolExecutionIndex:
+      sanitizedHistory.lastToolExecutionIndex,
+    stalledContinuationTailItemsInspected:
+      sanitizedHistory.inspectedTailItemCount,
     selectedModel,
     localInput: optimizeResult.localInput,
   });
-  serverLog(runtime.config, "INFO", "codexproxy:local_prune:applied", {
-    requestId,
-    inputItemsBefore: originalInput.length,
-    inputItemsAfter: optimizeResult.localInput.length,
-    keepRecentFunctionCallPairs: runtime.config.keepRecentFunctionCallPairs,
-    keepRecentReasoningItems: runtime.config.keepRecentReasoningItems,
-    keepFunctionCallName: runtime.config.keepFunctionCallName,
-    droppedFunctionCallCount: optimizeResult.stats.droppedFunctionCallCount,
-    droppedFunctionCallOutputCount: optimizeResult.stats.droppedFunctionCallOutputCount,
-    droppedReasoningCount: optimizeResult.stats.droppedReasoningCount,
-  });
-  await appendEventLog(runtime.config, {
-    requestId,
-    stage: "local_prune_applied",
-    inputItemsBefore: originalInput.length,
-    inputItemsAfter: optimizeResult.localInput.length,
-    keepRecentFunctionCallPairs: runtime.config.keepRecentFunctionCallPairs,
-    keepRecentReasoningItems: runtime.config.keepRecentReasoningItems,
-    keepFunctionCallName: runtime.config.keepFunctionCallName,
-    droppedFunctionCallCount: optimizeResult.stats.droppedFunctionCallCount,
-    droppedFunctionCallOutputCount: optimizeResult.stats.droppedFunctionCallOutputCount,
-    droppedReasoningCount: optimizeResult.stats.droppedReasoningCount,
-  });
+  if (sanitizedHistory.removedTurnCount > 0) {
+    serverLog(
+      runtime.config,
+      "INFO",
+      "codexproxy:continuation:stalled_history_removed",
+      {
+        requestId,
+        removedTurnCount: sanitizedHistory.removedTurnCount,
+        removedItemCount: sanitizedHistory.removedItemCount,
+        lastToolExecutionIndex: sanitizedHistory.lastToolExecutionIndex,
+        inspectedTailItemCount: sanitizedHistory.inspectedTailItemCount,
+      },
+    );
+    await appendEventLog(runtime.config, {
+      requestId,
+      stage: "stalled_continuation_history_removed",
+      removedTurnCount: sanitizedHistory.removedTurnCount,
+      removedItemCount: sanitizedHistory.removedItemCount,
+      lastToolExecutionIndex: sanitizedHistory.lastToolExecutionIndex,
+      inspectedTailItemCount: sanitizedHistory.inspectedTailItemCount,
+    });
+  }
+  if (continuationGuardInstruction) {
+    serverLog(runtime.config, "INFO", "codexproxy:continuation:guard_applied", {
+      requestId,
+    });
+    await appendEventLog(runtime.config, {
+      requestId,
+      stage: "continuation_guard_applied",
+    });
+  }
+  if (shouldApplyCompression) {
+    serverLog(runtime.config, "INFO", "codexproxy:local_prune:applied", {
+      requestId,
+      originalContextTokens,
+      localPruneMinTokens: runtime.config.localPruneMinTokens,
+      inputItemsBefore: originalInput.length,
+      inputItemsAfter: optimizeResult.localInput.length,
+      keepRecentFunctionCallPairs: runtime.config.keepRecentFunctionCallPairs,
+      keepRecentReasoningItems: runtime.config.keepRecentReasoningItems,
+      keepFunctionCallName: runtime.config.keepFunctionCallName,
+      droppedFunctionCallCount: optimizeResult.stats.droppedFunctionCallCount,
+      droppedFunctionCallOutputCount:
+        optimizeResult.stats.droppedFunctionCallOutputCount,
+      droppedReasoningCount: optimizeResult.stats.droppedReasoningCount,
+    });
+    await appendEventLog(runtime.config, {
+      requestId,
+      stage: "local_prune_applied",
+      originalContextTokens,
+      localPruneMinTokens: runtime.config.localPruneMinTokens,
+      inputItemsBefore: originalInput.length,
+      inputItemsAfter: optimizeResult.localInput.length,
+      keepRecentFunctionCallPairs: runtime.config.keepRecentFunctionCallPairs,
+      keepRecentReasoningItems: runtime.config.keepRecentReasoningItems,
+      keepFunctionCallName: runtime.config.keepFunctionCallName,
+      droppedFunctionCallCount: optimizeResult.stats.droppedFunctionCallCount,
+      droppedFunctionCallOutputCount:
+        optimizeResult.stats.droppedFunctionCallOutputCount,
+      droppedReasoningCount: optimizeResult.stats.droppedReasoningCount,
+    });
+  } else {
+    const reason = inputHasToolHistory
+      ? "below_token_threshold"
+      : "no_tool_history";
+    serverLog(runtime.config, "INFO", "codexproxy:local_prune:skipped", {
+      requestId,
+      reason,
+      originalContextTokens,
+      localPruneMinTokens: runtime.config.localPruneMinTokens,
+      inputItems: originalInput.length,
+    });
+    await appendEventLog(runtime.config, {
+      requestId,
+      stage: "local_prune_skipped",
+      reason,
+      originalContextTokens,
+      localPruneMinTokens: runtime.config.localPruneMinTokens,
+      inputItems: originalInput.length,
+    });
+  }
 
   let finalInput = optimizeResult.localInput;
-  const remoteCompactPayload = buildRemoteCompactPayload(optimizeResult.prefixSegments);
-  const allowRemoteCompact = runtime.config.enableCompactModel && !inputHasToolHistory;
+  const remoteCompactPayload = buildRemoteCompactPayload(
+    optimizeResult.prefixSegments,
+  );
+  const allowRemoteCompact = runtime.config.enableCompactModel &&
+    shouldApplyCompression;
   if (remoteCompactPayload.compressibleHistory.trim() && allowRemoteCompact) {
     const liteUpstream = runtime.config.liteUpstream;
     const liteModel = runtime.config.liteModel;
     if (!liteUpstream || !liteModel) {
-      throw new Error("Compact model is enabled but LITE upstream config is incomplete.");
+      throw new Error(
+        "Compact model is enabled but LITE upstream config is incomplete.",
+      );
     }
     const compactRequest = buildCompactRequest(
       liteModel,
@@ -987,13 +1595,10 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
       );
       const summaryText = extractResponseText(compactResult.payload);
       if (summaryText) {
-        finalInput = [
-          ...optimizeResult.prefixSegments
-            .filter((segment) => !segment.compressible)
-            .map((segment) => segment.item),
+        finalInput = applyRemoteCompactSummary(
+          optimizeResult,
           buildSummaryMessage(runtime.assets.summaryPrefix, summaryText),
-          ...optimizeResult.suffixItems,
-        ];
+        );
         await writeJsonArtifact(logContext, "03-compact-summary.json", {
           summaryText,
           finalInput,
@@ -1012,7 +1617,7 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
     }
   } else if (remoteCompactPayload.compressibleHistory.trim()) {
     const reason = runtime.config.enableCompactModel
-      ? "tool_history_present"
+      ? "below_token_threshold"
       : "ENABLE_COMPACT_MODEL=false";
     serverLog(runtime.config, "INFO", "codexproxy:compact:disabled", {
       requestId,
@@ -1030,20 +1635,26 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
   const finalRequest: JsonObject = {
     ...structuredClone(requestBody),
     model: selectedModel.model,
-    instructions: rewrittenInstructions.instructions,
+    instructions: finalInstructions,
     input: finalInput,
   };
-  if (rewrittenInstructions.instructions !== instructions || didMutateLocalInput(optimizeResult.stats)) {
+  if (
+    finalInstructions !== instructions ||
+    didMutateLocalInput(optimizeResult.stats)
+  ) {
     delete finalRequest.previous_response_id;
   }
 
   const localRequestForMetrics: JsonObject = {
     ...structuredClone(requestBody),
     model: selectedModel.model,
-    instructions: rewrittenInstructions.instructions,
+    instructions: finalInstructions,
     input: optimizeResult.localInput,
   };
-  if (rewrittenInstructions.instructions !== instructions || didMutateLocalInput(optimizeResult.stats)) {
+  if (
+    finalInstructions !== instructions ||
+    didMutateLocalInput(optimizeResult.stats)
+  ) {
     delete localRequestForMetrics.previous_response_id;
   }
 
@@ -1082,6 +1693,7 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
     model_reason: selectedModel.reason,
     instructionsMatched: rewrittenInstructions.matched,
     instructionsVariant: rewrittenInstructions.variant ?? null,
+    continuationGuardApplied: Boolean(continuationGuardInstruction),
     tools: summarizeTools(finalRequest),
     stats: toJsonValue(optimizeResult.stats),
     context_tokens: toJsonValue(tokenMetrics),
@@ -1096,7 +1708,117 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
     requestId,
     logContext.requestDir,
     streamMode,
+    Boolean(continuationGuardInstruction),
   );
+}
+
+async function handleCompactPassthroughRequest(request: Request): Promise<Response> {
+  const runtime = await loadRuntime();
+  const requestId = newRequestId();
+  const proxyAuth = inspectProxyAccess(request.headers);
+
+  if (!isAuthorizedProxyRequest(runtime.config.proxyApiKey, request)) {
+    serverLog(runtime.config, "WARN", "codexproxy:auth:rejected", {
+      requestId,
+      path: new URL(request.url).pathname,
+      authSource: proxyAuth.source ?? "missing",
+      authScheme: proxyAuth.scheme ?? "missing",
+      authorizationPresent: proxyAuth.authorizationPresent,
+      xApiKeyPresent: proxyAuth.xApiKeyPresent,
+      apiKeyPresent: proxyAuth.apiKeyPresent,
+      providedPreview: maskSecretPreview(proxyAuth.token),
+      expectedPreview: maskSecretPreview(runtime.config.proxyApiKey),
+    });
+    return jsonResponse({ error: "Unauthorized." }, 401);
+  }
+
+  const logContext = await createRequestLogContext(runtime.config, requestId);
+  const rawBody = await request.text();
+
+  let requestBody: JsonObject;
+  try {
+    requestBody = parseJsonRequestBody(rawBody);
+  } catch (error) {
+    serverLog(runtime.config, "WARN", "codexproxy:compact:invalid-json", {
+      requestId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return jsonResponse({ error: "Invalid JSON request body." }, 400);
+  }
+
+  const targetUrl = compactEndpointUrl(runtime.config.codexUpstream.url);
+  const upstreamHeaders = forwardHeaders(
+    request.headers,
+    runtime.config.codexUpstream.apiKey,
+    "application/json, text/event-stream",
+  );
+
+  await writeJsonArtifact(logContext, "00-incoming-request.json", {
+    method: request.method,
+    url: request.url,
+    headers: headersToObject(request.headers),
+    body: requestBody,
+  });
+  await writeJsonArtifact(logContext, "01-compact-passthrough-request.json", {
+    url: targetUrl,
+    method: "POST",
+    headers: headersToObject(upstreamHeaders),
+    body: requestBody,
+  });
+
+  serverLog(runtime.config, "INFO", "codexproxy:compact:passthrough", {
+    requestId,
+    targetUrl,
+  });
+  await appendEventLog(runtime.config, {
+    requestId,
+    stage: "compact_passthrough",
+    target_url: targetUrl,
+  });
+
+  const startedAt = Date.now();
+  const upstream = await fetchWithTimeout(
+    targetUrl,
+    {
+      method: "POST",
+      headers: upstreamHeaders,
+      body: JSON.stringify(requestBody),
+    },
+    runtime.config.requestTimeoutMs,
+    request.signal,
+  );
+  const raw = await upstream.text().catch(() => "");
+  const returnedHeaders = buildBufferedClientHeaders(upstream.headers, raw);
+
+  await writeTextArtifact(
+    logContext,
+    "02-compact-passthrough-response.txt",
+    raw,
+  );
+  await writeJsonArtifact(logContext, "02-compact-passthrough-response-meta.json", {
+    status: upstream.status,
+    headers: headersToObject(upstream.headers),
+    returnedContentType: returnedHeaders.get("content-type"),
+    bytes: raw.length,
+  });
+
+  serverLog(
+    runtime.config,
+    upstream.ok ? "INFO" : "WARN",
+    "codexproxy:compact:passthrough_response",
+    {
+      requestId,
+      status: upstream.status,
+      bytes: raw.length,
+      elapsedMs: Date.now() - startedAt,
+      returnedContentType: returnedHeaders.get("content-type"),
+    },
+  );
+
+  return new Response(raw, {
+    status: upstream.status,
+    headers: returnedHeaders,
+  });
 }
 
 async function handleRequest(request: Request): Promise<Response> {
@@ -1115,6 +1837,28 @@ async function handleRequest(request: Request): Promise<Response> {
     });
   }
 
+  if (request.method === "POST" && isCompactEndpointPath(url.pathname)) {
+    try {
+      return await handleCompactPassthroughRequest(request);
+    } catch (error) {
+      const runtime = await loadRuntime().catch(() => undefined);
+      const meta = {
+        error: error instanceof Error ? error.message : String(error),
+      };
+      if (runtime) {
+        serverLog(runtime.config, "ERROR", "codexproxy:compact:failed", meta);
+      } else logLine("ERROR", "codexproxy:compact:failed", meta);
+      return jsonResponse(
+        {
+          error: error instanceof Error
+            ? error.message
+            : "Internal proxy error.",
+        },
+        500,
+      );
+    }
+  }
+
   if (
     request.method === "POST" &&
     (url.pathname === "/v1/responses" || url.pathname === "/responses")
@@ -1126,11 +1870,14 @@ async function handleRequest(request: Request): Promise<Response> {
       const meta = {
         error: error instanceof Error ? error.message : String(error),
       };
-      if (runtime) serverLog(runtime.config, "ERROR", "codexproxy:request:failed", meta);
-      else logLine("ERROR", "codexproxy:request:failed", meta);
+      if (runtime) {
+        serverLog(runtime.config, "ERROR", "codexproxy:request:failed", meta);
+      } else logLine("ERROR", "codexproxy:request:failed", meta);
       return jsonResponse(
         {
-          error: error instanceof Error ? error.message : "Internal proxy error.",
+          error: error instanceof Error
+            ? error.message
+            : "Internal proxy error.",
         },
         500,
       );
@@ -1138,6 +1885,10 @@ async function handleRequest(request: Request): Promise<Response> {
   }
 
   if (url.pathname === "/v1/responses" || url.pathname === "/responses") {
+    return jsonResponse({ error: "Method not allowed." }, 405);
+  }
+
+  if (isCompactEndpointPath(url.pathname)) {
     return jsonResponse({ error: "Method not allowed." }, 405);
   }
 

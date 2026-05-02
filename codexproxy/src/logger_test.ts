@@ -27,6 +27,7 @@ function makeConfig(logDir: string): CodexProxyConfig {
     logDir,
     heartbeatMs: 5000,
     requestTimeoutMs: 1000,
+    localPruneMinTokens: 180000,
     keepRecentUserMessages: 6,
     keepRecentItems: 80,
     keepRecentFunctionCallPairs: 2,

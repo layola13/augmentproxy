@@ -115,6 +115,14 @@ function itemCallId(item: JsonValue | undefined): string | undefined {
   return stringValue(objectValue(item).call_id);
 }
 
+function functionCallName(item: JsonValue | undefined): string | undefined {
+  return stringValue(objectValue(item).name);
+}
+
+function isTodoFunctionCall(item: JsonValue | undefined): boolean {
+  return itemType(item) === "function_call" && functionCallName(item) === "update_plan";
+}
+
 function functionCallLabel(item: JsonObject): string {
   const namespace = stringValue(item.namespace);
   const name = stringValue(item.name) ?? "unknown";
@@ -195,15 +203,38 @@ function collectRetainedFunctionCallIds(
   keepRecentFunctionCallPairs: number,
 ): Set<string> {
   const retained = new Set<string>();
+  for (const item of input) {
+    if (!isTodoFunctionCall(item)) continue;
+    const callId = itemCallId(item);
+    if (callId) retained.add(callId);
+  }
   if (keepRecentFunctionCallPairs <= 0) return retained;
   for (let index = input.length - 1; index >= 0; index -= 1) {
     if (itemType(input[index]) !== "function_call") continue;
     const callId = itemCallId(input[index]);
     if (!callId || retained.has(callId)) continue;
     retained.add(callId);
-    if (retained.size >= keepRecentFunctionCallPairs) break;
+    if (retained.size >= keepRecentFunctionCallPairs + countTodoFunctionCalls(input)) break;
   }
   return retained;
+}
+
+function countTodoFunctionCalls(input: JsonValue[]): number {
+  let count = 0;
+  for (const item of input) {
+    if (isTodoFunctionCall(item)) count += 1;
+  }
+  return count;
+}
+
+function collectTodoFunctionCallIds(input: JsonValue[]): Set<string> {
+  const todoCallIds = new Set<string>();
+  for (const item of input) {
+    if (!isTodoFunctionCall(item)) continue;
+    const callId = itemCallId(item);
+    if (callId) todoCallIds.add(callId);
+  }
+  return todoCallIds;
 }
 
 function collectDroppedFunctionCallOverviewLines(
@@ -213,6 +244,7 @@ function collectDroppedFunctionCallOverviewLines(
   const lines: string[] = [];
   for (const item of input) {
     if (itemType(item) !== "function_call") continue;
+    if (isTodoFunctionCall(item)) continue;
     const callId = itemCallId(item);
     if (callId && retainedFunctionCallIds.has(callId)) continue;
     lines.push(summarizeFunctionCallOverview(objectValue(item)));
@@ -321,12 +353,10 @@ function isRemoteCompactCandidate(
   index: number,
   firstUserIndex: number,
 ): boolean {
-  const type = itemType(item);
   const role = messageRole(item);
   if (isManagedPrefixMessage(item)) return false;
   if (role === "developer" || role === "user") return false;
   if (index === firstUserIndex) return false;
-  if (type === "function_call" || type === "function_call_output") return false;
   return true;
 }
 
@@ -358,16 +388,11 @@ export function optimizeRequestInput(
       prefixSegments: [],
       suffixItems: [],
       stats: summary,
+      remoteSummaryInsertIndex: null,
+      remoteSummaryHasLocalFallback: false,
     };
   }
 
-  const preservedFromIndex = findPreservedStartIndex(requestInput, options);
-  summary.preservedFromIndex = preservedFromIndex;
-  const firstUserIndex = findFirstUserMessageIndex(requestInput);
-  const retainedReasoningIndexes = collectRetainedReasoningIndexes(
-    requestInput,
-    options.keepRecentReasoningItems,
-  );
   const retainedFunctionCallIds = collectRetainedFunctionCallIds(
     requestInput,
     options.keepRecentFunctionCallPairs,
@@ -378,32 +403,23 @@ export function optimizeRequestInput(
   const functionCallHistorySummary = droppedFunctionCallOverviewLines.length > 0
     ? buildFunctionCallHistorySummaryMessage(droppedFunctionCallOverviewLines)
     : undefined;
-  let functionCallSummaryInserted = false;
-
   const localInput: JsonValue[] = [];
   const prefixSegments: PrefixSegment[] = [];
-  const suffixItems: JsonValue[] = [];
+  let remoteSummaryInsertIndex: number | null = null;
+  let localFallbackInserted = false;
 
   for (let index = 0; index < requestInput.length; index += 1) {
-    if (!functionCallSummaryInserted && functionCallHistorySummary && index >= preservedFromIndex) {
-      localInput.push(functionCallHistorySummary);
-      prefixSegments.push({ item: functionCallHistorySummary, compressible: false });
-      functionCallSummaryInserted = true;
-    }
-
     const item = requestInput[index];
     const type = itemType(item);
-    const record = objectValue(item);
-
-    if (type === "reasoning" && options.dropOldReasoning && !retainedReasoningIndexes.has(index)) {
-      summary.droppedReasoningCount += 1;
-      continue;
-    }
 
     if (type === "function_call") {
       const callId = itemCallId(item);
       if (!callId || !retainedFunctionCallIds.has(callId)) {
         summary.droppedFunctionCallCount += 1;
+        if (remoteSummaryInsertIndex === null) {
+          remoteSummaryInsertIndex = localInput.length;
+        }
+        prefixSegments.push({ item, compressible: true });
         continue;
       }
     }
@@ -412,56 +428,49 @@ export function optimizeRequestInput(
       const callId = itemCallId(item);
       if (!callId || !retainedFunctionCallIds.has(callId)) {
         summary.droppedFunctionCallOutputCount += 1;
+        if (remoteSummaryInsertIndex === null) {
+          remoteSummaryInsertIndex = localInput.length;
+        }
+        prefixSegments.push({ item, compressible: true });
         continue;
       }
     }
 
-    let nextItem: JsonValue = item;
-    if (index < preservedFromIndex && type === "function_call_output") {
-      const pruned = pruneFunctionCallOutput(record, options);
-      if (pruned.truncated) summary.truncatedToolOutputCount += 1;
-      nextItem = pruned.value;
-    } else if (index < preservedFromIndex && type === "function_call") {
-      const pruned = pruneFunctionCall(record, options);
-      if (pruned.truncated) summary.truncatedFunctionCallCount += 1;
-      nextItem = pruned.value;
-    } else if (
-      index < preservedFromIndex &&
-      index === firstUserIndex &&
-      type === "message" &&
-      messageRole(item) === "user"
+    if (
+      !localFallbackInserted &&
+      functionCallHistorySummary &&
+      remoteSummaryInsertIndex !== null &&
+      localInput.length === remoteSummaryInsertIndex
     ) {
-      const compacted = compactPinnedUserItem(record);
-      summary.compactedPinnedUserCodeBlockCount += compacted.compactedCodeBlocks;
-      nextItem = compacted.item;
+      localInput.push(functionCallHistorySummary);
+      localFallbackInserted = true;
     }
 
-    localInput.push(nextItem);
-
-    if (index < preservedFromIndex) {
-      const compressible = isRemoteCompactCandidate(nextItem, index, firstUserIndex);
-      prefixSegments.push({ item: nextItem, compressible });
-      if (compressible) {
-        summary.remoteCompactCandidateCount += 1;
-        summary.remoteCompactCandidateBytes += jsonLength(nextItem);
-      }
-    } else {
-      suffixItems.push(nextItem);
-    }
+    localInput.push(item);
   }
 
-  if (!functionCallSummaryInserted && functionCallHistorySummary) {
+  if (functionCallHistorySummary && !localFallbackInserted) {
+    remoteSummaryInsertIndex = localInput.length;
     localInput.push(functionCallHistorySummary);
-    prefixSegments.push({ item: functionCallHistorySummary, compressible: false });
+    localFallbackInserted = true;
   }
 
+  for (const segment of prefixSegments) {
+    if (!segment.compressible) continue;
+    summary.remoteCompactCandidateCount += 1;
+    summary.remoteCompactCandidateBytes += jsonLength(segment.item);
+  }
+
+  summary.preservedFromIndex = remoteSummaryInsertIndex ?? requestInput.length;
   summary.inputCountAfter = localInput.length;
   summary.bytesAfter = jsonLength(localInput);
   return {
     localInput,
     prefixSegments,
-    suffixItems,
+    suffixItems: [],
     stats: summary,
+    remoteSummaryInsertIndex,
+    remoteSummaryHasLocalFallback: localFallbackInserted,
   };
 }
 
@@ -509,6 +518,23 @@ export function buildRemoteCompactPayload(
     pinnedContext: pinnedParts.join("\n\n"),
     compressibleHistory: compressibleParts.join("\n\n"),
   };
+}
+
+export function applyRemoteCompactSummary(
+  optimized: OptimizedInputResult,
+  summaryMessage: JsonValue,
+): JsonValue[] {
+  if (optimized.remoteSummaryInsertIndex === null) {
+    return [...optimized.localInput];
+  }
+
+  const nextInput = [...optimized.localInput];
+  if (optimized.remoteSummaryHasLocalFallback) {
+    nextInput.splice(optimized.remoteSummaryInsertIndex, 1, summaryMessage);
+  } else {
+    nextInput.splice(optimized.remoteSummaryInsertIndex, 0, summaryMessage);
+  }
+  return nextInput;
 }
 
 export function buildSummaryMessage(summaryPrefix: string, summaryText: string): JsonObject {

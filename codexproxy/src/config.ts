@@ -154,6 +154,7 @@ export function loadConfig(): CodexProxyConfig {
     logDir: resolvePath(env("CODEXPROXY_LOG_DIR", "../logs")),
     heartbeatMs: envNumber("CODEXPROXY_HEARTBEAT_MS", 5000),
     requestTimeoutMs: envNumber("CODEXPROXY_REQUEST_TIMEOUT_MS", 180000),
+    localPruneMinTokens: envNumber("CODEXPROXY_LOCAL_PRUNE_MIN_TOKENS", 180000),
     keepRecentUserMessages: envNumber("CODEXPROXY_KEEP_RECENT_USER_MESSAGES", 6),
     keepRecentItems: envNumber("CODEXPROXY_KEEP_RECENT_ITEMS", 80),
     keepRecentFunctionCallPairs: envNumber("CODEXPROXY_KEEP_RECENT_FUNCTION_CALL_PAIRS", 2),
