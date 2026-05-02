@@ -1,0 +1,41 @@
+{
+  "servers": [
+    {
+      "server": "proxyanyrouter_local",
+      "description": "Local simulated MCP tools for AnyRouter responses bridge tests",
+      "tools": [
+        {
+          "name": "read_anyrouter_doc",
+          "description": "Read the local anyrouter.md provider note",
+          "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "action": {
+            "type": "read_file",
+            "path": "/home/vscode/projects/augmentproxy/anyrouter.md"
+          }
+        },
+        {
+          "name": "read_workspace_file",
+          "description": "Read a workspace file under the augmentproxy repository",
+          "input_schema": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": ["path"]
+          },
+          "action": {
+            "type": "read_file_arg",
+            "path_argument": "path",
+            "allowed_roots": ["/home/vscode/projects/augmentproxy"]
+          }
+        }
+      ]
+    }
+  ]
+}

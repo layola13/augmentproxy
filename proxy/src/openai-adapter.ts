@@ -156,21 +156,51 @@ function nodeToolUse(node: JsonValue): JsonObject | undefined {
   return { id, type: "function", function: { name, arguments: args } };
 }
 
-function historyToMessages(history: JsonValue): OpenAIMessage[] {
+interface HistoryToMessagesResult {
+  messages: OpenAIMessage[];
+  filteredToolCalls: number;
+  filteredToolCallIds: string[];
+  filteredToolReasons: string[];
+}
+
+function historyToMessages(
+  history: JsonValue,
+  fallbackPath?: string,
+): HistoryToMessagesResult {
   const messages: OpenAIMessage[] = [];
+  const filteredToolCallIds = new Set<string>();
+  const filteredToolReasons: string[] = [];
+  let filteredToolCalls = 0;
   for (const item of asArray(history)) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const record = item as JsonObject;
 
     const requestNodes = asArray(record.request_nodes);
     const responseNodes = asArray(record.response_nodes);
-    const toolResults = toolResultSummaries(requestNodes);
+    const toolResults = toolResultSummaries(requestNodes, filteredToolCallIds);
     const responseText =
       responseNodes.map(nodeText).filter(Boolean).join("\n") ||
       text(record.response_text).trim();
-    const toolCalls = responseNodes.map(nodeToolUse).filter((
-      call,
-    ): call is JsonObject => Boolean(call));
+    const toolCalls: JsonObject[] = [];
+    for (const call of responseNodes.map(nodeToolUse).filter((
+      value,
+    ): value is JsonObject => Boolean(value))) {
+      const parsed = parseToolCall(call, fallbackPath);
+      const dropReason = parsed
+        ? historicalToolCallDropReason(
+          parsed.name,
+          parsed.argumentsJson,
+          toolCallArgumentsJson(call),
+        )
+        : undefined;
+      if (parsed && dropReason) {
+        filteredToolCalls += 1;
+        filteredToolCallIds.add(parsed.id);
+        filteredToolReasons.push(`${parsed.name}: ${dropReason}`);
+        continue;
+      }
+      toolCalls.push(call);
+    }
     const userText = requestNodes.map(nodeText).filter(Boolean).join("\n") ||
       text(record.request_message).trim();
 
@@ -198,7 +228,7 @@ function historyToMessages(history: JsonValue): OpenAIMessage[] {
     // Auggie stores tool results in the next turn's request_nodes. For OpenAI
     // chat-completions, those tool messages must appear immediately after the
     // assistant tool_calls that produced them, before the next assistant turn.
-    appendToolResultMessages(messages, requestNodes);
+    appendToolResultMessages(messages, requestNodes, filteredToolCallIds);
     if (userText) messages.push({ role: "user", content: userText });
 
     if (responseText || toolCalls.length > 0) {
@@ -221,10 +251,73 @@ function historyToMessages(history: JsonValue): OpenAIMessage[] {
       if (content) messages.push({ role, content });
     }
   }
-  return messages;
+  return {
+    messages,
+    filteredToolCalls,
+    filteredToolCallIds: [...filteredToolCallIds],
+    filteredToolReasons,
+  };
 }
 
-function toolResultSummaries(nodes: JsonValue): string[] {
+function historicalToolCallDropReason(
+  toolName: string,
+  argumentsJson: string,
+  originalArgumentsJson: string,
+): string | undefined {
+  if (toolName !== "str-replace-editor") return undefined;
+  const reason = invalidToolReason(toolName, argumentsJson);
+  if (!reason) return undefined;
+  if (
+    reason.includes("requires path") ||
+    reason.includes("outside the allowed scope") ||
+    reason.includes("path does not exist") ||
+    reason.includes("no insert_line_entries")
+  ) return reason;
+  if (reason.includes("no effective str_replace_entries")) {
+    const rawArgs = parseHistoricalStrReplaceArgs(originalArgumentsJson);
+    const rawEntries = Array.isArray(rawArgs?.str_replace_entries)
+      ? rawArgs.str_replace_entries
+      : [];
+    if (rawEntries.length === 0 || rawEntries.every(isNoopStrReplaceEntry)) {
+      return reason;
+    }
+  }
+  return undefined;
+}
+
+function toolCallArgumentsJson(call: JsonObject): string {
+  const fn = call.function;
+  if (!fn || typeof fn !== "object" || Array.isArray(fn)) return "{}";
+  const args = (fn as JsonObject).arguments;
+  return typeof args === "string" ? args : JSON.stringify(args ?? {});
+}
+
+function parseHistoricalStrReplaceArgs(
+  argumentsJson: string,
+): JsonObject | undefined {
+  const parsed = parseStrReplaceObjectFromPossiblyBrokenJson(argumentsJson);
+  if (parsed) return parsed;
+  const outer = parseJsonObjectLoose(argumentsJson);
+  if (outer && typeof outer.raw_input === "string") {
+    return parseStrReplaceObjectFromPossiblyBrokenJson(outer.raw_input) ??
+      parseJsonObjectLoose(outer.raw_input);
+  }
+  return outer;
+}
+
+function isNoopStrReplaceEntry(entry: JsonValue): boolean {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const record = entry as JsonObject;
+  return typeof record.old_str === "string" &&
+    typeof record.new_str === "string" &&
+    normalizeForNoopCompare(record.old_str) ===
+      normalizeForNoopCompare(record.new_str);
+}
+
+function toolResultSummaries(
+  nodes: JsonValue,
+  skipToolCallIds = new Set<string>(),
+): string[] {
   const output: string[] = [];
   for (const node of asArray(nodes)) {
     if (!node || typeof node !== "object" || Array.isArray(node)) continue;
@@ -235,6 +328,7 @@ function toolResultSummaries(nodes: JsonValue): string[] {
     ) continue;
     const result = toolResult as JsonObject;
     const id = text(result.tool_use_id).trim();
+    if (id && skipToolCallIds.has(id)) continue;
     const content = compactToolResultContent(text(result.content));
     if (!content.trim()) continue;
     output.push(`Tool result${id ? ` ${id}` : ""}:\n${content}`);
@@ -245,6 +339,7 @@ function toolResultSummaries(nodes: JsonValue): string[] {
 function appendToolResultMessages(
   messages: OpenAIMessage[],
   nodes: JsonValue,
+  skipToolCallIds = new Set<string>(),
 ): void {
   for (const node of asArray(nodes)) {
     if (!node || typeof node !== "object" || Array.isArray(node)) continue;
@@ -256,6 +351,7 @@ function appendToolResultMessages(
     const toolCallId = typeof result.tool_use_id === "string"
       ? result.tool_use_id
       : undefined;
+    if (toolCallId && skipToolCallIds.has(toolCallId)) continue;
     const content = compactToolResultContent(text(result.content));
     if (toolCallId) {
       messages.push({ role: "tool", tool_call_id: toolCallId, content });
@@ -406,7 +502,22 @@ function buildMessages(
   if (systemParts.length > 0) {
     messages.push({ role: "system", content: systemParts.join("\n\n") });
   }
-  messages.push(...historyToMessages(body.chat_history));
+  const fallbackPath = workspaceFallbackPath(ctx);
+  const historyMessages = historyToMessages(body.chat_history, fallbackPath);
+  messages.push(...historyMessages.messages);
+  if (historyMessages.filteredToolCalls > 0) {
+    logWarn(config, "openai:messages:filtered-invalid-tool-history", {
+      requestId: ctx.requestId,
+      filteredToolCalls: historyMessages.filteredToolCalls,
+      sampleToolCallIds: historyMessages.filteredToolCallIds.slice(0, 12),
+      sampleReasons: historyMessages.filteredToolReasons.slice(0, 5),
+    });
+    messages.push({
+      role: "user",
+      content:
+        "Proxy context: previous invalid str-replace-editor calls were removed from tool history. Do not repeat those old edit arguments. Re-read the current file and generate fresh old_str/new_str pairs before editing.",
+    });
+  }
   appendToolResultMessages(messages, body.nodes);
   const currentUserText = currentNodeUserText(body.nodes);
   const currentHasToolResults = hasToolResultNodes(body.nodes);
@@ -1258,6 +1369,10 @@ function normalizeStrReplaceEntries(
     const normalizedNewStr = newStr
       ? normalizeForNoopCompare(newStr)
       : undefined;
+    if (
+      oldStr !== undefined && newStr !== undefined &&
+      normalizeForNoopCompare(oldStr) === normalizeForNoopCompare(newStr)
+    ) continue;
     if (fileContent && oldStr && !fileContent.includes(oldStr)) {
       const repairedOldStr = repairOldStrFromLineHints(
         fileContent,
@@ -1913,7 +2028,15 @@ function invalidToolReason(
           !Array.isArray(args.str_replace_entries) ||
           args.str_replace_entries.length === 0
         ) {
-          return `Tool ${toolName} has no unapplied str_replace_entries. Re-read the file and build fresh old_str/new_str pairs before retrying.`;
+          return `Tool ${toolName} has no effective str_replace_entries. Re-read the file and build fresh old_str/new_str pairs where new_str is different from old_str before retrying.`;
+        }
+      }
+      if (args.command === "insert") {
+        if (
+          !Array.isArray(args.insert_line_entries) ||
+          args.insert_line_entries.length === 0
+        ) {
+          return `Tool ${toolName} has no insert_line_entries. Re-read the file and build a non-empty insert edit before retrying.`;
         }
       }
     }
@@ -2052,6 +2175,47 @@ function invalidToolCallHint(
     return undefined;
   }
   return `Tool call rejected (${name}): ${reason}`;
+}
+
+function recoveryToolNodesForInvalidToolCalls(
+  invalidToolCalls: JsonObject[],
+  startingId = 1,
+): JsonObject[] {
+  const nodes: JsonObject[] = [];
+  const seenPaths = new Set<string>();
+  let id = startingId;
+  for (const call of invalidToolCalls) {
+    if (call.name !== "str-replace-editor") continue;
+    const reason = typeof call.reason === "string" ? call.reason : "";
+    if (!reason.includes("no effective str_replace_entries")) continue;
+    const argumentsJson = typeof call.arguments === "string" ? call.arguments : "{}";
+    let args: JsonObject;
+    try {
+      const parsed = JSON.parse(argumentsJson);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      args = parsed as JsonObject;
+    } catch {
+      continue;
+    }
+    const path = typeof args.path === "string" ? args.path : "";
+    if (!path || seenPaths.has(path)) continue;
+    if (!isPathWithinAllowedHome(path) || !isFilePath(path)) continue;
+    seenPaths.add(path);
+    const sourceId = typeof call.id === "string" && call.id
+      ? call.id
+      : `invalid_${id}`;
+    nodes.push({
+      id,
+      type: 5,
+      tool_use: {
+        tool_name: "view",
+        tool_use_id: `${sourceId}_recovery_view`,
+        input_json: JSON.stringify({ path, type: "file" }),
+      },
+    });
+    id += 1;
+  }
+  return nodes;
 }
 
 function hasMeaningfulVisibleText(content: string): boolean {
@@ -2366,6 +2530,8 @@ function openAIUrl(config: ProxyConfig): string {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+const STREAM_RATE_LIMIT_RETRY_MS = 60_000;
 
 function summarizeUpstreamFailure(
   status: number,
@@ -3020,6 +3186,22 @@ export async function forwardAugmentStream(
               await delay(200);
               continue;
             }
+            if (upstream.status === 429) {
+              logWarn(config, "openai:stream:rate-limited-retry", {
+                requestId,
+                attempt: upstreamAttempts,
+                retryAfterMs: STREAM_RATE_LIMIT_RETRY_MS,
+                hasBody: Boolean(upstream.body),
+                bodyLen: raw.length,
+                contentType: upstream.headers.get("content-type") ?? "",
+                upstreamRequestId: upstream.headers.get("x-request-id") ??
+                  upstream.headers.get("request-id") ?? "",
+                body: raw.slice(0, 300),
+              });
+              await delay(STREAM_RATE_LIMIT_RETRY_MS);
+              if (closed) return;
+              continue;
+            }
             const retry = shouldRetryUpstreamFailure(
               upstream.status,
               raw,
@@ -3144,20 +3326,41 @@ export async function forwardAugmentStream(
             return parsed &&
               !invalidToolReason(parsed.name, parsed.argumentsJson);
           });
-          const toolNodes = toolCallsToNodes(
+          const validToolNodes = toolCallsToNodes(
             nonInvalidToolCalls,
             1,
             fallbackPath,
             launchCommandFallback,
           );
-          if (toolNodes.length > 0) {
-            logInfo(config, "openai:stream:tool-nodes", {
+          const recoveryToolNodes = validToolNodes.length === 0
+            ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1)
+            : [];
+          if (recoveryToolNodes.length > 0) {
+            logWarn(config, "openai:stream:invalid-tool-recovery-nodes", {
               requestId,
-              nodes: toolNodes.map((node) =>
+              nodes: recoveryToolNodes.map((node) =>
                 (node.tool_use as JsonObject | undefined)?.tool_name ??
                   "unknown"
               ),
-              inputs: toolNodes.map((node) => {
+              inputs: recoveryToolNodes.map((node) => {
+                const input =
+                  ((node.tool_use as JsonObject | undefined)?.input_json ??
+                    "") as string;
+                return { len: input.length, preview: input.slice(0, 120) };
+              }),
+            });
+          }
+          const toolNodes = recoveryToolNodes.length > 0
+            ? recoveryToolNodes
+            : validToolNodes;
+          if (validToolNodes.length > 0) {
+            logInfo(config, "openai:stream:tool-nodes", {
+              requestId,
+              nodes: validToolNodes.map((node) =>
+                (node.tool_use as JsonObject | undefined)?.tool_name ??
+                  "unknown"
+              ),
+              inputs: validToolNodes.map((node) => {
                 const input =
                   ((node.tool_use as JsonObject | undefined)?.input_json ??
                     "") as string;
@@ -3166,16 +3369,17 @@ export async function forwardAugmentStream(
               fallbackPathUsed: fallbackPath,
             });
           }
-          if (
-            !hasMeaningfulVisibleText(visibleText) && toolNodes.length === 0
-          ) {
+          if (invalidToolCalls.length > 0 && toolNodes.length === 0) {
             const invalidHint = invalidToolCallHint(invalidToolCalls);
             if (invalidHint) {
-              visibleText += invalidHint;
+              const hintText = visibleText.trim()
+                ? `\n\n${invalidHint}`
+                : invalidHint;
+              visibleText += hintText;
               emittedVisibleText = true;
               safeEnqueue({
-                text: invalidHint,
-                delta: invalidHint,
+                text: hintText,
+                delta: hintText,
                 request_id: requestId,
               });
             }
