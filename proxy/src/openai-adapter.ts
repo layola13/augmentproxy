@@ -163,21 +163,44 @@ function historyToMessages(history: JsonValue): OpenAIMessage[] {
     const record = item as JsonObject;
 
     const requestNodes = asArray(record.request_nodes);
+    const responseNodes = asArray(record.response_nodes);
+    const toolResults = toolResultSummaries(requestNodes);
+    const responseText =
+      responseNodes.map(nodeText).filter(Boolean).join("\n") ||
+      text(record.response_text).trim();
+    const toolCalls = responseNodes.map(nodeToolUse).filter((
+      call,
+    ): call is JsonObject => Boolean(call));
+    const userText = requestNodes.map(nodeText).filter(Boolean).join("\n") ||
+      text(record.request_message).trim();
+
+    if (
+      toolResults.length > 0 && !userText && !responseText &&
+      toolCalls.length === 0
+    ) {
+      messages.push({
+        role: "user",
+        content: [
+          "Previous tool results were recorded without a following assistant continuation. Treat them as context and continue the task.",
+          ...toolResults,
+        ].join("\n\n"),
+      });
+      continue;
+    }
+
+    if (
+      toolResults.length === 0 && userText && isContinuationText(userText) &&
+      !responseText && toolCalls.length === 0
+    ) {
+      continue;
+    }
+
     // Auggie stores tool results in the next turn's request_nodes. For OpenAI
     // chat-completions, those tool messages must appear immediately after the
     // assistant tool_calls that produced them, before the next assistant turn.
     appendToolResultMessages(messages, requestNodes);
-    const userText = requestNodes.map(nodeText).filter(Boolean).join("\n") ||
-      text(record.request_message).trim();
     if (userText) messages.push({ role: "user", content: userText });
 
-    const responseNodes = asArray(record.response_nodes);
-    const toolCalls = responseNodes.map(nodeToolUse).filter((
-      call,
-    ): call is JsonObject => Boolean(call));
-    const responseText =
-      responseNodes.map(nodeText).filter(Boolean).join("\n") ||
-      text(record.response_text).trim();
     if (responseText || toolCalls.length > 0) {
       messages.push({
         role: "assistant",
@@ -199,6 +222,24 @@ function historyToMessages(history: JsonValue): OpenAIMessage[] {
     }
   }
   return messages;
+}
+
+function toolResultSummaries(nodes: JsonValue): string[] {
+  const output: string[] = [];
+  for (const node of asArray(nodes)) {
+    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+    const toolResult = (node as JsonObject).tool_result_node;
+    if (
+      !toolResult || typeof toolResult !== "object" ||
+      Array.isArray(toolResult)
+    ) continue;
+    const result = toolResult as JsonObject;
+    const id = text(result.tool_use_id).trim();
+    const content = compactToolResultContent(text(result.content));
+    if (!content.trim()) continue;
+    output.push(`Tool result${id ? ` ${id}` : ""}:\n${content}`);
+  }
+  return output;
 }
 
 function appendToolResultMessages(
@@ -231,6 +272,20 @@ function hasToolResultNodes(nodes: JsonValue): boolean {
     if (!node || typeof node !== "object" || Array.isArray(node)) return false;
     return Boolean((node as JsonObject).tool_result_node);
   });
+}
+
+function isContinuationText(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return normalized === "继续" || normalized === "continue" ||
+    normalized === "go on" || normalized === "next" ||
+    normalized.includes("继续");
+}
+
+function shouldRetryStalledContinuation(ctx: RequestContext): boolean {
+  const body = objectBody(ctx);
+  const currentText = currentNodeUserText(body.nodes) || text(body.message) ||
+    text(body.prompt) || text(body.instruction);
+  return hasToolResultNodes(body.nodes) || isContinuationText(currentText);
 }
 
 function pruneUnresolvedToolHistory(messages: OpenAIMessage[]): {
@@ -376,7 +431,13 @@ function buildMessages(
 
   if (userParts.length > 0) {
     messages.push({ role: "user", content: userParts.join("\n\n") });
-  } else if (!currentHasToolResults) {
+  } else if (currentHasToolResults) {
+    messages.push({
+      role: "user",
+      content:
+        "Continue from the latest tool result. If the task is not complete, perform the next concrete step using an appropriate tool. If it is complete, summarize the result and next step briefly.",
+    });
+  } else {
     messages.push({ role: "user", content: "Continue." });
   }
   const repaired = pruneUnresolvedToolHistory(messages);
@@ -929,9 +990,8 @@ function normalizeToolArguments(
     (toolName === "launch-process") && typeof args.max_wait_seconds !== "number"
   ) args.max_wait_seconds = 120;
   if (toolName === "str-replace-editor") {
-    if (typeof args.path === "string") {
-      args.path = repairViewPath(args.path, fallbackPath);
-    }
+    normalizeStrReplaceToolArguments(args, argumentsJson);
+    normalizeStrReplacePath(args, fallbackPath);
     if (typeof args.command !== "string") args.command = "str_replace";
     if (Array.isArray(args.str_replace_entries)) {
       const normalizedEntries = normalizeStrReplaceEntries(
@@ -955,7 +1015,136 @@ function normalizeToolArguments(
     const workspaceFolder = workspaceFolderFromPath(fallbackPath);
     if (workspaceFolder) args.workspace_folder = workspaceFolder;
   }
+  if (toolName === "add_tasks" || toolName === "update_tasks") {
+    normalizeTaskToolArguments(args, argumentsJson);
+  }
   return JSON.stringify(args);
+}
+
+function normalizeTaskToolArguments(
+  args: JsonObject,
+  originalArgumentsJson: string,
+): void {
+  if (Array.isArray(args.tasks)) {
+    args.tasks = normalizeTaskItems(args.tasks);
+    return;
+  }
+  const candidates: string[] = [];
+  if (typeof args.raw_input === "string") candidates.push(args.raw_input);
+  if (originalArgumentsJson.trim()) candidates.push(originalArgumentsJson);
+  for (const candidate of candidates) {
+    const tasks = parseTasksArrayFromPossiblyBrokenJson(candidate);
+    if (tasks) {
+      args.tasks = normalizeTaskItems(tasks);
+      delete args.raw_input;
+      return;
+    }
+  }
+}
+
+function normalizeTaskItems(items: JsonValue[]): JsonObject[] {
+  return items
+    .filter((item): item is JsonObject =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item)
+    )
+    .map((item) => {
+      const task = { ...item };
+      for (const key of ["parent_task_id", "after_task_id", "task_id"]) {
+        if (typeof task[key] === "string" && task[key].trim() === "") {
+          delete task[key];
+        }
+      }
+      return task;
+    });
+}
+
+function normalizeStrReplaceToolArguments(
+  args: JsonObject,
+  originalArgumentsJson: string,
+): void {
+  if (typeof args.path === "string" && Array.isArray(args.str_replace_entries)) {
+    return;
+  }
+  const candidates: string[] = [];
+  if (typeof args.raw_input === "string") candidates.push(args.raw_input);
+  if (originalArgumentsJson.trim()) candidates.push(originalArgumentsJson);
+  for (const candidate of candidates) {
+    const parsed = parseStrReplaceObjectFromPossiblyBrokenJson(candidate);
+    if (!parsed) continue;
+    for (const [key, value] of Object.entries(parsed)) {
+      args[key] = value;
+    }
+    delete args.raw_input;
+    return;
+  }
+}
+
+function parseStrReplaceObjectFromPossiblyBrokenJson(input: string): JsonObject | undefined {
+  const parsed = parseJsonObjectLoose(input);
+  if (parsed && typeof parsed.path === "string") return parsed;
+
+  const repaired = input
+    .replace(
+      /("str_replace_entries"\s*:\s*)\[\s*([A-Za-z_][A-Za-z0-9_]*\s*")/g,
+      '$1[{"$2',
+    )
+    .replace(
+      /("insert_line_entries"\s*:\s*)\[\s*([A-Za-z_][A-Za-z0-9_]*\s*")/g,
+      '$1[{"$2',
+    )
+    .replace(/([\{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/g, '$1"$2":');
+  const repairedParsed = parseJsonObjectLoose(repaired);
+  if (repairedParsed && typeof repairedParsed.path === "string") {
+    return repairedParsed;
+  }
+  return undefined;
+}
+
+function parseTasksArrayFromPossiblyBrokenJson(input: string): JsonObject[] | undefined {
+  const parsed = parseJsonObjectLoose(input);
+  if (parsed && Array.isArray(parsed.tasks)) {
+    const tasks = parsed.tasks.filter((item): item is JsonObject =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item)
+    );
+    if (tasks.length > 0) return tasks;
+  }
+
+  const repaired = input
+    .replace(/\[\s*([A-Za-z_][A-Za-z0-9_]*\s*\")/g, '[{"$1')
+    .replace(/\[\s*([A-Za-z_][A-Za-z0-9_]*\s*:)/g, '[{"$1')
+    .replace(/([\{,])\s*([A-Za-z_][A-Za-z0-9_]*)\s*:/g, '$1"$2":');
+  const repairedParsed = parseJsonObjectLoose(repaired);
+  if (repairedParsed && Array.isArray(repairedParsed.tasks)) {
+    const tasks = repairedParsed.tasks.filter((item): item is JsonObject =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item)
+    );
+    if (tasks.length > 0) return tasks;
+  }
+  return undefined;
+}
+
+function parseJsonObjectLoose(input: string): JsonObject | undefined {
+  const candidates = [input];
+  try {
+    const outer = JSON.parse(repairArgumentsJson(input));
+    if (typeof outer === "string") candidates.push(outer);
+    else if (outer && typeof outer === "object" && !Array.isArray(outer)) {
+      return outer as JsonObject;
+    }
+  } catch {
+    // Fall through to the repair candidates below.
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(repairArgumentsJson(candidate));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as JsonObject;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
 }
 
 function normalizeViewRangeArgument(args: JsonObject): void {
@@ -1112,6 +1301,112 @@ function normalizeStrReplaceEntries(
     output.push(entry);
   }
   return output;
+}
+
+function normalizeStrReplacePath(
+  args: JsonObject,
+  fallbackPath?: string,
+): void {
+  const alias = args.path ?? args.file_path ?? args.filepath ?? args.filename ??
+    args.file ?? args.absolute_path;
+  if (typeof alias === "string" && alias.trim()) {
+    const repaired = repairFilePath(alias, fallbackPath);
+    if (repaired) args.path = repaired;
+    return;
+  }
+  const inferred = inferUniqueEditPathFromOldStr(args, fallbackPath);
+  if (inferred) args.path = inferred;
+}
+
+function repairFilePath(path: string, fallbackPath?: string): string | undefined {
+  const repaired = repairViewPath(path, fallbackPath);
+  if (repaired && isFilePath(repaired)) return repaired;
+  const cleaned = cleanExtractedPath(path);
+  const fallback = fallbackPath ? normalizePathSlashes(fallbackPath.trim()) : undefined;
+  const candidates = [cleaned];
+  if (fallback && cleaned && !isAbsolutePath(cleaned)) {
+    candidates.push(joinPath(fallback, cleaned.replace(/^\.\//, "")));
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const sibling = uniqueExtensionSibling(candidate) ?? uniqueFilePrefixSibling(candidate);
+    if (sibling && isFilePath(sibling)) return sibling;
+  }
+  return undefined;
+}
+
+function isFilePath(path: string): boolean {
+  try {
+    return Deno.statSync(path).isFile;
+  } catch {
+    return false;
+  }
+}
+
+function inferUniqueEditPathFromOldStr(
+  args: JsonObject,
+  fallbackPath?: string,
+): string | undefined {
+  const root = workspaceFolderFromPath(fallbackPath) ?? fallbackPath;
+  if (!root || !directoryExists(root)) return undefined;
+  const entries = Array.isArray(args.str_replace_entries)
+    ? args.str_replace_entries
+    : [];
+  const oldStrings = entries
+    .map((entry) => entry && typeof entry === "object" && !Array.isArray(entry)
+      ? (entry as JsonObject).old_str
+      : undefined)
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .slice(0, 3);
+  if (oldStrings.length === 0) return undefined;
+  const matches: string[] = [];
+  findFilesContainingAll(root, oldStrings, matches, 0);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+const EDIT_PATH_SKIP_DIRS = new Set([
+  ".git",
+  ".zig-cache",
+  "zig-cache",
+  "node_modules",
+  "target",
+  "dist",
+  "build",
+  "__pycache__",
+]);
+
+function findFilesContainingAll(
+  dir: string,
+  needles: string[],
+  matches: string[],
+  depth: number,
+): void {
+  if (matches.length > 1 || depth > 8) return;
+  let entries: Deno.DirEntry[];
+  try {
+    entries = [...Deno.readDirSync(dir)];
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (matches.length > 1) return;
+    const path = joinPath(dir, entry.name);
+    if (entry.isDirectory) {
+      if (EDIT_PATH_SKIP_DIRS.has(entry.name)) continue;
+      findFilesContainingAll(path, needles, matches, depth + 1);
+      continue;
+    }
+    if (!entry.isFile || !hasFileExtension(path)) continue;
+    let content: string;
+    try {
+      const stat = Deno.statSync(path);
+      if (stat.size > 2_000_000) continue;
+      content = Deno.readTextFileSync(path);
+    } catch {
+      continue;
+    }
+    if (needles.every((needle) => content.includes(needle))) matches.push(path);
+  }
 }
 
 function repairMisusedToolCall(
@@ -1920,11 +2215,17 @@ function buildOpenAIRequest(
   config: ProxyConfig,
   ctx: RequestContext,
   stream: boolean,
+  continuationNudge?: string,
+  forceToolChoiceRequired = false,
 ): OpenAIChatRequest {
   const body = objectBody(ctx);
+  const messages = buildMessages(config, ctx);
+  if (continuationNudge) {
+    messages.push({ role: "user", content: continuationNudge });
+  }
   const request: OpenAIChatRequest = {
     model: config.openaiModel,
-    messages: buildMessages(config, ctx),
+    messages,
     stream,
   };
   if (typeof body.temperature === "number") {
@@ -1935,7 +2236,7 @@ function buildOpenAIRequest(
   const tools = buildOpenAITools(ctx);
   if (tools.length > 0) {
     request.tools = tools;
-    request.tool_choice = "auto";
+    request.tool_choice = forceToolChoiceRequired ? "required" : "auto";
   }
   return request;
 }
@@ -2087,6 +2388,17 @@ function shouldRetryUpstreamFailure(
   if (!hasBody) return true;
   return status === 408 || status === 409 || status === 425 || status === 429 ||
     status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+function shouldFallbackToolChoiceAuto(
+  status: number,
+  raw: string,
+): boolean {
+  if (status !== 400) return false;
+  const lower = raw.toLowerCase();
+  return lower.includes("tool_choice") &&
+    (lower.includes("required") || lower.includes("unsupported") ||
+      lower.includes("invalid"));
 }
 
 function augmentStatus(status: number): number {
@@ -2526,7 +2838,21 @@ export async function forwardAugmentStream(
     });
     return compactStreamResponse(config, ctx, compactSummary);
   }
-  const request = buildOpenAIRequest(config, ctx, true);
+  const continuationNudge = shouldRetryStalledContinuation(ctx)
+    ? [
+      "Continuation control: do not stop after a brief status update.",
+      "If the task is not fully complete, call the next appropriate tool now.",
+      "Only produce a final natural-language answer when there is no concrete tool action left to take.",
+    ].join(" ")
+    : undefined;
+  const forceToolChoiceRequired = Boolean(continuationNudge);
+  const request = buildOpenAIRequest(
+    config,
+    ctx,
+    true,
+    continuationNudge,
+    forceToolChoiceRequired,
+  );
   const requestId = ctx.requestId;
   const fallbackPath = workspaceFallbackPath(ctx);
   const streamToolCalls: JsonObject[] = [];
@@ -2626,7 +2952,8 @@ export async function forwardAugmentStream(
             tools: request.tools?.length ?? 0,
             bytes: JSON.stringify(request).length,
           });
-          const requestBody = JSON.stringify(request);
+          let requestBody = JSON.stringify(request);
+          let usedToolChoiceFallback = false;
           while (true) {
             upstreamAttempts += 1;
             const waitLogger = setInterval(
@@ -2674,6 +3001,25 @@ export async function forwardAugmentStream(
             if (upstream.ok && upstream.body) break;
 
             const raw = await upstream.text().catch(() => "");
+            if (
+              forceToolChoiceRequired && !usedToolChoiceFallback &&
+              shouldFallbackToolChoiceAuto(upstream.status, raw)
+            ) {
+              const fallbackRequest = {
+                ...request,
+                tool_choice: "auto" as const,
+              };
+              requestBody = JSON.stringify(fallbackRequest);
+              usedToolChoiceFallback = true;
+              logWarn(config, "openai:stream:tool-choice-required-fallback", {
+                requestId,
+                attempt: upstreamAttempts,
+                status: upstream.status,
+                body: raw.slice(0, 240),
+              });
+              await delay(200);
+              continue;
+            }
             const retry = shouldRetryUpstreamFailure(
               upstream.status,
               raw,

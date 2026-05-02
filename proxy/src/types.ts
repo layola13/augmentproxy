@@ -53,6 +53,6 @@ export interface OpenAIChatRequest {
   temperature?: number;
   max_tokens?: number;
   tools?: JsonObject[];
-  tool_choice?: "auto";
+  tool_choice?: "auto" | "required";
   stream_options?: JsonObject;
 }
