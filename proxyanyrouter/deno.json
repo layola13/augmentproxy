@@ -7,5 +7,8 @@
   "compilerOptions": {
     "strict": true,
     "lib": ["deno.ns", "dom", "dom.iterable"]
+  },
+  "imports": {
+    "js-tiktoken": "npm:js-tiktoken@^1.0.21"
   }
 }

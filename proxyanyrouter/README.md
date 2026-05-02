@@ -68,3 +68,4 @@ bash test-mcp-bridge.sh
 - 非桥接请求现在走实时透传，不再等完整上游 SSE 收完才回给客户端。
 - 本地 MCP bridge 默认使用 `PROXYANYROUTER_CONTINUATION_MODE=replay`，第二跳会把首跳 `function_call` 和 `function_call_output` 直接回放到 `input`，避免 AnyRouter 对 `previous_response_id` 报错。
 - 如果后续切回支持 `previous_response_id` 的上游，可以把 `PROXYANYROUTER_CONTINUATION_MODE` 改成 `previous_response_id`。
+- 对长会话历史，代理会保留最近 `6` 个 user turn 和最近 `80` 条输入的完整上下文，并压缩更早的 `function_call_output` / `function_call.arguments`，同时删除更早的 `reasoning`，以减少上游首包等待时间。

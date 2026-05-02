@@ -1,5 +1,10 @@
 import { loadConfigFromEnvFile } from "./config.ts";
 import {
+  DEFAULT_HISTORY_PRUNE_OPTIONS,
+  pruneRequestHistory,
+  type HistoryPruneSummary,
+} from "./history-pruning.ts";
+import {
   appendEventLog,
   createRequestLogContext,
   headersToObject,
@@ -276,11 +281,12 @@ async function runBridgeLoopWithRegistry(
   requestDir: string,
   registry: McpBridgeRegistry,
 ): Promise<UpstreamTurn> {
-  let currentRequest = sanitizeOutgoingRequest(flattenBridgeToolsInRequest(
+  const initialPrepared = prepareOutgoingRequest(flattenBridgeToolsInRequest(
     structuredClone(originalRequest),
     registry,
   ));
-  currentRequest = withStreamMode(currentRequest, true);
+  await logHistoryPruning(requestId, initialPrepared.history, "bridge_initial");
+  let currentRequest = withStreamMode(initialPrepared.request, true);
 
   for (let step = 0; step < config.maxBridgeSteps; step += 1) {
     const turn = await fetchUpstreamTurn(
@@ -347,10 +353,11 @@ async function runBridgeLoopWithRegistry(
         output,
       });
     }
-    currentRequest = sanitizeOutgoingRequest(
+    const prepared = prepareOutgoingRequest(
       buildFollowUpRequest(currentRequest, turn, outputs),
     );
-    currentRequest = withStreamMode(currentRequest, true);
+    await logHistoryPruning(requestId, prepared.history, `bridge_step_${step + 1}`);
+    currentRequest = withStreamMode(prepared.request, true);
   }
 
   throw new Error(`Exceeded max bridge steps (${config.maxBridgeSteps}).`);
@@ -437,6 +444,54 @@ function sanitizeOutgoingRequest(request: JsonObject): JsonObject {
       .filter((tool): tool is Exclude<JsonValue, null> => tool !== null);
   }
   return sanitized;
+}
+
+function prepareOutgoingRequest(
+  request: JsonObject,
+): { request: JsonObject; history: HistoryPruneSummary } {
+  const prepared = pruneRequestHistory(
+    sanitizeOutgoingRequest(request),
+    DEFAULT_HISTORY_PRUNE_OPTIONS,
+  );
+  return {
+    request: prepared.request,
+    history: prepared.summary,
+  };
+}
+
+async function logHistoryPruning(
+  requestId: string,
+  history: HistoryPruneSummary,
+  phase: string,
+): Promise<void> {
+  const bytesSaved = history.bytesBefore - history.bytesAfter;
+  const itemsRemoved = history.inputCountBefore - history.inputCountAfter;
+  if (
+    bytesSaved <= 0 &&
+    itemsRemoved <= 0 &&
+    history.truncatedToolOutputCount <= 0 &&
+    history.truncatedFunctionCallCount <= 0 &&
+    history.droppedReasoningCount <= 0
+  ) {
+    return;
+  }
+  const payload = {
+    requestId,
+    stage: "history_pruned",
+    phase,
+    preservedFromIndex: history.preservedFromIndex,
+    inputCountBefore: history.inputCountBefore,
+    inputCountAfter: history.inputCountAfter,
+    bytesBefore: history.bytesBefore,
+    bytesAfter: history.bytesAfter,
+    bytesSaved,
+    itemsRemoved,
+    droppedReasoningCount: history.droppedReasoningCount,
+    truncatedToolOutputCount: history.truncatedToolOutputCount,
+    truncatedFunctionCallCount: history.truncatedFunctionCallCount,
+  };
+  logLine("INFO", "proxyanyrouter:history:pruned", payload);
+  await appendEventLog(config, payload);
 }
 
 function withStreamMode(request: JsonObject, stream: boolean): JsonObject {
@@ -585,10 +640,9 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
 
   if (wantsJson) {
     if (!hasBridge) {
-      const upstreamRequest = withStreamMode(
-        sanitizeOutgoingRequest(structuredClone(body)),
-        false,
-      );
+      const prepared = prepareOutgoingRequest(structuredClone(body));
+      await logHistoryPruning(requestId, prepared.history, "json_passthrough");
+      const upstreamRequest = withStreamMode(prepared.request, false);
       const upstream = await fetchUpstreamResponse(
         upstreamRequest,
         request.headers,
@@ -669,10 +723,9 @@ async function handleResponsesRequest(request: Request): Promise<Response> {
       void (async () => {
         try {
           controller.enqueue(encoder.encode(encodeSseComment("connected")));
-          const sanitizedBody = withStreamMode(
-            sanitizeOutgoingRequest(structuredClone(body)),
-            true,
-          );
+          const prepared = prepareOutgoingRequest(structuredClone(body));
+          await logHistoryPruning(requestId, prepared.history, "stream_passthrough");
+          const sanitizedBody = withStreamMode(prepared.request, true);
           const finalTurn = hasBridge
             ? await runBridgeLoopWithRegistry(
               body,
