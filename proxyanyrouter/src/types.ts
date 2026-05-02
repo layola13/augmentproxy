@@ -13,8 +13,10 @@ export interface ProxyAnyRouterConfig {
   upstreamUrl: string;
   upstreamApiKey: string;
   mcpConfigPath: string;
+  logDir: string;
   heartbeatMs: number;
   maxBridgeSteps: number;
+  continuationMode: "replay" | "previous_response_id";
 }
 
 export interface McpBridgeActionReadFile {

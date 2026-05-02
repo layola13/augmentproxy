@@ -45,6 +45,11 @@ function findToolByName(body: JsonObject, name: string): JsonObject | undefined 
   return tools.find((tool) => stringValue(objectValue(tool).name) === name) as JsonObject | undefined;
 }
 
+function findInputItem(body: JsonObject, type: string): JsonObject | undefined {
+  const input = Array.isArray(body.input) ? body.input : [];
+  return input.find((item) => stringValue(objectValue(item).type) === type) as JsonObject | undefined;
+}
+
 console.log(`proxyanyrouter mock upstream listening on http://127.0.0.1:${port}`);
 console.log(`proxyanyrouter mock log: ${logPath}`);
 
@@ -64,7 +69,8 @@ Deno.serve({ port }, async (request) => {
 
   const flattenedToolName = "mcp__proxyanyrouter_local__read_anyrouter_doc";
   const previousResponseId = stringValue(body.previous_response_id);
-  if (!previousResponseId) {
+  const functionCallOutput = findInputItem(body, "function_call_output");
+  if (!previousResponseId && !functionCallOutput) {
     const tool = findToolByName(body, flattenedToolName);
     if (!tool) {
       return new Response(
@@ -97,7 +103,7 @@ Deno.serve({ port }, async (request) => {
     ].join(""));
   }
 
-  if (previousResponseId !== "resp-1") {
+  if (previousResponseId && previousResponseId !== "resp-1") {
     return new Response(
       JSON.stringify({ error: `unexpected previous_response_id ${previousResponseId}` }),
       { status: 400, headers: { "content-type": "application/json" } },
@@ -105,8 +111,14 @@ Deno.serve({ port }, async (request) => {
   }
 
   const input = Array.isArray(body.input) ? body.input : [];
-  const outputItem = input.find((item) => objectValue(item).type === "function_call_output");
-  const outputRecord = objectValue(outputItem);
+  const functionCallRecord = objectValue(findInputItem(body, "function_call"));
+  if (!previousResponseId && stringValue(functionCallRecord.name) !== flattenedToolName) {
+    return new Response(
+      JSON.stringify({ error: "missing replayed function_call item" }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    );
+  }
+  const outputRecord = objectValue(functionCallOutput);
   if (stringValue(outputRecord.call_id) !== "call-1") {
     return new Response(
       JSON.stringify({ error: "missing function_call_output for call-1" }),

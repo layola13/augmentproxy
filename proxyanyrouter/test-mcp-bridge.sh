@@ -111,11 +111,19 @@ tool_names = [tool.get("name") for tool in tools if isinstance(tool, dict)]
 assert "mcp__proxyanyrouter_local__read_anyrouter_doc" in tool_names, tool_names
 assert all(tool.get("type") != "namespace" for tool in tools if isinstance(tool, dict)), tools
 
-assert second.get("previous_response_id") == "resp-1", second
 inputs = second.get("input", [])
-assert inputs and inputs[0].get("type") == "function_call_output", inputs
-assert inputs[0].get("call_id") == "call-1", inputs[0]
-assert "wire_api = \"responses\"" in inputs[0].get("output", ""), inputs[0]
+assert inputs, second
+function_output = next((item for item in inputs if item.get("type") == "function_call_output"), None)
+assert function_output is not None, inputs
+assert function_output.get("call_id") == "call-1", function_output
+assert "wire_api = \"responses\"" in function_output.get("output", ""), function_output
+
+if second.get("previous_response_id") is None:
+    replayed_call = next((item for item in inputs if item.get("type") == "function_call"), None)
+    assert replayed_call is not None, inputs
+    assert replayed_call.get("name") == "mcp__proxyanyrouter_local__read_anyrouter_doc", replayed_call
+else:
+    assert second.get("previous_response_id") == "resp-1", second
 
 stream_text = client_stream.read_text(encoding="utf-8")
 assert "event: response.output_text.delta" in stream_text, stream_text

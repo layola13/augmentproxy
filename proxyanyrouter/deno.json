@@ -1,6 +1,6 @@
 {
   "tasks": {
-    "start": "deno run --allow-net --allow-env --allow-read src/server.ts",
+    "start": "deno run --allow-net --allow-env --allow-read --allow-write src/server.ts",
     "mock-upstream": "deno run --allow-net --allow-env --allow-read --allow-write mock-upstream.ts",
     "check": "deno check src/server.ts mock-upstream.ts"
   },
