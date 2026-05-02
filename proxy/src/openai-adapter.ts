@@ -898,6 +898,9 @@ function normalizeToolArguments(
   if ((toolName === "view") && args.path === "." && fallbackPath) {
     args.path = fallbackPath;
   }
+  if (toolName === "view") {
+    normalizeViewRangeArgument(args);
+  }
   if (
     (toolName === "view-range-untruncated") && typeof args.path === "string"
   ) args.path = repairViewPath(args.path, fallbackPath);
@@ -953,6 +956,30 @@ function normalizeToolArguments(
     if (workspaceFolder) args.workspace_folder = workspaceFolder;
   }
   return JSON.stringify(args);
+}
+
+function normalizeViewRangeArgument(args: JsonObject): void {
+  const value = args.view_range;
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value)) {
+    delete args.view_range;
+    return;
+  }
+  const normalized = value
+    .map((item) => typeof item === "number" && Number.isFinite(item)
+      ? Math.trunc(item)
+      : undefined)
+    .filter((item): item is number => item !== undefined);
+  if (normalized.length !== 2) {
+    delete args.view_range;
+    return;
+  }
+  const [start, end] = normalized;
+  if (start < 1 || end < start) {
+    delete args.view_range;
+    return;
+  }
+  args.view_range = [start, end];
 }
 
 function readTextFileIfExists(path?: string): string | undefined {
@@ -1475,6 +1502,18 @@ function invalidToolReason(
     if ((toolName === "view") && typeof args.path !== "string") {
       return `Tool ${toolName} requires a concrete path. Retry with valid JSON like {"path":"README.md","type":"file"}.`;
     }
+    if (toolName === "view" && Array.isArray(args.view_range)) {
+      const range = args.view_range;
+      const start = range[0];
+      const end = range[1];
+      const validRange = range.length === 2 &&
+        typeof start === "number" && Number.isFinite(start) &&
+        typeof end === "number" && Number.isFinite(end) &&
+        start >= 1 && end >= start;
+      if (!validRange) {
+        return `Tool ${toolName} view_range must be omitted or be [start_line,end_line]. Do not send an empty view_range array.`;
+      }
+    }
     if (
       (toolName === "view") && typeof args.path === "string" &&
       !isPathWithinAllowedHome(args.path)
@@ -1715,7 +1754,7 @@ function invalidToolCallHint(
     name === "str-replace-editor" &&
     reason.includes("no unapplied str_replace_entries")
   ) {
-    return "The requested edit appears to have already been applied or no longer matches the current file. Re-read the file and continue from the current contents.";
+    return undefined;
   }
   return `Tool call rejected (${name}): ${reason}`;
 }

@@ -63,7 +63,7 @@ export function loadConfig(): ProxyConfig {
     fakeAugmentEmail: env("FAKE_AUGMENT_EMAIL", "proxy@example.local"),
     fakeAugmentUserId: env("FAKE_AUGMENT_USER_ID", "user_proxy_local"),
     requestLogDir: normalizeLogDir(env("AUGMENT_REQUEST_LOG_DIR", "logs")),
-    indexingMode: env("AUGMENT_INDEXING_MODE", "capture").toLowerCase(),
+    indexingMode: env("AUGMENT_INDEXING_MODE", "complete").toLowerCase(),
     embedBaseUrl: normalizeEmbedBaseUrl(env("EMBED_BASE_URL", "http://127.0.0.1:11434")),
     embedApiKey: env("EMBED_API_KEY"),
     embedModel: env("EMBED_MODEL", "mxbai-embed-large:latest"),

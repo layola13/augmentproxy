@@ -34,8 +34,77 @@ export interface IndexedChunkHit {
 
 const indexedBlobs = new Set<string>();
 const checkpoints = new Map<string, string[]>();
+const seenUploads = new Map<
+  string,
+  { path: string; contentLength: number; seenAt: string }
+>();
+const pendingUploads = new Map<
+  string,
+  {
+    path: string;
+    contentLength: number;
+    startedAt: string;
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  }
+>();
 let collectionReady: Promise<void> | undefined;
 const pointIdCache = new Map<string, string>();
+
+function createPendingUpload(blob: UploadBlob): void {
+  if (pendingUploads.has(blob.blobName)) return;
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<void>((resolveFn, rejectFn) => {
+    resolve = resolveFn;
+    reject = rejectFn;
+  });
+  pendingUploads.set(blob.blobName, {
+    path: blob.path,
+    contentLength: blob.content.length,
+    startedAt: new Date().toISOString(),
+    promise,
+    resolve,
+    reject,
+  });
+}
+
+async function waitForPendingUploads(
+  config: ProxyConfig,
+  requestId: string,
+  names: string[],
+): Promise<void> {
+  const pending = names
+    .map((name) => ({ name, upload: pendingUploads.get(name) }))
+    .filter((entry): entry is {
+      name: string;
+      upload: NonNullable<ReturnType<typeof pendingUploads.get>>;
+    } => Boolean(entry.upload));
+  if (pending.length === 0) return;
+
+  logInfo(config, "index:find-missing:wait-pending", {
+    requestId,
+    pending: pending.length,
+    samples: pending.slice(0, 20).map(({ name, upload }) => ({
+      name,
+      path: upload.path,
+      contentLength: upload.contentLength,
+      startedAt: upload.startedAt,
+    })),
+  });
+
+  const timeoutMs = 180_000;
+  const timeout = new Promise<void>((resolve) => {
+    setTimeout(resolve, timeoutMs);
+  });
+  await Promise.race([
+    Promise.allSettled(pending.map(({ upload }) => upload.promise)).then(() =>
+      undefined
+    ),
+    timeout,
+  ]);
+}
 
 function bodyObject(ctx: RequestContext): JsonObject {
   return ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
@@ -134,6 +203,45 @@ async function upsertBlobMarker(
   if (!response.ok) {
     throw new Error(
       `Qdrant marker upsert failed: ${response.status} ${await response
+        .text()}`,
+    );
+  }
+}
+
+async function upsertOrphanBlobMarkers(
+  config: ProxyConfig,
+  blobNames: string[],
+): Promise<void> {
+  if (blobNames.length === 0) return;
+  await ensureCollection(config);
+  const points = [];
+  for (const blobName of blobNames) {
+    points.push({
+      id: await pointId(`blob-marker:${blobName}`),
+      vector: markerVector(config),
+      payload: {
+        kind: "blob_marker",
+        blob_name: blobName,
+        path: "",
+        content_length: 0,
+        orphan: true,
+        indexed_at: new Date().toISOString(),
+      },
+    });
+  }
+  const response = await qdrantRequest(
+    config,
+    `/collections/${
+      encodeURIComponent(config.qdrantCollection)
+    }/points?wait=true`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ points }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `Qdrant orphan marker upsert failed: ${response.status} ${await response
         .text()}`,
     );
   }
@@ -441,19 +549,40 @@ export async function indexFindMissing(
   if (config.indexingMode === "capture") {
     return { unknown_memory_names: names, nonindexed_blob_names: [] };
   }
+  await waitForPendingUploads(config, ctx.requestId, names);
   const existing = await existingBlobNames(config, names);
   for (const name of existing) indexedBlobs.add(name);
   const unknown = names.filter((name) =>
     !existing.has(name) && !indexedBlobs.has(name)
   );
+  const unknownSamples = unknown.slice(0, 20);
+  const orphanUnknown = unknown.filter((name) =>
+    !seenUploads.has(name) && !pendingUploads.has(name)
+  );
+  if (orphanUnknown.length > 0) {
+    await upsertOrphanBlobMarkers(config, orphanUnknown);
+    for (const name of orphanUnknown) indexedBlobs.add(name);
+    logInfo(config, "index:find-missing:orphan-markers", {
+      requestId: ctx.requestId,
+      count: orphanUnknown.length,
+      samples: orphanUnknown.slice(0, 20),
+    });
+  }
+  const returnedUnknown = unknown.filter((name) => !orphanUnknown.includes(name));
   logInfo(config, "index:find-missing:end", {
     requestId: ctx.requestId,
     names: names.length,
     existing: existing.size,
-    unknown: unknown.length,
+    unknown: returnedUnknown.length,
+    orphanUnknown: orphanUnknown.length,
+    unknownSamples,
+    seenUploads: unknownSamples.map((name) => ({
+      name,
+      upload: seenUploads.get(name) ?? null,
+    })),
     ms: Date.now() - start,
   });
-  return { unknown_memory_names: unknown, nonindexed_blob_names: [] };
+  return { unknown_memory_names: returnedUnknown, nonindexed_blob_names: [] };
 }
 
 export async function indexBatchUpload(
@@ -470,18 +599,34 @@ export async function indexBatchUpload(
     return { blob_names: blobs.map((blob) => blob.blobName) };
   }
 
+  for (const blob of blobs) createPendingUpload(blob);
+
   const uploaded: string[] = [];
   for (const blob of blobs) {
-    await deleteBlobPoints(config, [blob.blobName]);
-    const chunks = chunkText(config, blob);
-    const embeddings = await embedTexts(
-      config,
-      chunks.map((chunk) => chunk.text),
-    );
-    await upsertChunks(config, chunks, embeddings);
-    await upsertBlobMarker(config, blob);
-    indexedBlobs.add(blob.blobName);
-    uploaded.push(blob.blobName);
+    const pending = pendingUploads.get(blob.blobName);
+    try {
+      seenUploads.set(blob.blobName, {
+        path: blob.path,
+        contentLength: blob.content.length,
+        seenAt: new Date().toISOString(),
+      });
+      await deleteBlobPoints(config, [blob.blobName]);
+      const chunks = chunkText(config, blob);
+      const embeddings = await embedTexts(
+        config,
+        chunks.map((chunk) => chunk.text),
+      );
+      await upsertChunks(config, chunks, embeddings);
+      await upsertBlobMarker(config, blob);
+      indexedBlobs.add(blob.blobName);
+      uploaded.push(blob.blobName);
+      pending?.resolve();
+    } catch (error) {
+      pending?.reject(error);
+      throw error;
+    } finally {
+      pendingUploads.delete(blob.blobName);
+    }
   }
   logInfo(config, "index:batch-upload:end", {
     requestId: ctx.requestId,
