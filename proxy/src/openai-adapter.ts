@@ -2081,6 +2081,16 @@ function toolCallsToNodes(
   return nodes;
 }
 
+function textResponseNode(content: string, id = 1): JsonObject | undefined {
+  const trimmed = content.trim();
+  if (!trimmed) return undefined;
+  return {
+    id,
+    type: 0,
+    content,
+  };
+}
+
 function recentToolCallCounts(
   ctx: RequestContext,
   fallbackPath?: string,
@@ -2721,9 +2731,17 @@ export async function forwardAugmentJson(
     content = reasoningFallback;
     nodes = [];
   }
+  const responseNode = textResponseNode(content, 1);
+  let nextNodeId = responseNode ? 2 : 1;
+  const thinking = thinkingNodes(split.thinking).map((node) => ({
+    ...node,
+    id: nextNodeId++,
+  }));
+  const toolNodes = nodes.map((node) => ({ ...node, id: nextNodeId++ }));
   nodes = [
-    ...thinkingNodes(split.thinking),
-    ...nodes,
+    ...(responseNode ? [responseNode] : []),
+    ...thinking,
+    ...toolNodes,
     tokenUsageNode(config, request, data.usage),
   ];
   const tokenUsage = augmentTokenUsage(config, request, data.usage);
@@ -3396,12 +3414,22 @@ export async function forwardAugmentStream(
             thinkingItems: allThinking.length,
             toolFragments: streamToolCalls.length,
           });
+          const responseNode = textResponseNode(visibleText, 1);
+          let nextNodeId = responseNode ? 2 : 1;
           const thoughtNodes = hasMeaningfulVisibleText(visibleText)
             ? []
-            : thinkingNodes(allThinking);
+            : thinkingNodes(allThinking).map((node) => ({
+              ...node,
+              id: nextNodeId++,
+            }));
+          const persistedToolNodes = toolNodes.map((node) => ({
+            ...node,
+            id: nextNodeId++,
+          }));
           const finalNodes = [
+            ...(responseNode ? [responseNode] : []),
             ...thoughtNodes,
-            ...toolNodes,
+            ...persistedToolNodes,
             tokenUsageNode(config, request, streamUsage ?? null),
           ];
           if (
