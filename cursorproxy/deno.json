@@ -1,0 +1,15 @@
+{
+  "tasks": {
+    "dev": "node --experimental-strip-types --watch src/server.ts",
+    "start": "node --experimental-strip-types src/server.ts",
+    "check": "deno check src/server.ts"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.ns", "dom", "dom.iterable"]
+  },
+  "fmt": {
+    "semiColons": true,
+    "singleQuote": false
+  }
+}

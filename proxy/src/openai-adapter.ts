@@ -1064,6 +1064,9 @@ function normalizeToolArguments(
     if (typeof candidate === "string") args.path = candidate;
     else if (fallbackPath) args.path = fallbackPath;
   }
+  if (toolName === "save-file") {
+    normalizeSaveFileArguments(args, fallbackPath);
+  }
   if ((toolName === "view") && typeof args.path === "string") {
     args.path = repairViewPath(args.path, fallbackPath);
   }
@@ -1103,7 +1106,12 @@ function normalizeToolArguments(
   if (toolName === "str-replace-editor") {
     normalizeStrReplaceToolArguments(args, argumentsJson);
     normalizeStrReplacePath(args, fallbackPath);
-    if (typeof args.command !== "string") args.command = "str_replace";
+    if (typeof args.command !== "string") {
+      args.command = Array.isArray(args.insert_line_entries) &&
+          !Array.isArray(args.str_replace_entries)
+        ? "insert"
+        : "str_replace";
+    }
     if (Array.isArray(args.str_replace_entries)) {
       const normalizedEntries = normalizeStrReplaceEntries(
         typeof args.path === "string" ? args.path : undefined,
@@ -1111,6 +1119,7 @@ function normalizeToolArguments(
       );
       args.str_replace_entries = normalizedEntries;
     }
+    addFlatStrReplaceEditorCompatibilityFields(args);
   }
   if (
     toolName === "codebase-retrieval" &&
@@ -1130,6 +1139,21 @@ function normalizeToolArguments(
     normalizeTaskToolArguments(args, argumentsJson);
   }
   return JSON.stringify(args);
+}
+
+function normalizeSaveFileArguments(
+  args: JsonObject,
+  fallbackPath?: string,
+): void {
+  const alias = args.path ?? args.file_path ?? args.filepath ?? args.filename ??
+    args.file ?? args.absolute_path;
+  if (typeof alias === "string" && alias.trim()) {
+    args.path = repairViewPath(alias, fallbackPath);
+    return;
+  }
+  if (typeof args.path !== "string" && fallbackPath) {
+    args.path = repairViewPath(fallbackPath, fallbackPath);
+  }
 }
 
 function normalizeTaskToolArguments(
@@ -1167,6 +1191,70 @@ function normalizeTaskItems(items: JsonValue[]): JsonObject[] {
       }
       return task;
     });
+}
+
+function addFlatStrReplaceEditorCompatibilityFields(args: JsonObject): void {
+  const command = typeof args.command === "string" ? args.command : "";
+  clearFlatEditPreviewFields(args);
+  if (command === "str_replace" && Array.isArray(args.str_replace_entries)) {
+    let index = 1;
+    for (const item of args.str_replace_entries) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const entry = item as JsonObject;
+      const oldStr = typeof entry.old_str === "string"
+        ? entry.old_str
+        : undefined;
+      const newStr = typeof entry.new_str === "string"
+        ? entry.new_str
+        : undefined;
+      if (oldStr === undefined || newStr === undefined) continue;
+      args[`old_str_${index}`] = oldStr;
+      args[`new_str_${index}`] = newStr;
+      const startLine = integerField(entry.old_str_start_line_number);
+      const endLine = integerField(entry.old_str_end_line_number);
+      if (startLine !== undefined) {
+        args[`old_str_start_line_number_${index}`] = startLine;
+      }
+      if (endLine !== undefined) {
+        args[`old_str_end_line_number_${index}`] = endLine;
+      }
+      index += 1;
+    }
+  }
+  if (command === "insert" && Array.isArray(args.insert_line_entries)) {
+    let index = 1;
+    for (const item of args.insert_line_entries) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const entry = item as JsonObject;
+      const insertLine = integerField(entry.insert_line);
+      const newStr = typeof entry.new_str === "string"
+        ? entry.new_str
+        : undefined;
+      if (insertLine === undefined || newStr === undefined) continue;
+      args[`insert_line_${index}`] = insertLine;
+      args[`new_str_${index}`] = newStr;
+      index += 1;
+    }
+  }
+}
+
+function clearFlatEditPreviewFields(args: JsonObject): void {
+  for (const key of Object.keys(args)) {
+    if (
+      key === "old_str" ||
+      key === "new_str" ||
+      key === "old_str_start_line_number" ||
+      key === "old_str_end_line_number" ||
+      key === "insert_line" ||
+      /^old_str_\d+$/.test(key) ||
+      /^new_str_\d+$/.test(key) ||
+      /^old_str_start_line_number_\d+$/.test(key) ||
+      /^old_str_end_line_number_\d+$/.test(key) ||
+      /^insert_line_\d+$/.test(key)
+    ) {
+      delete args[key];
+    }
+  }
 }
 
 function normalizeStrReplaceToolArguments(
@@ -1571,8 +1659,91 @@ function repairArgumentsJson(argumentsJson: string): string {
   return trimmed;
 }
 
+function looksLikePathToken(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith("/")) return true;
+  if (/^[A-Za-z]:[\\/]/.test(trimmed)) return true;
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith("file://")) return true;
+  if (lower.startsWith("vscode://file/")) return true;
+  return trimmed.includes("/");
+}
+
+function unwrapPathReference(value: string): string {
+  let output = value.trim();
+  const markdownLinkMatch = output.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+  if (markdownLinkMatch) {
+    const label = markdownLinkMatch[1]?.trim() ?? "";
+    const target = markdownLinkMatch[2]?.trim() ?? "";
+    output = looksLikePathToken(target)
+      ? target
+      : looksLikePathToken(label)
+      ? label
+      : target;
+  } else {
+    const bracketedLabel = output.match(/^\[([^\]]+)\]$/);
+    if (bracketedLabel?.[1]) output = bracketedLabel[1].trim();
+  }
+  const angleBracket = output.match(/^<([^>]+)>$/);
+  if (angleBracket?.[1]) output = angleBracket[1].trim();
+  return output;
+}
+
+function decodePathUri(value: string): string {
+  const lower = value.toLowerCase();
+  if (lower.startsWith("file://")) {
+    try {
+      const url = new URL(value);
+      if (url.protocol === "file:") {
+        let pathname = decodeURIComponent(url.pathname || "");
+        if (/^\/[A-Za-z]:\//.test(pathname)) pathname = pathname.slice(1);
+        return `${pathname}${url.search ?? ""}${url.hash ?? ""}`;
+      }
+    } catch {
+      // Fall through to conservative fallback below.
+    }
+    return value.replace(/^file:\/+/, "/");
+  }
+  if (lower.startsWith("vscode://file/")) {
+    let pathname = value.slice("vscode://file/".length);
+    if (!pathname.startsWith("/")) pathname = `/${pathname}`;
+    try {
+      pathname = decodeURIComponent(pathname);
+    } catch {
+      // Keep raw pathname if decode fails.
+    }
+    return pathname;
+  }
+  return value;
+}
+
+function stripPathLineSuffix(value: string): string {
+  let output = value.trim();
+  output = output.replace(/#L\d+(?:C\d+)?$/i, "");
+  output = output.replace(
+    /([?&](?:line|lineno|start_line)=\d+(?::\d+)?)$/i,
+    "",
+  );
+  output = output.replace(/[?&]$/g, "");
+  const lineSuffixMatch = output.match(/^(.*):(\d+)(?::(\d+))?$/);
+  if (!lineSuffixMatch) return output;
+  const base = lineSuffixMatch[1];
+  if (/^[A-Za-z]$/.test(base)) return output;
+  if (
+    base.includes("/") || base.includes("\\") ||
+    /\.[^/\\.]+$/.test(base)
+  ) {
+    return base;
+  }
+  return output;
+}
+
 function cleanExtractedPath(path: string): string {
-  let cleaned = path.trim().replace(/^["'`]+|["'`]+$/g, "");
+  let cleaned = path.trim();
+  cleaned = unwrapPathReference(cleaned);
+  cleaned = decodePathUri(cleaned);
+  cleaned = cleaned.replace(/^["'`]+|["'`]+$/g, "");
   cleaned = cleaned.replace(/["'`}\])]+$/g, "");
   cleaned = cleaned.replace(
     /\s+-\s+(?:read|view)\s+(?:file|directory)\s*$/i,
@@ -1582,6 +1753,7 @@ function cleanExtractedPath(path: string): string {
     /\s+\|\s*(?:read|view)\s+(?:file|directory)\s*$/i,
     "",
   );
+  cleaned = stripPathLineSuffix(cleaned);
   return cleaned.trim();
 }
 
@@ -1822,7 +1994,13 @@ function canonicalizePath(path: string): string {
 }
 
 function allowedHomePrefix(): string | undefined {
-  const user = (Deno.env.get("USER") ?? "").trim().replace(/^\/+|\/+$/g, "");
+  let rawUser = "";
+  try {
+    rawUser = Deno.env.get("USER") ?? "";
+  } catch {
+    return undefined;
+  }
+  const user = rawUser.trim().replace(/^\/+|\/+$/g, "");
   if (!user) return undefined;
   return `/home/${user}`;
 }
@@ -2040,6 +2218,18 @@ function invalidToolReason(
         }
       }
     }
+    if (toolName === "save-file") {
+      if (typeof args.path !== "string") {
+        return `Tool ${toolName} requires path.`;
+      }
+      if (!isPathWithinAllowedHome(args.path)) {
+        return `Tool ${toolName} path is outside the allowed scope. Use an absolute path under ${allowedHomeHint()}.`;
+      }
+      const content = args.content ?? args.file_contents ?? args.text;
+      if (typeof content !== "string") {
+        return `Tool ${toolName} requires content.`;
+      }
+    }
     if (
       toolName === "reorganize_tasklist" && typeof args.markdown !== "string"
     ) return `Tool ${toolName} requires markdown.`;
@@ -2241,7 +2431,7 @@ function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
   const byKey = new Map<string, JsonObject>();
   const order: string[] = [];
   let anonymousCounter = 0;
-  let lastKey: string | undefined;
+  let anonymousFallbackCursor = 0;
 
   const completeJsonObject = (value: string | undefined): boolean => {
     if (!value || !value.trim()) return false;
@@ -2251,6 +2441,25 @@ function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
     } catch {
       return false;
     }
+  };
+  const mergedArgumentsByKey = (key: string): string | undefined => {
+    const existing = byKey.get(key);
+    const fn = existing?.function && typeof existing.function === "object" &&
+        !Array.isArray(existing.function)
+      ? existing.function as JsonObject
+      : undefined;
+    return fn && typeof fn.arguments === "string" ? fn.arguments : undefined;
+  };
+  const unresolvedKeys = (): string[] => {
+    return order.filter((key) => !completeJsonObject(mergedArgumentsByKey(key)));
+  };
+  const unresolvedNameForKey = (key: string): string => {
+    const existing = byKey.get(key);
+    const fn = existing?.function && typeof existing.function === "object" &&
+        !Array.isArray(existing.function)
+      ? existing.function as JsonObject
+      : undefined;
+    return fn && typeof fn.name === "string" ? fn.name : "";
   };
 
   for (const call of toolCalls) {
@@ -2274,24 +2483,30 @@ function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
     if (id && byKey.has(id)) key = id;
     else if (typeof index === "number") key = `index:${index}`;
     else if (id) key = id;
-    else if (lastKey) {
-      if (!sourceName) key = lastKey;
-      else {
-        const last = byKey.get(lastKey);
-        const lastFn = last?.function && typeof last.function === "object" &&
-            !Array.isArray(last.function)
-          ? last.function as JsonObject
-          : undefined;
-        const lastName = lastFn && typeof lastFn.name === "string"
-          ? lastFn.name
-          : "";
-        const lastArgs = lastFn && typeof lastFn.arguments === "string"
-          ? lastFn.arguments
-          : undefined;
-        if (
-          !lastName || sourceName.startsWith(lastName) ||
-          lastName.startsWith(sourceName) || !completeJsonObject(lastArgs)
-        ) key = lastKey;
+    else {
+      // If upstream omits both index and id (seen in some OpenAI-compatible
+      // providers), only stitch into an existing call when there is exactly one
+      // unresolved call. When there are multiple unresolved calls, prefer an
+      // exact/compatible name match. As a last resort, distribute fragments
+      // round-robin across unresolved calls to avoid collapsing everything into
+      // one call under parallel tool emission.
+      const unresolved = unresolvedKeys();
+      if (unresolved.length === 1) key = unresolved[0];
+      else if (unresolved.length > 1) {
+        if (sourceName) {
+          const candidates = unresolved.filter((candidateKey) => {
+            const candidateName = unresolvedNameForKey(candidateKey);
+            return !candidateName ||
+              sourceName === candidateName ||
+              sourceName.startsWith(candidateName) ||
+              candidateName.startsWith(sourceName);
+          });
+          if (candidates.length === 1) key = candidates[0];
+        }
+        if (!key) {
+          key = unresolved[anonymousFallbackCursor % unresolved.length];
+          anonymousFallbackCursor += 1;
+        }
       }
     }
     if (!key) key = `anon:${anonymousCounter++}`;
@@ -2340,7 +2555,6 @@ function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
       } else mergedFunction.arguments = `${mergedArgs}${sourceArguments}`;
     }
     merged.function = mergedFunction;
-    lastKey = key;
   }
 
   const mergedCalls = order.map((key) => byKey.get(key)).filter(
@@ -2351,29 +2565,7 @@ function mergeStreamToolCalls(toolCalls: JsonObject[]): JsonObject[] {
       return typeof record.name === "string" && record.name.length > 0;
     },
   );
-  return dedupeToolCalls(mergedCalls);
-}
-
-function dedupeToolCalls(toolCalls: JsonObject[]): JsonObject[] {
-  const seen = new Set<string>();
-  const output: JsonObject[] = [];
-  for (const call of toolCalls) {
-    const fn = call.function;
-    const fnRecord = fn && typeof fn === "object" && !Array.isArray(fn)
-      ? fn as JsonObject
-      : {};
-    const name = typeof fnRecord.name === "string"
-      ? normalizeToolName(fnRecord.name)
-      : "unknown";
-    const args = typeof fnRecord.arguments === "string"
-      ? fnRecord.arguments
-      : JSON.stringify(fnRecord.arguments ?? {});
-    const key = `${name}:${args}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    output.push(call);
-  }
-  return output;
+  return mergedCalls;
 }
 
 function renderToolCalls(toolCalls: JsonValue): string {
