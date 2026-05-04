@@ -549,6 +549,84 @@ Deno.test("save-file normalizes file_path alias to path", async () => {
         const input = firstToolInput(body);
         assertEquals(input.path, path);
         assertEquals(input.content, "alpha\nbeta\n");
+        assertEquals(input.file_content, "alpha\nbeta\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file accepts client file_content field", async () => {
+  const path = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-",
+    suffix: ".txt",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path,
+              file_content: "canonical\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+        assertEquals(input.file_content, "canonical\n");
+        assertEquals(input.content, "canonical\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file normalizes content aliases to file_content", async () => {
+  const path = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-",
+    suffix: ".txt",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path,
+              new_content: "aliased\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(input.file_content, "aliased\n");
+        assertEquals(input.content, "aliased\n");
       },
     );
   } finally {

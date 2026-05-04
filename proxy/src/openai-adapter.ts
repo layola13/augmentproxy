@@ -665,7 +665,8 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- view-range-untruncated: requires reference_id, start_line, end_line from a prior view result. Do not pass path to this tool.",
     '- codebase-retrieval: requires information_request. Valid example: {"information_request":"Find the modules responsible for request routing, OpenAI adaptation, indexing, and configuration."}. Invalid: {}.',
     '- launch-process: requires command. Prefer simple commands and set cwd only when known. Valid example: {"command":"pwd && ls -la","cwd":"<known-directory>"}.',
-    "- save-file / str-replace-editor: only use when editing is explicitly needed, and provide the complete required schema fields.",
+    '- save-file: requires path and file_content. Valid example: {"path":"<file>","file_content":"complete file contents"}.',
+    "- str-replace-editor: only use when editing is explicitly needed, and provide the complete required schema fields.",
   );
   if (toolSummaries.length > 0) {
     lines.push("Available tool schemas from this client:");
@@ -771,6 +772,8 @@ function toolDescriptionForModel(tool: JsonObject): string {
       'Example arguments: {"terminal_id":1}. Never use undefined terminal_id.',
     "write-process":
       'Example arguments: {"terminal_id":1,"input_text":"text"}. Never use undefined terminal_id.',
+    "save-file":
+      'Example arguments: {"path":"<file>","file_content":"complete file contents"}. Never omit file_content.',
     "sub-agent":
       'Example arguments: {"action":"run","name":"reviewer","instruction":"Inspect the failing tests and report concise findings."}. To retrieve a completed agent result, use {"action":"output","name":"reviewer"}.',
   };
@@ -1155,10 +1158,16 @@ function normalizeSaveFileArguments(
     args.file ?? args.absolute_path;
   if (typeof alias === "string" && alias.trim()) {
     args.path = repairViewPath(alias, fallbackPath);
-    return;
-  }
-  if (typeof args.path !== "string" && fallbackPath) {
+  } else if (typeof args.path !== "string" && fallbackPath) {
     args.path = repairViewPath(fallbackPath, fallbackPath);
+  }
+  if (typeof args.file_content !== "string") {
+    const contentAlias = args.content ?? args.file_contents ?? args.contents ??
+      args.text ?? args.new_content ?? args.new_contents ?? args.data ?? args.body;
+    if (typeof contentAlias === "string") args.file_content = contentAlias;
+  }
+  if (typeof args.content !== "string" && typeof args.file_content === "string") {
+    args.content = args.file_content;
   }
 }
 
@@ -2253,9 +2262,11 @@ function invalidToolReason(
       if (!isPathWithinAllowedHome(args.path)) {
         return `Tool ${toolName} path is outside the allowed scope. Use an absolute path under ${allowedHomeHint()}.`;
       }
-      const content = args.content ?? args.file_contents ?? args.text;
+      const content = args.file_content ?? args.content ?? args.file_contents ??
+        args.contents ?? args.text ?? args.new_content ?? args.new_contents ??
+        args.data ?? args.body;
       if (typeof content !== "string") {
-        return `Tool ${toolName} requires content.`;
+        return `Tool ${toolName} requires file_content.`;
       }
     }
     if (
