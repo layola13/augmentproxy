@@ -903,6 +903,92 @@ Deno.test("codex stream invalid save-file recovers with view tool", async () => 
   );
 });
 
+Deno.test("codex json upstream failed recovers with view tool", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-failed",
+          status: "failed",
+          error: { message: "remote model interrupted" },
+          usage: { input_tokens: 7, output_tokens: 0, total_tokens: 7 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(response.ok, true);
+      assertEquals(hasToolName(body, "view"), true);
+      assertEquals(body.recovery_reason, "remote model interrupted");
+      const input = firstToolInput(body);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("codex stream upstream failed recovers with view tool", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        [
+          `data: ${
+            JSON.stringify({
+              type: "response.failed",
+              response: {
+                id: "resp-stream-failed",
+                status: "failed",
+                error: { message: "remote stream interrupted" },
+                usage: { input_tokens: 8, output_tokens: 0, total_tokens: 8 },
+              },
+            })
+          }`,
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    async () => {
+      const response = await forwardAugmentStream(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "view"), true);
+      const final = objects.find((item) => item.done === true);
+      assertEquals(final?.recovery_reason, "remote stream interrupted");
+      assertEquals(final?.stop_reason, "stop");
+      const input = firstToolInput(objects);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("empty upstream stream recovers with view tool", async () => {
+  await withFakeFetch(
+    () =>
+      new Response("", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "view"), true);
+      const final = objects.find((item) => item.done === true);
+      assertEquals(final?.recovery_reason, "stream ended without done marker or content");
+      assertEquals(final?.stop_reason, "stop");
+    },
+  );
+});
+
 Deno.test("str-replace without prior view is redirected to file read", async () => {
   const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
@@ -2844,6 +2930,320 @@ Deno.test("write-process normalizes write_stdin style session_id and chars", asy
       const input = firstToolInput(body);
       assertEquals(input.terminal_id, 77126);
       assertEquals(input.input_text, "");
+    },
+  );
+});
+
+Deno.test("launch-process with pipe gets pipefail guard", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_pipe_command",
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command: "haxe -p src -main TestAll --interp 2>&1 | head -30",
+            cwd: "/home/vscode/projects/augmentproxy/proxy",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      const input = firstToolInput(body);
+      assertEquals(
+        input.command,
+        "set -o pipefail; haxe -p src -main TestAll --interp 2>&1 | head -30",
+      );
+    },
+  );
+});
+
+Deno.test("repeated failed launch-process recovers by reading diagnostic file", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-failed-launch-",
+  });
+  const path = `${root}/src/haxe/state/NextState.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(path, "class NextState {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_compile",
+          type: "function",
+          function: {
+            name: "launch-process",
+            arguments: JSON.stringify({
+              command: `${command} | head -30`,
+              cwd: root,
+              wait: true,
+              max_wait_seconds: 60,
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "launch-process"), false);
+        assertEquals(hasToolName(body, "view"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+        assertEquals(input.type, "file");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("repeated failed launch-process without diagnostic path recovers by reading workspace", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-failed-launch-workspace-",
+  });
+  const command =
+    "cat > /tmp/fix_state.py << 'PYEOF'\nprint('`bad`')\nPYEOF";
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_backticks",
+          type: "function",
+          function: {
+            name: "launch-process",
+            arguments: JSON.stringify({
+              command,
+              cwd: root,
+              wait: true,
+              max_wait_seconds: 60,
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_backticks",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_backticks",
+                  content:
+                    "Error: Backticks are not allowed in shell commands. Write content to a file first.",
+                  is_error: true,
+                },
+              }],
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "launch-process"), false);
+        assertEquals(hasToolName(body, "view"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, root);
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("successful output mentioning zero failed does not suppress repeated launch-process", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-successful-launch-",
+  });
+  const command = "deno test --allow-read proxy/src/openai-adapter_test.ts";
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_successful_tests",
+          type: "function",
+          function: {
+            name: "launch-process",
+            arguments: JSON.stringify({
+              command,
+              cwd: root,
+              wait: true,
+              max_wait_seconds: 60,
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_successful_tests",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_successful_tests",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "ok | 63 passed | 0 failed (236ms)",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "launch-process"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.command, command);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("repeated failed write-process recovers by listing processes", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_repeat_write_process",
+        type: "function",
+        function: {
+          name: "write-process",
+          arguments: JSON.stringify({
+            terminal_id: 7,
+            input_text: "continue\n",
+            wait: true,
+            max_wait_seconds: 60,
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          chat_history: [{
+            response_nodes: [{
+              id: 1,
+              type: 5,
+              tool_use: {
+                tool_name: "write-process",
+                tool_use_id: "call_failed_write_process",
+                input_json: JSON.stringify({
+                  terminal_id: 7,
+                  input_text: "continue\n",
+                  wait: true,
+                  max_wait_seconds: 60,
+                }),
+              },
+            }],
+            request_nodes: [{
+              id: 2,
+              type: 1,
+              tool_result_node: {
+                tool_use_id: "call_failed_write_process",
+                content: "Terminal 7 not found.",
+                is_error: true,
+              },
+            }],
+          }],
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "write-process"), false);
+      assertEquals(hasToolName(body, "list-processes"), true);
+      assertEquals(firstToolInput(body), {});
     },
   );
 });

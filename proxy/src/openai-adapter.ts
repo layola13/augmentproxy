@@ -1423,6 +1423,9 @@ function normalizeToolArguments(
   if (
     (toolName === "launch-process") && typeof args.max_wait_seconds !== "number"
   ) args.max_wait_seconds = 120;
+  if (toolName === "launch-process") {
+    normalizeLaunchProcessArguments(args);
+  }
   if (
     toolName === "read-process" || toolName === "write-process" ||
     toolName === "kill-process"
@@ -1512,6 +1515,15 @@ function normalizeProcessToolArguments(args: JsonObject): void {
   }
   if (typeof args.wait !== "boolean") args.wait = true;
   if (typeof args.max_wait_seconds !== "number") args.max_wait_seconds = 120;
+}
+
+function normalizeLaunchProcessArguments(args: JsonObject): void {
+  if (typeof args.command !== "string") return;
+  const command = args.command.trim();
+  if (!command) return;
+  if (!/[|]/.test(command)) return;
+  if (/\bset\s+-o\s+pipefail\b/.test(command)) return;
+  args.command = `set -o pipefail; ${command}`;
 }
 
 function normalizeTaskToolArguments(
@@ -2801,59 +2813,367 @@ function textResponseNode(content: string, id = 1): JsonObject | undefined {
   };
 }
 
-function recentToolCallCounts(
+interface RecentFailedToolCall {
+  count: number;
+  content: string;
+  parsed: ParsedToolCall;
+}
+
+function recentFailedToolCalls(
   ctx: RequestContext,
   fallbackPath?: string,
-): Map<string, number> {
-  const counts = new Map<string, number>();
+): Map<string, RecentFailedToolCall> {
+  const failures = new Map<string, RecentFailedToolCall>();
   const body = objectBody(ctx);
-  for (const item of asArray(body.chat_history).slice(-8)) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-    const record = item as JsonObject;
-    for (const node of asArray(record.response_nodes)) {
+  const toolById = new Map<string, ParsedToolCall>();
+  const rememberToolCalls = (nodes: JsonValue): void => {
+    for (const node of asArray(nodes)) {
       const call = nodeToolUse(node);
       if (!call) continue;
       const parsed = parseToolCall(call, fallbackPath);
-      if (parsed) {
-        const key = toolCallKey(parsed.name, parsed.argumentsJson);
-        counts.set(key, (counts.get(key) ?? 0) + 1);
+      if (parsed) toolById.set(parsed.id, parsed);
+    }
+  };
+  const rememberToolResults = (nodes: JsonValue): void => {
+    for (const node of asArray(nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const toolResult = (node as JsonObject).tool_result_node;
+      if (!toolResult || typeof toolResult !== "object" || Array.isArray(toolResult)) {
+        continue;
       }
+      const result = toolResult as JsonObject;
+      if (toolResultMutatedWorkspace(result)) {
+        failures.clear();
+        continue;
+      }
+      const id = typeof result.tool_use_id === "string" ? result.tool_use_id : "";
+      const parsed = id ? toolById.get(id) : undefined;
+      const content = text(result.content);
+      if (!parsed || !toolResultIndicatesFailure(content, result)) continue;
+      const key = toolCallKey(parsed.name, parsed.argumentsJson);
+      const previous = failures.get(key);
+      failures.set(key, {
+        count: (previous?.count ?? 0) + 1,
+        content,
+        parsed,
+      });
+    }
+  };
+
+  for (const item of asArray(body.chat_history).slice(-16)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    rememberToolCalls(record.response_nodes);
+    rememberToolCalls(record.request_nodes);
+    rememberToolResults(record.request_nodes);
+    rememberToolResults(record.response_nodes);
+  }
+  rememberToolCalls(body.nodes);
+  rememberToolResults(body.nodes);
+  return failures;
+}
+
+function toolResultMutatedWorkspace(result: JsonObject): boolean {
+  if (!toolResultLooksSuccessful(result)) return false;
+  const metadata = result.metadata;
+  if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+    const record = metadata as JsonObject;
+    const added = Number(record.tool_lines_added ?? 0);
+    const deleted = Number(record.tool_lines_deleted ?? 0);
+    if (Number.isFinite(added) && added > 0) return true;
+    if (Number.isFinite(deleted) && deleted > 0) return true;
+  }
+  const content = text(result.content);
+  return /"action"\s*:\s*"(?:Update|Create|Save|Delete)"/i.test(content) ||
+    /\b(?:Updated|Saved successfully|Created|Deleted)\b/i.test(content);
+}
+
+function toolResultIndicatesFailure(
+  content: string,
+  result?: JsonObject,
+): boolean {
+  if (result) {
+    if (result.is_error === true || result.error === true) return true;
+    const status = text(result.status).toLowerCase();
+    if (status === "error" || status === "failed" || status === "failure") {
+      return true;
     }
   }
-  return counts;
+  const lower = content.toLowerCase();
+  if (lower.includes("tool call rejected")) return true;
+  const returnCode = content.match(/<return-code>\s*(-?\d+)\s*<\/return-code>/i);
+  if (returnCode && Number(returnCode[1]) !== 0) return true;
+  const outputMatch = content.match(/<output>\s*([\s\S]*?)<\/output>/i);
+  const output = outputMatch?.[1] ?? content;
+  return commandOutputLooksLikeFailure(output);
+}
+
+function commandOutputLooksLikeFailure(output: string): boolean {
+  const trimmed = output.trim();
+  if (!trimmed) return false;
+  const patterns = [
+    /\bType not found\b/i,
+    /\bType name [^\n]+ is redefined\b/i,
+    /\bModule [^\n]+ does not define type\b/i,
+    /\bClass not found\b/i,
+    /\bUnknown identifier\b/i,
+    /\bUnexpected\b/i,
+    /\bSyntax error\b/i,
+    /\bSyntaxError\b/i,
+    /\bReferenceError\b/i,
+    /\bNameError\b/i,
+    /\bMissing variable identifier\b/i,
+    /\bTraceback \(most recent call last\):/i,
+    /\b(?:fatal )?error:/i,
+    /\bCommand (?:failed|error)\b/i,
+    /\bNo such file or directory\b/i,
+    /\bpath does not exist\b/i,
+    /\b(?:command|tool|module|class|type) [^\n]*\bnot found\b/i,
+    /\bFile already exists\b/i,
+    /\brequires (?:content|file_content|path|command|terminal_id)\b/i,
+    /\bold_str\b[^\n]*(?:not found|no match|failed)/i,
+    /\bNo changes (?:made|applied)\b/i,
+    /\btimed out\b/i,
+    /\b(?:cancelled|canceled|interrupted|aborted)\b/i,
+    /\b[1-9]\d*\s+(?:failed|failures)\b/i,
+    /^\s*(?:FAILED|FAIL|FAILURE)\b/im,
+    /:\d+:\s*characters\s+\d+-\d+\s*:/i,
+  ];
+  return patterns.some((pattern) => pattern.test(trimmed));
 }
 
 function toolCallKey(name: string, argumentsJson: string): string {
   try {
-    return `${name}:${JSON.stringify(JSON.parse(argumentsJson))}`;
+    return `${name}:${JSON.stringify(normalizeToolCallKeyArgs(name, JSON.parse(argumentsJson)))}`;
   } catch {
     return `${name}:${argumentsJson}`;
   }
+}
+
+function normalizeToolCallKeyArgs(name: string, value: JsonValue): JsonValue {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const args = { ...(value as JsonObject) };
+  if (name === "launch-process" && typeof args.command === "string") {
+    args.command = normalizeLaunchCommandForRepeatKey(args.command);
+    delete args.max_wait_seconds;
+    delete args.wait;
+    delete args.cwd;
+  }
+  return args;
+}
+
+function normalizeLaunchCommandForRepeatKey(command: string): string {
+  let output = command.trim();
+  output = output.replace(/^\s*set\s+-o\s+pipefail\s*;\s*/i, "");
+  output = output.replace(/\s*\|\s*head\s+(?:-\d+|-n\s+\d+|\d+)\s*$/i, "");
+  output = output.replace(/\s+/g, " ").trim();
+  return output;
 }
 
 function looksLikeToolUseId(value: string): boolean {
   return /^call_function_[a-z0-9_]+$/i.test(value.trim());
 }
 
-function filterRepeatedToolCalls(
+function filterRepeatedFailedToolCalls(
   toolCalls: JsonObject[],
-  recentCounts: Map<string, number>,
+  recentFailures: Map<string, RecentFailedToolCall>,
   fallbackPath?: string,
   launchCommandFallback?: string,
-): { valid: JsonObject[]; repeated: JsonObject[] } {
+): { valid: JsonObject[]; repeated: JsonObject[]; recoveryNodes: JsonObject[] } {
   const valid: JsonObject[] = [];
   const repeated: JsonObject[] = [];
+  const recoveryNodes: JsonObject[] = [];
+  const seenRecoveries = new Set<string>();
   for (const call of toolCalls) {
     const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
     if (!parsed) continue;
     const key = toolCallKey(parsed.name, parsed.argumentsJson);
-    const seenCount = recentCounts.get(key) ?? 0;
-    // Allow one repeat in case the model is reconciling tool output; start
-    // filtering only after the same call has appeared multiple times.
-    if (seenCount >= 2) repeated.push(call);
-    else valid.push(call);
+    const failure = recentFailures.get(key);
+    if (!failure || failure.count < 1) {
+      valid.push(call);
+      continue;
+    }
+    repeated.push(call);
+    const recovery = recoveryToolNodeForRepeatedFailure(
+      parsed,
+      failure,
+      fallbackPath,
+      recoveryNodes.length + 1,
+    );
+    if (!recovery) continue;
+    const recoveryKey = JSON.stringify((recovery.tool_use as JsonObject | undefined)?.input_json ?? "");
+    if (seenRecoveries.has(recoveryKey)) continue;
+    seenRecoveries.add(recoveryKey);
+    recoveryNodes.push(recovery);
   }
-  return { valid, repeated };
+  return { valid, repeated, recoveryNodes };
+}
+
+function appendRepeatedToolCallHint(
+  content: string,
+  repeatedToolCalls: JsonObject[],
+  fallbackPath?: string,
+): string {
+  if (repeatedToolCalls.length === 0) return content;
+  const rendered = repeatedToolCalls
+    .map((call) => {
+      const parsed = parseToolCall(call, fallbackPath);
+      if (!parsed) return "";
+      const details = repeatedToolCallDetails(parsed);
+      return details
+        ? `Repeated failed tool call suppressed: ${details}. Inspect or edit the failing file instead of running the same command again.`
+        : `Repeated failed tool call suppressed: ${parsed.name}. Inspect the latest error and change the workspace before retrying.`;
+    })
+    .filter(Boolean)
+    .join("\n");
+  if (!rendered || content.includes(rendered)) return content;
+  return content.trim() ? `${content.trimEnd()}\n\n${rendered}` : rendered;
+}
+
+function repeatedToolCallDetails(parsed: ParsedToolCall): string {
+  try {
+    const args = JSON.parse(parsed.argumentsJson) as JsonObject;
+    const command = typeof args.command === "string"
+      ? normalizeLaunchCommandForRepeatKey(args.command)
+      : "";
+    if (parsed.name === "launch-process" && command) {
+      return `${parsed.name} ${command}`;
+    }
+  } catch {
+    // Fall through to the tool name.
+  }
+  return parsed.name;
+}
+
+function recoveryToolNodeForRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath: string | undefined,
+  id: number,
+): JsonObject | undefined {
+  const recovery = recoveryToolForRepeatedFailure(parsed, failure, fallbackPath);
+  if (!recovery) return undefined;
+  return {
+    id,
+    type: 5,
+    tool_use: {
+      tool_name: recovery.toolName,
+      tool_use_id: `${parsed.id}_repeated_failure_${
+        recovery.toolName.replace(/[^a-z0-9]+/gi, "_")
+      }`,
+      input_json: JSON.stringify(recovery.input),
+    },
+  };
+}
+
+function recoveryToolForRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath?: string,
+): { toolName: string; input: JsonObject } | undefined {
+  if (
+    parsed.name === "read-process" ||
+    parsed.name === "write-process" ||
+    parsed.name === "kill-process"
+  ) {
+    return { toolName: "list-processes", input: {} };
+  }
+  const viewTarget = recoveryViewTargetForRepeatedFailure(
+    parsed,
+    failure,
+    fallbackPath,
+  );
+  if (viewTarget) return { toolName: "view", input: viewTarget };
+  return undefined;
+}
+
+function recoveryViewTargetForRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath?: string,
+): JsonObject | undefined {
+  const diagnosticPath = firstExistingPathFromDiagnostic(failure.content, fallbackPath);
+  if (diagnosticPath) {
+    return {
+      path: diagnosticPath,
+      type: directoryExists(diagnosticPath) ? "directory" : "file",
+    };
+  }
+  if (parsed.name === "str-replace-editor") {
+    const path = editPath(parsed.argumentsJson);
+    if (path && pathExists(path)) return { path, type: "file" };
+  }
+  const argumentTarget = fallbackViewTargetFromToolArguments(parsed);
+  if (argumentTarget) return argumentTarget;
+  return fallbackViewTarget(fallbackPath);
+}
+
+function fallbackViewTargetFromToolArguments(
+  parsed: ParsedToolCall,
+): JsonObject | undefined {
+  let args: JsonObject;
+  try {
+    const decoded = JSON.parse(parsed.argumentsJson);
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return undefined;
+    }
+    args = decoded as JsonObject;
+  } catch {
+    return undefined;
+  }
+
+  const rawPath = typeof args.path === "string" && args.path.trim()
+    ? args.path.trim()
+    : typeof args.cwd === "string" && args.cwd.trim()
+    ? args.cwd.trim()
+    : "";
+  if (!rawPath || !isPathWithinAllowedHome(rawPath)) return undefined;
+  if (pathExists(rawPath)) {
+    return {
+      path: rawPath,
+      type: directoryExists(rawPath) ? "directory" : "file",
+    };
+  }
+  const dir = pathDirname(rawPath);
+  if (dir && isPathWithinAllowedHome(dir) && directoryExists(dir)) {
+    return { path: dir, type: "directory" };
+  }
+  return undefined;
+}
+
+function fallbackViewTarget(fallbackPath?: string): JsonObject | undefined {
+  const fallback = workspaceFolderFromPath(fallbackPath) ?? fallbackPath;
+  if (!fallback || !isPathWithinAllowedHome(fallback) || !pathExists(fallback)) {
+    return undefined;
+  }
+  return {
+    path: fallback,
+    type: directoryExists(fallback) ? "directory" : "file",
+  };
+}
+
+function firstExistingPathFromDiagnostic(
+  content: string,
+  fallbackPath?: string,
+): string | undefined {
+  const outputMatch = content.match(/<output>\s*([\s\S]*?)<\/output>/i);
+  const diagnostic = outputMatch?.[1] ?? content;
+  const candidates: string[] = [];
+  for (const match of diagnostic.matchAll(/(?:\/[^\s"'`<>:]+|[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+)(?::\d+(?::\d+)?(?:\s*:\s*characters\s+\d+-\d+)?)?/g)) {
+    const raw = match[0];
+    const beforeLine = raw.replace(/:\d+(?::\d+)?(?:\s*:\s*characters\s+\d+-\d+)?$/i, "");
+    candidates.push(beforeLine);
+  }
+  for (const candidate of candidates) {
+    const repaired = repairFilePath(candidate, fallbackPath) ??
+      repairViewPath(candidate, fallbackPath);
+    if (
+      repaired &&
+      isPathWithinAllowedHome(repaired) &&
+      pathExists(repaired)
+    ) return repaired;
+  }
+  return undefined;
 }
 
 function invalidToolCallSummaries(
@@ -3580,6 +3900,98 @@ function parseResponsesJson(data: JsonObject): {
   };
 }
 
+function upstreamInterruptionReason(
+  data: JsonObject,
+  request: OpenAIUpstreamRequest,
+): string | undefined {
+  const errorReason = upstreamErrorReason(data.error);
+  if (errorReason) return errorReason;
+
+  if (isResponsesRequest(request)) {
+    const status = text(data.status).toLowerCase();
+    if (
+      status === "failed" || status === "incomplete" ||
+      status === "cancelled" || status === "canceled"
+    ) {
+      const reason = [
+        status,
+        upstreamErrorReason(data.incomplete_details),
+      ].filter(Boolean).join(": ");
+      return reason || status;
+    }
+    return undefined;
+  }
+
+  const choices = Array.isArray(data.choices) ? data.choices : [];
+  if (choices.length === 0) return "chat completion returned no choices";
+  return undefined;
+}
+
+function upstreamErrorReason(value: JsonValue | undefined): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  }
+  const record = value as JsonObject;
+  const message = text(record.message ?? record.reason ?? record.code ?? record.type)
+    .trim();
+  if (message) return message;
+  const rendered = text(record).trim();
+  return rendered && rendered !== "{}" ? rendered : undefined;
+}
+
+function recoveryToolNodesForUpstreamInterruption(
+  startingId = 1,
+  fallbackPath?: string,
+): JsonObject[] {
+  const target = fallbackViewTarget(fallbackPath);
+  if (!target) return [];
+  return [{
+    id: startingId,
+    type: 5,
+    tool_use: {
+      tool_name: "view",
+      tool_use_id: "upstream_interruption_recovery_view",
+      input_json: JSON.stringify(target),
+    },
+  }];
+}
+
+function upstreamInterruptionJsonResponse(
+  config: ProxyConfig,
+  request: OpenAIUpstreamRequest,
+  requestId: string,
+  fallbackPath: string | undefined,
+  usage: JsonValue,
+  reason: string,
+): Response {
+  const recoveryNodes = recoveryToolNodesForUpstreamInterruption(1, fallbackPath);
+  if (recoveryNodes.length === 0) {
+    return augmentError(
+      `OpenAI upstream interrupted before a usable assistant response: ${reason}`,
+      502,
+      "upstream_interrupted",
+    );
+  }
+  const tokenUsage = augmentTokenUsage(config, request, usage);
+  const outputUsage = openAIUsage(config, request, usage);
+  return jsonResponse({
+    text: "",
+    response_text: "",
+    completion: "",
+    request_id: requestId,
+    requestId,
+    stop_reason: "stop",
+    token_usage: tokenUsage,
+    total_tokens: outputUsage.total_tokens,
+    usage: outputUsage,
+    recovery_reason: reason,
+    nodes: [
+      ...recoveryNodes,
+      tokenUsageNode(config, request, usage),
+    ],
+  });
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -3744,19 +4156,44 @@ export async function forwardAugmentJson(
     );
   }
 
+  const interrupted = upstreamInterruptionReason(data, request);
+  if (interrupted) {
+    logWarn(config, "openai:json:upstream-interrupted", {
+      requestId: ctx.requestId,
+      reason: interrupted,
+    });
+    return upstreamInterruptionJsonResponse(
+      config,
+      request,
+      ctx.requestId,
+      fallbackPath,
+      data.usage,
+      interrupted,
+    );
+  }
+
   let content = "";
   let nodes: JsonObject[] = [];
   let reasoningFallback = "";
   let invalidToolCallsForHint: JsonObject[] = [];
+  const recentFailures = recentFailedToolCalls(ctx, fallbackPath);
   const usage = isResponsesRequest(request) ? parseResponsesJson(data).usage : data.usage;
   if (isResponsesRequest(request)) {
     const parsed = parseResponsesJson(data);
     content = parsed.content;
     reasoningFallback = parsed.thinking.join("\n\n").trim();
     if (parsed.thinking.length > 0) nodes = [...thinkingNodes(parsed.thinking), ...nodes];
-    const invalidToolCalls = invalidToolCallSummaries(parsed.toolCalls, fallbackPath);
+    const repeatedFilter = filterRepeatedFailedToolCalls(parsed.toolCalls, recentFailures, fallbackPath);
+    const candidateToolCalls = repeatedFilter.valid;
+    if (
+      repeatedFilter.repeated.length > 0 &&
+      repeatedFilter.recoveryNodes.length === 0
+    ) {
+      content = appendRepeatedToolCallHint(content, repeatedFilter.repeated, fallbackPath);
+    }
+    const invalidToolCalls = invalidToolCallSummaries(candidateToolCalls, fallbackPath);
     const validToolNodes = toolCallsToNodes(
-      parsed.toolCalls,
+      candidateToolCalls,
       1,
       fallbackPath,
       undefined,
@@ -3768,7 +4205,11 @@ export async function forwardAugmentJson(
     invalidToolCallsForHint = recoveryToolNodes.length > 0 ? [] : invalidToolCalls;
     nodes = [
       ...nodes,
-      ...(recoveryToolNodes.length > 0 ? recoveryToolNodes : validToolNodes),
+      ...(repeatedFilter.recoveryNodes.length > 0
+        ? repeatedFilter.recoveryNodes
+        : recoveryToolNodes.length > 0
+        ? recoveryToolNodes
+        : validToolNodes),
     ];
   } else {
     const choices = Array.isArray(data.choices) ? data.choices : [];
@@ -3781,12 +4222,25 @@ export async function forwardAugmentJson(
         const reasoning = collectReasoningFields(messageRecord);
         reasoningFallback = reasoning.join("\n\n").trim();
         if (reasoning.length > 0) nodes = [...thinkingNodes(reasoning), ...nodes];
+        const repeatedFilter = filterRepeatedFailedToolCalls(
+          Array.isArray(messageRecord.tool_calls)
+            ? messageRecord.tool_calls as JsonObject[]
+            : [],
+          recentFailures,
+          fallbackPath,
+        );
+        if (
+          repeatedFilter.repeated.length > 0 &&
+          repeatedFilter.recoveryNodes.length === 0
+        ) {
+          content = appendRepeatedToolCallHint(content, repeatedFilter.repeated, fallbackPath);
+        }
         const invalidToolCalls = invalidToolCallSummaries(
-          messageRecord.tool_calls,
+          repeatedFilter.valid,
           fallbackPath,
         );
         const validToolNodes = toolCallsToNodes(
-          messageRecord.tool_calls,
+          repeatedFilter.valid,
           1,
           fallbackPath,
           undefined,
@@ -3798,7 +4252,11 @@ export async function forwardAugmentJson(
         invalidToolCallsForHint = recoveryToolNodes.length > 0 ? [] : invalidToolCalls;
         nodes = [
           ...nodes,
-          ...(recoveryToolNodes.length > 0 ? recoveryToolNodes : validToolNodes),
+          ...(repeatedFilter.recoveryNodes.length > 0
+            ? repeatedFilter.recoveryNodes
+            : recoveryToolNodes.length > 0
+            ? recoveryToolNodes
+            : validToolNodes),
         ];
         if (nodes.length === 0) {
           const renderedToolCalls = renderToolCalls(
@@ -4082,6 +4540,7 @@ function parseOpenAIStreamLine(
   usage?: JsonValue;
   done?: boolean;
   finishReason?: string;
+  interruptionReason?: string;
 } {
   if (!line.startsWith("data:")) return {};
   const payload = line.slice(5).trim();
@@ -4135,7 +4594,19 @@ function parseOpenAIStreamLine(
         };
       }
       if (type === "response.failed" || type === "response.incomplete") {
-        return { done: true, finishReason: type };
+        const response = data.response &&
+            typeof data.response === "object" && !Array.isArray(data.response)
+          ? data.response as JsonObject
+          : {};
+        return {
+          usage: normalizeResponsesUsage(response.usage),
+          done: true,
+          finishReason: type,
+          interruptionReason: upstreamErrorReason(data.error) ??
+            upstreamErrorReason(response.error) ??
+            upstreamErrorReason(response.incomplete_details) ??
+            type,
+        };
       }
       return {};
     }
@@ -4239,6 +4710,48 @@ export async function forwardAugmentStream(
         });
         finish();
       };
+      const enqueueRecoveryAndFinish = (
+        reason: string,
+        extra: JsonObject = {},
+      ) => {
+        const recoveryNodes = recoveryToolNodesForUpstreamInterruption(
+          1,
+          fallbackPath,
+        );
+        if (recoveryNodes.length === 0) {
+          enqueueTerminalError(
+            `OpenAI stream interrupted before a usable assistant response: ${reason}`,
+          );
+          return;
+        }
+        const usageValue = streamUsage ?? null;
+        const finalTokenUsage = augmentTokenUsage(config, request, usageValue);
+        const finalUsage = openAIUsage(config, request, usageValue);
+        safeEnqueue({
+          text: "",
+          nodes: [
+            ...recoveryNodes,
+            tokenUsageNode(config, request, usageValue),
+          ],
+          recovery_reason: reason,
+          request_id: requestId,
+          ...extra,
+        });
+        safeEnqueue({
+          text: "",
+          response_text: "",
+          completion: "",
+          token_usage: finalTokenUsage,
+          total_tokens: finalUsage.total_tokens,
+          usage: finalUsage,
+          done: true,
+          stop_reason: "stop",
+          recovery_reason: reason,
+          request_id: requestId,
+          ...extra,
+        });
+        finish();
+      };
       const enqueueVisibleText = (visible: string) => {
         if (!visible) return;
         if (staleRejectedStreamText) return;
@@ -4304,6 +4817,7 @@ export async function forwardAugmentStream(
         try {
           let upstream: Response | undefined;
           let upstreamAttempts = 0;
+          let streamInterruptionReason = "";
           logInfo(config, "openai:stream:start", {
             requestId,
             api: config.switchApi,
@@ -4429,6 +4943,9 @@ export async function forwardAugmentStream(
                 attempt: upstreamAttempts,
                 status: upstream.status,
               });
+              enqueueRecoveryAndFinish("empty upstream stream response", {
+                empty_upstream: true,
+              });
               return;
             }
             enqueueTerminalError(
@@ -4464,6 +4981,9 @@ export async function forwardAugmentStream(
               if (parsed.done) sawDone = true;
               if (parsed.usage !== undefined) streamUsage = parsed.usage;
               if (parsed.finishReason) finishReason = parsed.finishReason;
+              if (parsed.interruptionReason) {
+                streamInterruptionReason = parsed.interruptionReason;
+              }
               if (parsed.toolCalls?.length) {
                 streamToolCalls.push(...parsed.toolCalls);
               }
@@ -4481,17 +5001,55 @@ export async function forwardAugmentStream(
           }
           const flushed = thinkingFilter.flush();
           enqueueVisibleText(flushed.visible);
+          if (streamInterruptionReason) {
+            logWarn(config, "openai:stream:upstream-interrupted", {
+              requestId,
+              reason: streamInterruptionReason,
+              finishReason,
+            });
+            enqueueRecoveryAndFinish(streamInterruptionReason);
+            return;
+          }
+          if (
+            !sawDone && streamToolCalls.length === 0 &&
+            !visibleText.trim() && thinkingBuffer.length === 0 &&
+            !flushed.visible.trim() && flushed.thinking.length === 0
+          ) {
+            logWarn(config, "openai:stream:ended-without-done-or-content", {
+              requestId,
+              finishReason,
+            });
+            enqueueRecoveryAndFinish("stream ended without done marker or content");
+            return;
+          }
           const launchCommandFallback = inferLaunchCommandFromContext(ctx);
           const mergedToolCalls = mergeStreamToolCalls(streamToolCalls);
+          const repeatedFilter = filterRepeatedFailedToolCalls(
+            mergedToolCalls,
+            recentFailedToolCalls(ctx, fallbackPath),
+            fallbackPath,
+            launchCommandFallback,
+          );
           if (streamToolCalls.length > 0) {
             logInfo(config, "openai:stream:tool-calls", {
               requestId,
               fragments: streamToolCalls.length,
               merged: mergedToolCalls.length,
+              repeatedFailed: repeatedFilter.repeated.length,
             });
           }
+          if (
+            repeatedFilter.repeated.length > 0 &&
+            repeatedFilter.recoveryNodes.length === 0
+          ) {
+            visibleText = appendRepeatedToolCallHint(
+              visibleText,
+              repeatedFilter.repeated,
+              fallbackPath,
+            );
+          }
           const invalidToolCalls = invalidToolCallSummaries(
-            mergedToolCalls,
+            repeatedFilter.valid,
             fallbackPath,
             launchCommandFallback,
           );
@@ -4501,7 +5059,7 @@ export async function forwardAugmentStream(
               invalidToolCalls,
             });
           }
-          const nonInvalidToolCalls = mergedToolCalls.filter((call) => {
+          const nonInvalidToolCalls = repeatedFilter.valid.filter((call) => {
             const parsed = parseToolCall(
               call,
               fallbackPath,
@@ -4535,7 +5093,9 @@ export async function forwardAugmentStream(
               }),
             });
           }
-          let toolNodes = recoveryToolNodes.length > 0
+          let toolNodes = repeatedFilter.recoveryNodes.length > 0
+            ? repeatedFilter.recoveryNodes
+            : recoveryToolNodes.length > 0
             ? recoveryToolNodes
             : validToolNodes;
           if (validToolNodes.length > 0) {
