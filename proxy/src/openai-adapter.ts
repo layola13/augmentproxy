@@ -665,7 +665,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- view-range-untruncated: requires reference_id, start_line, end_line from a prior view result. Do not pass path to this tool.",
     '- codebase-retrieval: requires information_request. Valid example: {"information_request":"Find the modules responsible for request routing, OpenAI adaptation, indexing, and configuration."}. Invalid: {}.',
     '- launch-process: requires command. Prefer simple commands and set cwd only when known. Valid example: {"command":"pwd && ls -la","cwd":"<known-directory>"}.',
-    '- save-file: requires path and file_content. Valid example: {"path":"<file>","file_content":"complete file contents"}.',
+    '- save-file: requires path and file_content. The path must include a concrete filename, preferably with an extension. Valid example: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Invalid: {"path":"<dir>/utils","file_content":"..."}.',
     "- str-replace-editor: only use when editing is explicitly needed, and provide the complete required schema fields.",
   );
   if (toolSummaries.length > 0) {
@@ -773,7 +773,7 @@ function toolDescriptionForModel(tool: JsonObject): string {
     "write-process":
       'Example arguments: {"terminal_id":1,"input_text":"text"}. Never use undefined terminal_id.',
     "save-file":
-      'Example arguments: {"path":"<file>","file_content":"complete file contents"}. Never omit file_content.',
+      'Example arguments: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Never omit file_content. Never use a directory path as path.',
     "sub-agent":
       'Example arguments: {"action":"run","name":"reviewer","instruction":"Inspect the failing tests and report concise findings."}. To retrieve a completed agent result, use {"action":"output","name":"reviewer"}.',
   };
@@ -1157,14 +1157,18 @@ function normalizeSaveFileArguments(
   const alias = args.path ?? args.file_path ?? args.filepath ?? args.filename ??
     args.file ?? args.absolute_path;
   if (typeof alias === "string" && alias.trim()) {
-    args.path = repairViewPath(alias, fallbackPath);
-  } else if (typeof args.path !== "string" && fallbackPath) {
-    args.path = repairViewPath(fallbackPath, fallbackPath);
+    args.path = repairSaveFilePath(alias, fallbackPath);
   }
-  if (typeof args.file_content !== "string") {
-    const contentAlias = args.content ?? args.file_contents ?? args.contents ??
-      args.text ?? args.new_content ?? args.new_contents ?? args.data ?? args.body;
-    if (typeof contentAlias === "string") args.file_content = contentAlias;
+  const contentAlias = args.file_content ?? args.content ?? args.file_contents ??
+    args.contents ?? args.text ?? args.new_content ?? args.new_contents ??
+    args.data ?? args.body;
+  if (contentAlias !== undefined && contentAlias !== null) {
+    args.file_content = String(contentAlias);
+  }
+  if (typeof args.add_last_line_newline !== "boolean") {
+    const alias = args.add_last_line_newline ?? args.addLastLineNewline ??
+      args.append_newline ?? args.appendNewline;
+    if (typeof alias === "boolean") args.add_last_line_newline = alias;
   }
   if (typeof args.content !== "string" && typeof args.file_content === "string") {
     args.content = args.file_content;
@@ -1924,6 +1928,40 @@ function hasFileExtension(path: string): boolean {
   return /\.[^/\\.]+$/.test(pathBasename(path));
 }
 
+const EXTENSIONLESS_SAVE_FILE_NAMES = new Set([
+  "Makefile",
+  "Dockerfile",
+  "Containerfile",
+  "Rakefile",
+  "Gemfile",
+  "Procfile",
+  "Vagrantfile",
+  "Brewfile",
+  "Justfile",
+  "Taskfile",
+]);
+
+function saveFilePathLooksLikeDirectory(path: string): boolean {
+  if (directoryExists(path)) return true;
+  const normalized = normalizePathSlashes(path).trim();
+  if (!normalized) return true;
+  if (normalized.endsWith("/")) return true;
+  const base = pathBasename(normalized);
+  if (!base || base === "." || base === "..") return true;
+  if (pathExists(normalized)) return false;
+  return !hasFileExtension(base) && !EXTENSIONLESS_SAVE_FILE_NAMES.has(base);
+}
+
+function repairSaveFilePath(path: string, fallbackPath?: string): string {
+  const cleaned = cleanExtractedPath(path);
+  if (!cleaned) return cleaned;
+  const fallback = fallbackPath
+    ? normalizePathSlashes(fallbackPath.trim())
+    : undefined;
+  if (!fallback || isAbsolutePath(cleaned)) return canonicalizePath(cleaned);
+  return canonicalizePath(joinPath(fallback, cleaned.replace(/^\.\//, "")));
+}
+
 function workspaceFolderFromPath(path?: string): string | undefined {
   if (!path) return undefined;
   let candidate = canonicalizePath(normalizePathSlashes(path.trim()));
@@ -2262,10 +2300,13 @@ function invalidToolReason(
       if (!isPathWithinAllowedHome(args.path)) {
         return `Tool ${toolName} path is outside the allowed scope. Use an absolute path under ${allowedHomeHint()}.`;
       }
+      if (saveFilePathLooksLikeDirectory(args.path)) {
+        return `Tool ${toolName} path is a directory: ${args.path}. Provide a concrete file path including the filename.`;
+      }
       const content = args.file_content ?? args.content ?? args.file_contents ??
         args.contents ?? args.text ?? args.new_content ?? args.new_contents ??
         args.data ?? args.body;
-      if (typeof content !== "string") {
+      if (content === undefined || content === null) {
         return `Tool ${toolName} requires file_content.`;
       }
     }

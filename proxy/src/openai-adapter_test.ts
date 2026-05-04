@@ -596,6 +596,83 @@ Deno.test("save-file accepts client file_content field", async () => {
   }
 });
 
+Deno.test("save-file preserves client add_last_line_newline field", async () => {
+  const path = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-",
+    suffix: ".txt",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path,
+              file_content: "no trailing newline",
+              add_last_line_newline: false,
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(input.file_content, "no trailing newline");
+        assertEquals(input.add_last_line_newline, false);
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file stringifies non-string file_content like client", async () => {
+  const path = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-",
+    suffix: ".txt",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path,
+              file_content: 42,
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(input.file_content, "42");
+        assertEquals(input.content, "42");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
 Deno.test("save-file normalizes content aliases to file_content", async () => {
   const path = await Deno.makeTempFile({
     dir: "/home/vscode/projects/augmentproxy/proxy",
@@ -705,6 +782,140 @@ Deno.test("save-file without content is rejected", async () => {
   } finally {
     await Deno.remove(path).catch(() => undefined);
   }
+});
+
+Deno.test("save-file with directory path is rejected", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-dir-",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_dir",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: directoryPath,
+              file_content: "class ShouldNotUseDirectory {}\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "save-file"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file with missing extension directory-like path is rejected", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-parent-",
+  });
+  const target = `${directoryPath}/src/haxe/utils`;
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_dirlike",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: target,
+              file_content: "class ShouldHaveFilename {}\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: directoryPath }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "save-file"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file allows known extensionless filenames", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-extensionless-",
+  });
+  const target = `${directoryPath}/Makefile`;
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_makefile",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: target,
+              file_content: "all:\n\ttrue\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: directoryPath }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(input.path, target);
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file without path does not fallback to workspace directory", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_save_no_path",
+        type: "function",
+        function: {
+          name: "save-file",
+          arguments: JSON.stringify({
+            file_content: "class MissingPath {}\n",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "save-file"), false);
+    },
+  );
 });
 
 Deno.test("view path supports markdown/uri/line-suffixed references", async () => {
@@ -999,6 +1210,197 @@ Deno.test("stream keeps repeated single-thread save-file writes to same file", a
     );
   } finally {
     await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("stream save-file with directory path is rejected", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-dir-stream-",
+  });
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_save_dir_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "save-file",
+          arguments: JSON.stringify({
+            path: directoryPath,
+            file_content: "class ShouldNotUseDirectoryStream {}\n",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "save-file"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream save-file with missing extension directory-like path is rejected", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-dirlike-stream-",
+  });
+  const target = `${directoryPath}/src/haxe/utils`;
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_save_dirlike_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "save-file",
+          arguments: JSON.stringify({
+            path: target,
+            file_content: "class ShouldHaveFilenameStream {}\n",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: directoryPath }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "save-file"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream save-file without path does not fallback to workspace directory", async () => {
+  await withFakeOpenAIStreamToolCall(
+    {
+      id: "call_save_no_path_stream",
+      index: 0,
+      type: "function",
+      function: {
+        name: "save-file",
+        arguments: JSON.stringify({
+          file_content: "class MissingPathStream {}\n",
+        }),
+      },
+    },
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "save-file"), false);
+    },
+  );
+});
+
+Deno.test("stream distributes parallel anonymous save-file fragments across unresolved calls", async () => {
+  const pathA = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-anon-a-",
+    suffix: ".txt",
+  });
+  const pathB = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-anon-b-",
+    suffix: ".txt",
+  });
+  try {
+    await withFakeFetch(
+      () =>
+        new Response(
+          [
+            // Two unresolved calls with ids but no initial arguments.
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        id: "call_save_a",
+                        index: 0,
+                        type: "function",
+                        function: { name: "save-file", arguments: "" },
+                      },
+                      {
+                        id: "call_save_b",
+                        index: 1,
+                        type: "function",
+                        function: { name: "save-file", arguments: "" },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            // Anonymous fragments should be distributed, not collapsed.
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        type: "function",
+                        function: {
+                          name: "save-file",
+                          arguments: JSON.stringify({
+                            path: pathA,
+                            file_content: "first\n",
+                          }),
+                        },
+                      },
+                      {
+                        type: "function",
+                        function: {
+                          name: "save-file",
+                          arguments: JSON.stringify({
+                            path: pathB,
+                            file_content: "second\n",
+                          }),
+                        },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const inputs = toolInputs(await collectStreamObjects(response));
+        assertEquals(inputs.length, 2);
+        const paths = inputs
+          .map((input) => input.path)
+          .filter((value): value is string => typeof value === "string")
+          .sort();
+        assertEquals(paths, [pathA, pathB].sort());
+        const contents = inputs
+          .map((input) => input.file_content)
+          .filter((value): value is string => typeof value === "string")
+          .sort();
+        assertEquals(contents, ["first\n", "second\n"]);
+      },
+    );
+  } finally {
+    await Deno.remove(pathA).catch(() => undefined);
+    await Deno.remove(pathB).catch(() => undefined);
   }
 });
 
