@@ -711,6 +711,57 @@ Deno.test("save-file normalizes content aliases to file_content", async () => {
   }
 });
 
+Deno.test("save-file coalesces duplicate same-path writes in one batch", async () => {
+  const path = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-coalesce-",
+    suffix: ".txt",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [
+          {
+            id: "call_save_short",
+            type: "function",
+            function: {
+              name: "save-file",
+              arguments: JSON.stringify({
+                path,
+                file_content: "short\n",
+              }),
+            },
+          },
+          {
+            id: "call_save_full",
+            type: "function",
+            function: {
+              name: "save-file",
+              arguments: JSON.stringify({
+                path,
+                file_content: "full\ncontent\n",
+              }),
+            },
+          },
+        ],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const inputs = toolInputs(await response.json() as JsonObject);
+        assertEquals(inputs.length, 1);
+        assertEquals(inputs[0].path, path);
+        assertEquals(inputs[0].file_content, "full\ncontent\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
 Deno.test("save-file with relative path is repaired via workspace fallback", async () => {
   const path = await Deno.makeTempFile({
     dir: "/home/vscode/projects/augmentproxy/proxy",
@@ -1135,7 +1186,7 @@ Deno.test("stream keeps repeated single-thread view reads to same file", async (
   }
 });
 
-Deno.test("stream keeps repeated single-thread save-file writes to same file", async () => {
+Deno.test("stream coalesces repeated same-path save-file writes to final content", async () => {
   const path = await Deno.makeTempFile({
     dir: "/home/vscode/projects/augmentproxy/proxy",
     prefix: "openai-adapter-save-repeat-",
@@ -1201,11 +1252,10 @@ Deno.test("stream keeps repeated single-thread save-file writes to same file", a
           testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
         );
         const inputs = toolInputs(await collectStreamObjects(response));
-        assertEquals(inputs.length, 2);
+        assertEquals(inputs.length, 1);
         assertEquals(inputs[0].path, path);
-        assertEquals(inputs[1].path, path);
-        assertEquals(inputs[0].content, "first\n");
-        assertEquals(inputs[1].content, "second\n");
+        assertEquals(inputs[0].content, "second\n");
+        assertEquals(inputs[0].file_content, "second\n");
       },
     );
   } finally {

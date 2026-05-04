@@ -972,7 +972,7 @@ function parseToolCall(
   call: JsonValue,
   fallbackPath?: string,
   launchCommandFallback?: string,
-): { id: string; name: string; argumentsJson: string } | undefined {
+): ParsedToolCall | undefined {
   if (!call || typeof call !== "object" || Array.isArray(call)) {
     return undefined;
   }
@@ -1000,6 +1000,8 @@ function parseToolCall(
     : `tool_${crypto.randomUUID()}`;
   return { id, name, argumentsJson };
 }
+
+type ParsedToolCall = { id: string; name: string; argumentsJson: string };
 
 function normalizeToolName(name: string): string {
   const normalized = name.trim().toLowerCase().replace(/_/g, "-");
@@ -2329,14 +2331,12 @@ function toolCallsToNodes(
   fallbackPath?: string,
   launchCommandFallback?: string,
 ): JsonObject[] {
-  if (!Array.isArray(toolCalls)) return [];
+  const parsedCalls = coalesceSaveFileToolCalls(
+    validParsedToolCalls(toolCalls, fallbackPath, launchCommandFallback),
+  );
   const nodes: JsonObject[] = [];
   let id = startingId;
-  for (const call of toolCalls) {
-    const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
-    if (!parsed) continue;
-    const invalidReason = invalidToolReason(parsed.name, parsed.argumentsJson);
-    if (invalidReason) continue;
+  for (const parsed of parsedCalls) {
     nodes.push({
       id,
       type: 5,
@@ -2349,6 +2349,49 @@ function toolCallsToNodes(
     id += 1;
   }
   return nodes;
+}
+
+function validParsedToolCalls(
+  toolCalls: JsonValue,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+): ParsedToolCall[] {
+  if (!Array.isArray(toolCalls)) return [];
+  const parsedCalls: ParsedToolCall[] = [];
+  for (const call of toolCalls) {
+    const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
+    if (!parsed) continue;
+    const invalidReason = invalidToolReason(parsed.name, parsed.argumentsJson);
+    if (invalidReason) continue;
+    parsedCalls.push(parsed);
+  }
+  return parsedCalls;
+}
+
+function coalesceSaveFileToolCalls(
+  parsedCalls: ParsedToolCall[],
+): ParsedToolCall[] {
+  const latestByPath = new Map<string, number>();
+  parsedCalls.forEach((call, index) => {
+    const path = saveFilePathKey(call);
+    if (path) latestByPath.set(path, index);
+  });
+  if (latestByPath.size === 0) return parsedCalls;
+  return parsedCalls.filter((call, index) => {
+    const path = saveFilePathKey(call);
+    return !path || latestByPath.get(path) === index;
+  });
+}
+
+function saveFilePathKey(call: ParsedToolCall): string | undefined {
+  if (call.name !== "save-file") return undefined;
+  try {
+    const args = JSON.parse(call.argumentsJson) as JsonObject;
+    const path = typeof args.path === "string" ? args.path.trim() : "";
+    return path || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function textResponseNode(content: string, id = 1): JsonObject | undefined {
