@@ -359,6 +359,93 @@ function appendToolResultMessages(
   }
 }
 
+function collectReadFilePaths(
+  ctx: RequestContext,
+  fallbackPath?: string,
+): Set<string> {
+  const body = objectBody(ctx);
+  const viewPathById = new Map<string, string>();
+  const successfulResultIds = new Set<string>();
+
+  const rememberViewCalls = (nodes: JsonValue) => {
+    for (const node of asArray(nodes)) {
+      const call = nodeToolUse(node);
+      if (!call) continue;
+      const parsed = parseToolCall(call, fallbackPath);
+      if (!parsed || parsed.name !== "view") continue;
+      let args: JsonObject;
+      try {
+        const decoded = JSON.parse(parsed.argumentsJson);
+        if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+          continue;
+        }
+        args = decoded as JsonObject;
+      } catch {
+        continue;
+      }
+      const path = typeof args.path === "string" ? args.path : "";
+      if (!path || !isFilePath(path)) continue;
+      if (args.type === "directory") continue;
+      viewPathById.set(parsed.id, canonicalizePath(path));
+    }
+  };
+
+  const rememberSuccessfulResults = (nodes: JsonValue) => {
+    for (const node of asArray(nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const toolResult = (node as JsonObject).tool_result_node;
+      if (
+        !toolResult || typeof toolResult !== "object" ||
+        Array.isArray(toolResult)
+      ) continue;
+      const result = toolResult as JsonObject;
+      const id = typeof result.tool_use_id === "string"
+        ? result.tool_use_id
+        : "";
+      if (!id || !toolResultLooksSuccessful(result)) continue;
+      successfulResultIds.add(id);
+    }
+  };
+
+  for (const item of asArray(body.chat_history)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    rememberViewCalls(record.request_nodes);
+    rememberViewCalls(record.response_nodes);
+  }
+  rememberViewCalls(body.nodes);
+
+  for (const item of asArray(body.chat_history)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    rememberSuccessfulResults(record.request_nodes);
+    rememberSuccessfulResults(record.response_nodes);
+  }
+  rememberSuccessfulResults(body.nodes);
+
+  const paths = new Set<string>();
+  for (const id of successfulResultIds) {
+    const path = viewPathById.get(id);
+    if (path) paths.add(path);
+  }
+  return paths;
+}
+
+function toolResultLooksSuccessful(result: JsonObject): boolean {
+  if (result.is_error === true || result.error === true) return false;
+  const status = text(result.status).toLowerCase();
+  if (status === "error" || status === "failed" || status === "failure") {
+    return false;
+  }
+  const content = text(result.content).toLowerCase();
+  return !(
+    content.includes("path does not exist") ||
+    content.includes("no such file") ||
+    content.includes("not found") ||
+    content.includes("is a directory")
+  );
+}
+
 function currentNodeUserText(nodes: JsonValue): string {
   return asArray(nodes).map(nodeText).filter(Boolean).join("\n").trim();
 }
@@ -638,6 +725,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- Path safety policy: never access /, /home, or any path outside /home/<current-user>/. Restrict file and directory operations to the current user's home workspace only.",
     "- If a required argument is unknown, first use a discovery tool with a known directory/path or answer from available context; do not emit an invalid call.",
     "- If a tool fails validation, repair the next tool call by providing the missing required JSON field; do not repeat the same invalid call.",
+    "- Before every str-replace-editor call, first use view with {\"path\":\"<target>\",\"type\":\"file\"} for that exact file in the current conversation. Do not edit from memory, search snippets, or stale history.",
     "- For view-range-untruncated and search-untruncated, reference_id must come from the truncation footer text 'Reference ID: ...'. Never use a tool_use_id like call_function_* as reference_id.",
     "- If str-replace-editor reports old_str not found or no changes, do not repeat the same edit call. Re-read the file and regenerate fresh old_str/new_str from current content.",
     "- For launch-process checks that may legitimately return no matches (for example grep probes), append `|| true` to avoid unnecessary hard-failure retries.",
@@ -666,7 +754,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     '- codebase-retrieval: requires information_request. Valid example: {"information_request":"Find the modules responsible for request routing, OpenAI adaptation, indexing, and configuration."}. Invalid: {}.',
     '- launch-process: requires command. Prefer simple commands and set cwd only when known. Valid example: {"command":"pwd && ls -la","cwd":"<known-directory>"}.',
     '- save-file: only creates new files. Requires path and file_content. The path must include a concrete filename, preferably with an extension. Valid example: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Invalid: {"path":"<existing-file>","file_content":"..."}, {"path":"<dir>/utils","file_content":"..."}.',
-    "- str-replace-editor: only use when editing is explicitly needed, and provide the complete required schema fields.",
+    "- str-replace-editor: only use after reading the exact target file with view, and provide the complete required schema fields.",
   );
   if (toolSummaries.length > 0) {
     lines.push("Available tool schemas from this client:");
@@ -2404,6 +2492,7 @@ function toolCallsToNodes(
   startingId = 1,
   fallbackPath?: string,
   launchCommandFallback?: string,
+  readFilePaths?: Set<string>,
 ): JsonObject[] {
   const parsedCalls = coalesceSaveFileToolCalls(
     validParsedToolCalls(toolCalls, fallbackPath, launchCommandFallback),
@@ -2411,18 +2500,49 @@ function toolCallsToNodes(
   const nodes: JsonObject[] = [];
   let id = startingId;
   for (const parsed of parsedCalls) {
+    const nodeCall = redirectUnreadEditToView(parsed, readFilePaths) ?? parsed;
     nodes.push({
       id,
       type: 5,
       tool_use: {
-        tool_name: parsed.name,
-        tool_use_id: parsed.id,
-        input_json: parsed.argumentsJson,
+        tool_name: nodeCall.name,
+        tool_use_id: nodeCall.id,
+        input_json: nodeCall.argumentsJson,
       },
     });
     id += 1;
   }
   return nodes;
+}
+
+function redirectUnreadEditToView(
+  parsed: ParsedToolCall,
+  readFilePaths?: Set<string>,
+): ParsedToolCall | undefined {
+  if (parsed.name !== "str-replace-editor") return undefined;
+  if (!readFilePaths) return undefined;
+  const path = editPath(parsed.argumentsJson);
+  if (!path) return undefined;
+  const normalized = canonicalizePath(path);
+  if (readFilePaths.has(normalized)) return undefined;
+  return {
+    id: `${parsed.id}_read_before_edit`,
+    name: "view",
+    argumentsJson: JSON.stringify({ path, type: "file" }),
+  };
+}
+
+function editPath(argumentsJson: string): string | undefined {
+  try {
+    const parsed = JSON.parse(argumentsJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const path = (parsed as JsonObject).path;
+    return typeof path === "string" && path ? path : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function validParsedToolCalls(
@@ -2979,6 +3099,7 @@ export async function forwardAugmentJson(
 ): Promise<Response> {
   const request = buildOpenAIRequest(config, ctx, false);
   const fallbackPath = workspaceFallbackPath(ctx);
+  const readFilePaths = collectReadFilePaths(ctx, fallbackPath);
   logInfo(config, "openai:json:start", {
     requestId: ctx.requestId,
     model: config.openaiModel,
@@ -3094,9 +3215,23 @@ export async function forwardAugmentJson(
       const reasoning = collectReasoningFields(messageRecord);
       reasoningFallback = reasoning.join("\n\n").trim();
       if (reasoning.length > 0) nodes = [...thinkingNodes(reasoning), ...nodes];
+      const invalidToolCalls = invalidToolCallSummaries(
+        messageRecord.tool_calls,
+        fallbackPath,
+      );
+      const validToolNodes = toolCallsToNodes(
+        messageRecord.tool_calls,
+        1,
+        fallbackPath,
+        undefined,
+        readFilePaths,
+      );
+      const recoveryToolNodes = validToolNodes.length === 0
+        ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1)
+        : [];
       nodes = [
         ...nodes,
-        ...toolCallsToNodes(messageRecord.tool_calls, 1, fallbackPath),
+        ...(recoveryToolNodes.length > 0 ? recoveryToolNodes : validToolNodes),
       ];
       if (nodes.length === 0) {
         const renderedToolCalls = renderToolCalls(
@@ -3430,6 +3565,7 @@ export async function forwardAugmentStream(
   );
   const requestId = ctx.requestId;
   const fallbackPath = workspaceFallbackPath(ctx);
+  const readFilePaths = collectReadFilePaths(ctx, fallbackPath);
   const streamToolCalls: JsonObject[] = [];
 
   const stream = new ReadableStream<Uint8Array>({
@@ -3740,6 +3876,7 @@ export async function forwardAugmentStream(
             1,
             fallbackPath,
             launchCommandFallback,
+            readFilePaths,
           );
           const recoveryToolNodes = validToolNodes.length === 0
             ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1)

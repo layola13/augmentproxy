@@ -53,6 +53,35 @@ function testContext(body: JsonObject): RequestContext {
   };
 }
 
+function workspaceContext(): JsonObject {
+  return { path: "/home/vscode/projects/augmentproxy/proxy" };
+}
+
+function contextAfterView(path: string): JsonObject {
+  return {
+    path: "/home/vscode/projects/augmentproxy/proxy",
+    chat_history: [{
+      response_nodes: [{
+        id: 1,
+        type: 5,
+        tool_use: {
+          tool_name: "view",
+          tool_use_id: "call_view_previous",
+          input_json: JSON.stringify({ path, type: "file" }),
+        },
+      }],
+      request_nodes: [{
+        id: 2,
+        type: 1,
+        tool_result_node: {
+          tool_use_id: "call_view_previous",
+          content: `Read file: ${path}\nalpha\n`,
+        },
+      }],
+    }],
+  };
+}
+
 async function withFakeOpenAIMessage(
   message: JsonObject,
   run: () => Promise<void>,
@@ -224,6 +253,209 @@ function hasToolName(
   return scan(responseBody);
 }
 
+Deno.test("str-replace without prior view is redirected to file read", async () => {
+  const path = await makeTempTargetPath();
+  await Deno.writeTextFile(path, "alpha\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_unread_edit",
+          type: "function",
+          function: {
+            name: "str-replace-editor",
+            arguments: JSON.stringify({
+              command: "str_replace",
+              path,
+              str_replace_entries: [{
+                old_str: "alpha\n",
+                new_str: "beta\n",
+              }],
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(workspaceContext()),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "str-replace-editor"), false);
+        assertEquals(hasToolName(body, "view"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+        assertEquals(input.type, "file");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("str-replace after prior view is allowed", async () => {
+  const path = await makeTempTargetPath();
+  await Deno.writeTextFile(path, "alpha\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_read_edit",
+          type: "function",
+          function: {
+            name: "str-replace-editor",
+            arguments: JSON.stringify({
+              command: "str_replace",
+              path,
+              str_replace_entries: [{
+                old_str: "alpha\n",
+                new_str: "beta\n",
+              }],
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(contextAfterView(path)),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "view"), false);
+        assertEquals(hasToolName(body, "str-replace-editor"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+        assertEquals(input.old_str_1, "alpha\n");
+        assertEquals(input.new_str_1, "beta\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("stream str-replace without prior view is redirected to file read", async () => {
+  const path = await makeTempTargetPath();
+  await Deno.writeTextFile(path, "alpha\n");
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_unread_edit_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "str-replace-editor",
+          arguments: JSON.stringify({
+            command: "str_replace",
+            path,
+            str_replace_entries: [{
+              old_str: "alpha\n",
+              new_str: "beta\n",
+            }],
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext(workspaceContext()),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "str-replace-editor"), false);
+        assertEquals(hasToolName(objects, "view"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.path, path);
+        assertEquals(input.type, "file");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("stream str-replace after prior view is allowed", async () => {
+  const path = await makeTempTargetPath();
+  await Deno.writeTextFile(path, "alpha\n");
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_read_edit_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "str-replace-editor",
+          arguments: JSON.stringify({
+            command: "str_replace",
+            path,
+            str_replace_entries: [{
+              old_str: "alpha\n",
+              new_str: "beta\n",
+            }],
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext(contextAfterView(path)),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), false);
+        assertEquals(hasToolName(objects, "str-replace-editor"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.path, path);
+        assertEquals(input.old_str_1, "alpha\n");
+        assertEquals(input.new_str_1, "beta\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("stale str-replace with no effective entries recovers by reading file", async () => {
+  const path = await makeTempTargetPath();
+  await Deno.writeTextFile(path, "alpha\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_stale_edit",
+          type: "function",
+          function: {
+            name: "str-replace-editor",
+            arguments: JSON.stringify({
+              command: "str_replace",
+              path,
+              str_replace_entries: [{
+                old_str: "missing\n",
+                new_str: "beta\n",
+              }],
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(contextAfterView(path)),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "str-replace-editor"), false);
+        assertEquals(hasToolName(body, "view"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+        assertEquals(input.type, "file");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
 Deno.test("str-replace tool node includes flat preview fields for Augment UI", async () => {
   const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
@@ -252,7 +484,7 @@ Deno.test("str-replace tool node includes flat preview fields for Augment UI", a
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -315,7 +547,7 @@ Deno.test("stream keeps duplicate tool calls with identical arguments", async ()
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const inputs = toolInputs(await collectStreamObjects(response));
         assertEquals(inputs.length, 2);
@@ -394,7 +626,7 @@ Deno.test("stream keeps separate tool call ids across multiple deltas", async ()
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const chunks = await collectStreamObjects(response);
         let toolIds: string[] = [];
@@ -445,7 +677,7 @@ Deno.test("streamed str-replace tool node includes flat preview fields for Augme
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const input = firstToolInput(await collectStreamObjects(response));
         assertEquals(input.str_replace_entries, [{
@@ -490,7 +722,7 @@ Deno.test("insert tool node infers insert command and includes flat preview fiel
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -529,7 +761,7 @@ Deno.test("save-file normalizes file_path alias to path", async () => {
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -564,7 +796,7 @@ Deno.test("save-file accepts client file_content field", async () => {
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -600,7 +832,7 @@ Deno.test("save-file preserves client add_last_line_newline field", async () => 
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -634,7 +866,7 @@ Deno.test("save-file stringifies non-string file_content like client", async () 
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -668,7 +900,7 @@ Deno.test("save-file normalizes content aliases to file_content", async () => {
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -715,7 +947,7 @@ Deno.test("save-file coalesces duplicate same-path writes in one batch", async (
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const inputs = toolInputs(await response.json() as JsonObject);
         assertEquals(inputs.length, 1);
@@ -754,7 +986,7 @@ Deno.test("save-file to existing file is converted to str-replace-editor", async
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const body = await response.json() as JsonObject;
         assertEquals(hasToolName(body, "save-file"), false);
@@ -764,6 +996,44 @@ Deno.test("save-file to existing file is converted to str-replace-editor", async
         assertEquals(input.path, path);
         assertEquals(String(input.old_str_1).includes('trace("old");'), true);
         assertEquals(String(input.new_str_1).includes('trace("new");'), true);
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file to existing file without prior view is redirected to file read", async () => {
+  const path = await makeTempTargetPath(".hx");
+  await Deno.writeTextFile(path, "old\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_existing_unread",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path,
+              file_content: "new\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(workspaceContext()),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "save-file"), false);
+        assertEquals(hasToolName(body, "str-replace-editor"), false);
+        assertEquals(hasToolName(body, "view"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+        assertEquals(input.type, "file");
       },
     );
   } finally {
@@ -806,7 +1076,7 @@ Deno.test("duplicate save-file to existing file keeps final replacement", async 
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const inputs = toolInputs(await response.json() as JsonObject);
         assertEquals(inputs.length, 1);
@@ -842,7 +1112,7 @@ Deno.test("save-file with relative path is repaired via workspace fallback", asy
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const body = await response.json() as JsonObject;
         const input = firstToolInput(body);
@@ -874,7 +1144,7 @@ Deno.test("save-file without content is rejected", async () => {
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const body = await response.json() as JsonObject;
         assertEquals(hasToolName(body, "save-file"), false);
@@ -909,7 +1179,7 @@ Deno.test("save-file with directory path is rejected", async () => {
       async () => {
         const response = await forwardAugmentJson(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const body = await response.json() as JsonObject;
         assertEquals(hasToolName(body, "save-file"), false);
@@ -1011,7 +1281,7 @@ Deno.test("save-file without path does not fallback to workspace directory", asy
     async () => {
       const response = await forwardAugmentJson(
         testConfig(),
-        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        testContext(workspaceContext()),
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "save-file"), false);
@@ -1142,7 +1412,7 @@ Deno.test("stream distributes anonymous tool fragments across unresolved calls",
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const inputs = toolInputs(await collectStreamObjects(response));
         assertEquals(inputs.length, 2);
@@ -1223,7 +1493,7 @@ Deno.test("stream keeps repeated single-thread view reads to same file", async (
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const inputs = toolInputs(await collectStreamObjects(response));
         assertEquals(inputs.length, 2);
@@ -1295,7 +1565,7 @@ Deno.test("stream coalesces repeated same-path save-file writes to final content
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const inputs = toolInputs(await collectStreamObjects(response));
         assertEquals(inputs.length, 1);
@@ -1333,7 +1603,7 @@ Deno.test("stream save-file to existing file is converted to str-replace-editor"
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(contextAfterView(path)),
         );
         const objects = await collectStreamObjects(response);
         assertEquals(hasToolName(objects, "save-file"), false);
@@ -1343,6 +1613,42 @@ Deno.test("stream save-file to existing file is converted to str-replace-editor"
         assertEquals(input.path, path);
         assertEquals(String(input.old_str_1).includes('trace("old");'), true);
         assertEquals(String(input.new_str_1).includes('trace("new");'), true);
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("stream save-file to existing file without prior view is redirected to file read", async () => {
+  const path = await makeTempTargetPath(".hx");
+  await Deno.writeTextFile(path, "old\n");
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_save_existing_unread_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "save-file",
+          arguments: JSON.stringify({
+            path,
+            file_content: "new\n",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext(workspaceContext()),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "save-file"), false);
+        assertEquals(hasToolName(objects, "str-replace-editor"), false);
+        assertEquals(hasToolName(objects, "view"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.path, path);
+        assertEquals(input.type, "file");
       },
     );
   } finally {
@@ -1372,7 +1678,7 @@ Deno.test("stream save-file with directory path is rejected", async () => {
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const objects = await collectStreamObjects(response);
         assertEquals(hasToolName(objects, "save-file"), false);
@@ -1433,7 +1739,7 @@ Deno.test("stream save-file without path does not fallback to workspace director
     async () => {
       const response = await forwardAugmentStream(
         testConfig(),
-        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        testContext(workspaceContext()),
       );
       const objects = await collectStreamObjects(response);
       assertEquals(hasToolName(objects, "save-file"), false);
@@ -1511,7 +1817,7 @@ Deno.test("stream distributes parallel anonymous save-file fragments across unre
       async () => {
         const response = await forwardAugmentStream(
           testConfig(),
-          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+          testContext(workspaceContext()),
         );
         const inputs = toolInputs(await collectStreamObjects(response));
         assertEquals(inputs.length, 2);
@@ -1552,7 +1858,7 @@ Deno.test("write-process normalizes write_stdin style session_id and chars", asy
     async () => {
       const response = await forwardAugmentJson(
         testConfig(),
-        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        testContext(workspaceContext()),
       );
       const body = await response.json() as JsonObject;
       const input = firstToolInput(body);
@@ -1581,7 +1887,7 @@ Deno.test("write-process normalizes terminal and input aliases", async () => {
     async () => {
       const response = await forwardAugmentJson(
         testConfig(),
-        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        testContext(workspaceContext()),
       );
       const body = await response.json() as JsonObject;
       const input = firstToolInput(body);
@@ -1648,7 +1954,7 @@ Deno.test("stream keeps repeated write-process writes to same terminal", async (
     async () => {
       const response = await forwardAugmentStream(
         testConfig(),
-        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        testContext(workspaceContext()),
       );
       const inputs = toolInputs(await collectStreamObjects(response));
       assertEquals(inputs.length, 2);
@@ -1691,7 +1997,7 @@ Deno.test("stream keeps parallel write-process calls across terminals", async ()
     async () => {
       const response = await forwardAugmentStream(
         testConfig(),
-        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        testContext(workspaceContext()),
       );
       const inputs = toolInputs(await collectStreamObjects(response));
       assertEquals(inputs.length, 2);
