@@ -132,6 +132,16 @@ async function withFakeFetch(
   }
 }
 
+async function makeTempTargetPath(suffix = ".txt"): Promise<string> {
+  const path = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-",
+    suffix,
+  });
+  await Deno.remove(path);
+  return path;
+}
+
 async function collectStreamObjects(response: Response): Promise<JsonObject[]> {
   const text = await response.text();
   return text.split(/\r?\n/)
@@ -215,11 +225,7 @@ function hasToolName(
 }
 
 Deno.test("str-replace tool node includes flat preview fields for Augment UI", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
   try {
     await withFakeOpenAIMessage(
@@ -268,11 +274,7 @@ Deno.test("str-replace tool node includes flat preview fields for Augment UI", a
 });
 
 Deno.test("stream keeps duplicate tool calls with identical arguments", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
   try {
     await withFakeOpenAIStreamToolCalls(
@@ -325,11 +327,7 @@ Deno.test("stream keeps duplicate tool calls with identical arguments", async ()
 });
 
 Deno.test("stream keeps separate tool call ids across multiple deltas", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
   try {
     await withFakeFetch(
@@ -422,11 +420,7 @@ Deno.test("stream keeps separate tool call ids across multiple deltas", async ()
 });
 
 Deno.test("streamed str-replace tool node includes flat preview fields for Augment UI", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
   try {
     await withFakeOpenAIStreamToolCall(
@@ -472,11 +466,7 @@ Deno.test("streamed str-replace tool node includes flat preview fields for Augme
 });
 
 Deno.test("insert tool node infers insert command and includes flat preview fields", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
   try {
     await withFakeOpenAIMessage(
@@ -519,11 +509,7 @@ Deno.test("insert tool node infers insert command and includes flat preview fiel
 });
 
 Deno.test("save-file normalizes file_path alias to path", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeOpenAIMessage(
       {
@@ -558,11 +544,7 @@ Deno.test("save-file normalizes file_path alias to path", async () => {
 });
 
 Deno.test("save-file accepts client file_content field", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeOpenAIMessage(
       {
@@ -597,11 +579,7 @@ Deno.test("save-file accepts client file_content field", async () => {
 });
 
 Deno.test("save-file preserves client add_last_line_newline field", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeOpenAIMessage(
       {
@@ -636,11 +614,7 @@ Deno.test("save-file preserves client add_last_line_newline field", async () => 
 });
 
 Deno.test("save-file stringifies non-string file_content like client", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeOpenAIMessage(
       {
@@ -674,11 +648,7 @@ Deno.test("save-file stringifies non-string file_content like client", async () 
 });
 
 Deno.test("save-file normalizes content aliases to file_content", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeOpenAIMessage(
       {
@@ -712,11 +682,7 @@ Deno.test("save-file normalizes content aliases to file_content", async () => {
 });
 
 Deno.test("save-file coalesces duplicate same-path writes in one batch", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-save-coalesce-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeOpenAIMessage(
       {
@@ -762,12 +728,100 @@ Deno.test("save-file coalesces duplicate same-path writes in one batch", async (
   }
 });
 
+Deno.test("save-file to existing file is converted to str-replace-editor", async () => {
+  const path = await makeTempTargetPath(".hx");
+  await Deno.writeTextFile(
+    path,
+    'package;\n\nclass Main {\n    static function main() {\n        trace("old");\n    }\n}\n',
+  );
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_existing",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path,
+              file_content:
+                'package;\n\nclass Main {\n    static function main() {\n        trace("new");\n    }\n}\n',
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "save-file"), false);
+        assertEquals(hasToolName(body, "str-replace-editor"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.command, "str_replace");
+        assertEquals(input.path, path);
+        assertEquals(String(input.old_str_1).includes('trace("old");'), true);
+        assertEquals(String(input.new_str_1).includes('trace("new");'), true);
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("duplicate save-file to existing file keeps final replacement", async () => {
+  const path = await makeTempTargetPath(".hx");
+  await Deno.writeTextFile(path, "old\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [
+          {
+            id: "call_save_existing_1",
+            type: "function",
+            function: {
+              name: "save-file",
+              arguments: JSON.stringify({
+                path,
+                file_content: "middle\n",
+              }),
+            },
+          },
+          {
+            id: "call_save_existing_2",
+            type: "function",
+            function: {
+              name: "save-file",
+              arguments: JSON.stringify({
+                path,
+                file_content: "final\n",
+              }),
+            },
+          },
+        ],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const inputs = toolInputs(await response.json() as JsonObject);
+        assertEquals(inputs.length, 1);
+        assertEquals(inputs[0].command, "str_replace");
+        assertEquals(inputs[0].path, path);
+        assertEquals(inputs[0].new_str_1, "final\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
 Deno.test("save-file with relative path is repaired via workspace fallback", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   const fileName = path.split("/").pop() ?? "";
   try {
     await withFakeOpenAIMessage(
@@ -801,11 +855,7 @@ Deno.test("save-file with relative path is repaired via workspace fallback", asy
 });
 
 Deno.test("save-file without content is rejected", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeOpenAIMessage(
       {
@@ -1187,11 +1237,7 @@ Deno.test("stream keeps repeated single-thread view reads to same file", async (
 });
 
 Deno.test("stream coalesces repeated same-path save-file writes to final content", async () => {
-  const path = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-save-repeat-",
-    suffix: ".txt",
-  });
+  const path = await makeTempTargetPath();
   try {
     await withFakeFetch(
       () =>
@@ -1256,6 +1302,47 @@ Deno.test("stream coalesces repeated same-path save-file writes to final content
         assertEquals(inputs[0].path, path);
         assertEquals(inputs[0].content, "second\n");
         assertEquals(inputs[0].file_content, "second\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("stream save-file to existing file is converted to str-replace-editor", async () => {
+  const path = await makeTempTargetPath(".hx");
+  await Deno.writeTextFile(
+    path,
+    'package;\n\nclass Main {\n    static function main() {\n        trace("old");\n    }\n}\n',
+  );
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_save_existing_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "save-file",
+          arguments: JSON.stringify({
+            path,
+            file_content:
+              'package;\n\nclass Main {\n    static function main() {\n        trace("new");\n    }\n}\n',
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "save-file"), false);
+        assertEquals(hasToolName(objects, "str-replace-editor"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.command, "str_replace");
+        assertEquals(input.path, path);
+        assertEquals(String(input.old_str_1).includes('trace("old");'), true);
+        assertEquals(String(input.new_str_1).includes('trace("new");'), true);
       },
     );
   } finally {
@@ -1355,16 +1442,8 @@ Deno.test("stream save-file without path does not fallback to workspace director
 });
 
 Deno.test("stream distributes parallel anonymous save-file fragments across unresolved calls", async () => {
-  const pathA = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-save-anon-a-",
-    suffix: ".txt",
-  });
-  const pathB = await Deno.makeTempFile({
-    dir: "/home/vscode/projects/augmentproxy/proxy",
-    prefix: "openai-adapter-save-anon-b-",
-    suffix: ".txt",
-  });
+  const pathA = await makeTempTargetPath();
+  const pathB = await makeTempTargetPath();
   try {
     await withFakeFetch(
       () =>

@@ -665,7 +665,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- view-range-untruncated: requires reference_id, start_line, end_line from a prior view result. Do not pass path to this tool.",
     '- codebase-retrieval: requires information_request. Valid example: {"information_request":"Find the modules responsible for request routing, OpenAI adaptation, indexing, and configuration."}. Invalid: {}.',
     '- launch-process: requires command. Prefer simple commands and set cwd only when known. Valid example: {"command":"pwd && ls -la","cwd":"<known-directory>"}.',
-    '- save-file: requires path and file_content. The path must include a concrete filename, preferably with an extension. Valid example: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Invalid: {"path":"<dir>/utils","file_content":"..."}.',
+    '- save-file: only creates new files. Requires path and file_content. The path must include a concrete filename, preferably with an extension. Valid example: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Invalid: {"path":"<existing-file>","file_content":"..."}, {"path":"<dir>/utils","file_content":"..."}.',
     "- str-replace-editor: only use when editing is explicitly needed, and provide the complete required schema fields.",
   );
   if (toolSummaries.length > 0) {
@@ -773,7 +773,7 @@ function toolDescriptionForModel(tool: JsonObject): string {
     "write-process":
       'Example arguments: {"terminal_id":1,"input_text":"text"}. Never use undefined terminal_id.',
     "save-file":
-      'Example arguments: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Never omit file_content. Never use a directory path as path.',
+      'Example arguments: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Only use for new files. For existing files, use str-replace-editor. Never omit file_content. Never use a directory path as path.',
     "sub-agent":
       'Example arguments: {"action":"run","name":"reviewer","instruction":"Inspect the failing tests and report concise findings."}. To retrieve a completed agent result, use {"action":"output","name":"reviewer"}.',
   };
@@ -995,13 +995,87 @@ function parseToolCall(
     launchCommandFallback,
   );
   ({ name, argumentsJson } = repairMisusedToolCall(name, argumentsJson));
+  const nameBeforeExistingFileRepair = name;
+  ({ name, argumentsJson } = repairSaveFileForExistingPath(name, argumentsJson));
+  const convertedFromSaveFile = nameBeforeExistingFileRepair === "save-file" &&
+    name === "str-replace-editor";
   const id = typeof record.id === "string" && record.id
     ? record.id
     : `tool_${crypto.randomUUID()}`;
-  return { id, name, argumentsJson };
+  return { id, name, argumentsJson, convertedFromSaveFile };
 }
 
-type ParsedToolCall = { id: string; name: string; argumentsJson: string };
+type ParsedToolCall = {
+  id: string;
+  name: string;
+  argumentsJson: string;
+  convertedFromSaveFile?: boolean;
+};
+
+function repairSaveFileForExistingPath(
+  name: string,
+  argumentsJson: string,
+): { name: string; argumentsJson: string } {
+  if (name !== "save-file") return { name, argumentsJson };
+  let args: JsonObject;
+  try {
+    const parsed = JSON.parse(argumentsJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { name, argumentsJson };
+    }
+    args = parsed as JsonObject;
+  } catch {
+    return { name, argumentsJson };
+  }
+  const path = typeof args.path === "string" ? args.path : "";
+  if (!path || !isFilePath(path)) return { name, argumentsJson };
+  const existing = readTextFileIfExists(path);
+  if (existing === undefined) return { name, argumentsJson };
+  const desired = saveFileDesiredContent(args);
+  if (desired === undefined) return { name, argumentsJson };
+
+  const editArgs: JsonObject = existing.length === 0
+    ? {
+      command: "insert",
+      path,
+      insert_line_entries: desired.length === 0 ? [] : [{
+        insert_line: 1,
+        new_str: desired,
+      }],
+    }
+    : {
+      command: "str_replace",
+      path,
+      str_replace_entries: existing === desired ? [] : [{
+        old_str: existing,
+        new_str: desired,
+        old_str_start_line_number: 1,
+        old_str_end_line_number: lineCount(existing),
+      }],
+    };
+  addFlatStrReplaceEditorCompatibilityFields(editArgs);
+  return {
+    name: "str-replace-editor",
+    argumentsJson: JSON.stringify(editArgs),
+  };
+}
+
+function saveFileDesiredContent(args: JsonObject): string | undefined {
+  const content = args.file_content ?? args.content ?? args.file_contents ??
+    args.contents ?? args.text ?? args.new_content ?? args.new_contents ??
+    args.data ?? args.body;
+  if (content === undefined || content === null) return undefined;
+  let desired = String(content);
+  if (args.add_last_line_newline !== false && desired && !desired.endsWith("\n")) {
+    desired += "\n";
+  }
+  return desired;
+}
+
+function lineCount(value: string): number {
+  if (value.length === 0) return 1;
+  return value.replace(/\r\n/g, "\n").split("\n").length;
+}
 
 function normalizeToolName(name: string): string {
   const normalized = name.trim().toLowerCase().replace(/_/g, "-");
@@ -2384,7 +2458,9 @@ function coalesceSaveFileToolCalls(
 }
 
 function saveFilePathKey(call: ParsedToolCall): string | undefined {
-  if (call.name !== "save-file") return undefined;
+  if (call.name !== "save-file" && !call.convertedFromSaveFile) {
+    return undefined;
+  }
   try {
     const args = JSON.parse(call.argumentsJson) as JsonObject;
     const path = typeof args.path === "string" ? args.path.trim() : "";
