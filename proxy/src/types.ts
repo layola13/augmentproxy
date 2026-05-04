@@ -1,11 +1,16 @@
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
+export type SwitchApi = "OPENAI" | "CODEX";
 
 export interface ProxyConfig {
   port: number;
+  switchApi: SwitchApi;
   openaiBaseUrl: string;
+  codexBaseUrl: string;
   openaiApiKey: string;
+  codexApiKey: string;
   openaiModel: string;
+  codexModel: string;
   openaiUserAgent: string;
   upstreamAppName: string;
   sanitizeUpstreamPrompts: boolean;
@@ -56,3 +61,17 @@ export interface OpenAIChatRequest {
   tool_choice?: "auto" | "required";
   stream_options?: JsonObject;
 }
+
+export interface OpenAIResponsesRequest {
+  model: string;
+  instructions?: string;
+  input: JsonObject[];
+  tools: JsonObject[];
+  tool_choice: "auto" | "required";
+  parallel_tool_calls: boolean;
+  store: boolean;
+  stream: boolean;
+  include: string[];
+}
+
+export type OpenAIUpstreamRequest = OpenAIChatRequest | OpenAIResponsesRequest;

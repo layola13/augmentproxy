@@ -22,9 +22,13 @@ deno task dev
 
 ```env
 PROXY_PORT=8765
+SWITCH_API=OPENAI
 OPENAI_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
 OPENAI_API_KEY=...
 OPENAI_MODEL=mimo-v2.5-pro
+CODEX_BASE_URL=https://anyrouter.top/v1
+CODEX_API_KEY=...
+CODEX_MODEL=gpt-5.3-codex
 OPENAI_USER_AGENT=codex-cli
 OPENAI_UPSTREAM_APP_NAME=Codex
 OPENAI_SANITIZE_UPSTREAM_PROMPTS=false
@@ -32,6 +36,10 @@ AUGMENT_REQUEST_LOG_DIR=proxy/logs
 ```
 
 环境变量会覆盖 `.env` 中的同名值。
+
+`SWITCH_API=OPENAI` sends upstream model requests to `OPENAI_BASE_URL/chat/completions` with `OPENAI_API_KEY` and `OPENAI_MODEL`.
+`SWITCH_API=CODEX` sends upstream model requests to `CODEX_BASE_URL/responses` with `CODEX_API_KEY` and `CODEX_MODEL`.
+The two API keys are intentionally separate and are not used as fallbacks for each other.
 
 ## Upstream Identity / Codex-like Requests
 

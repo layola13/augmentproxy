@@ -35,10 +35,15 @@ function historySummaryParams(config: ProxyConfig): string {
   });
 }
 
+function activeModel(config: ProxyConfig): string {
+  return config.switchApi === "CODEX" ? config.codexModel : config.openaiModel;
+}
+
 function modelInfoRegistry(config: ProxyConfig): string {
+  const model = activeModel(config);
   return JSON.stringify({
-    [config.openaiModel]: {
-      humanName: config.openaiModel,
+    [model]: {
+      humanName: model,
       description: "OpenAI-compatible upstream model via augmentproxy",
       encoding: "o200k_base",
       context: config.augmentModelContextTokens,
@@ -57,12 +62,13 @@ export function fakeToken(): JsonObject {
 }
 
 export function fakeModels(config: ProxyConfig): JsonObject {
+  const model = activeModel(config);
   return {
-    default_model: config.openaiModel,
+    default_model: model,
     models: [
       {
-        name: config.openaiModel,
-        internal_name: config.openaiModel,
+        name: model,
+        internal_name: model,
         suggested_prefix_char_count: 12000,
         suggested_suffix_char_count: 12000,
         completion_timeout_ms: 600000,
@@ -76,8 +82,8 @@ export function fakeModels(config: ProxyConfig): JsonObject {
       { name: "JSON", vscode_name: "json", extensions: [".json"] },
     ],
     feature_flags: {
-      additional_chat_models: config.openaiModel,
-      agent_chat_model: config.openaiModel,
+      additional_chat_models: model,
+      agent_chat_model: model,
       enable_model_registry: true,
       model_info_registry: modelInfoRegistry(config),
       history_summary_min_version: "0.0.0",

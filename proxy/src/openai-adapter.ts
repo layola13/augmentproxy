@@ -3,6 +3,8 @@ import type {
   JsonValue,
   OpenAIChatRequest,
   OpenAIMessage,
+  OpenAIResponsesRequest,
+  OpenAIUpstreamRequest,
   ProxyConfig,
   RequestContext,
 } from "./types.ts";
@@ -110,8 +112,10 @@ function compactSummaryText(ctx: RequestContext): string | undefined {
         return content ? `Tool result ${id}: ${truncateMiddle(content, 350)}` : "";
       })
       .filter(Boolean);
-    const assistantText = responseNodes.map(nodeText).filter(Boolean).join("\n") ||
-      text(record.response_text).trim();
+    const assistantText = stripToolCallRejectedTail(
+      responseNodes.map(nodeText).filter(Boolean).join("\n") ||
+        text(record.response_text).trim(),
+    );
     const toolUses = responseNodes
       .map(nodeToolUse)
       .filter((call): call is JsonObject => Boolean(call))
@@ -156,6 +160,33 @@ function nodeToolUse(node: JsonValue): JsonObject | undefined {
   return { id, type: "function", function: { name, arguments: args } };
 }
 
+function stripTrailingNextStepsSection(value: string): string {
+  const pattern = /\n(?:-{3,}\s*\n)?\s{0,3}(?:#{1,6}\s*)?Next Steps\s*(?:\n|$)/gi;
+  let lastMatch: RegExpExecArray | null = null;
+  for (let match = pattern.exec(value); match; match = pattern.exec(value)) {
+    lastMatch = match;
+  }
+  if (!lastMatch) return value;
+
+  const tail = value.slice(lastMatch.index);
+  if (!/(?:^|\n)\s*(?:\d+[.)]|[-*])\s+\S/.test(tail)) return value;
+
+  const head = value.slice(0, lastMatch.index)
+    .replace(/\n+-{3,}\s*$/g, "")
+    .trimEnd();
+  return head || value;
+}
+
+function stripToolCallRejectedTail(value: string): string {
+  const index = value.search(/(?:^|\n)\s*Tool call rejected \([^)]+\):/i);
+  if (index < 0) return value;
+  return value.slice(0, index).trimEnd();
+}
+
+function hasToolCallRejectedText(value: string): boolean {
+  return /(?:^|\n)\s*Tool call rejected \([^)]+\):/i.test(value);
+}
+
 interface HistoryToMessagesResult {
   messages: OpenAIMessage[];
   filteredToolCalls: number;
@@ -166,6 +197,7 @@ interface HistoryToMessagesResult {
 function historyToMessages(
   history: JsonValue,
   fallbackPath?: string,
+  stripAssistantNextSteps = false,
 ): HistoryToMessagesResult {
   const messages: OpenAIMessage[] = [];
   const filteredToolCallIds = new Set<string>();
@@ -177,10 +209,17 @@ function historyToMessages(
 
     const requestNodes = asArray(record.request_nodes);
     const responseNodes = asArray(record.response_nodes);
-    const toolResults = toolResultSummaries(requestNodes, filteredToolCallIds);
-    const responseText =
+    const toolResults = [
+      ...toolResultSummaries(responseNodes, filteredToolCallIds),
+      ...toolResultSummaries(requestNodes, filteredToolCallIds),
+    ];
+    let responseText =
       responseNodes.map(nodeText).filter(Boolean).join("\n") ||
       text(record.response_text).trim();
+    responseText = stripToolCallRejectedTail(responseText);
+    if (stripAssistantNextSteps) {
+      responseText = stripTrailingNextStepsSection(responseText);
+    }
     const toolCalls: JsonObject[] = [];
     for (const call of responseNodes.map(nodeToolUse).filter((
       value,
@@ -199,7 +238,9 @@ function historyToMessages(
         filteredToolReasons.push(`${parsed.name}: ${dropReason}`);
         continue;
       }
-      toolCalls.push(call);
+      if (parsed) {
+        toolCalls.push(parsedToolCallToOpenAI(parsed));
+      }
     }
     const userText = requestNodes.map(nodeText).filter(Boolean).join("\n") ||
       text(record.request_message).trim();
@@ -228,7 +269,6 @@ function historyToMessages(
     // Auggie stores tool results in the next turn's request_nodes. For OpenAI
     // chat-completions, those tool messages must appear immediately after the
     // assistant tool_calls that produced them, before the next assistant turn.
-    appendToolResultMessages(messages, requestNodes, filteredToolCallIds);
     if (userText) messages.push({ role: "user", content: userText });
 
     if (responseText || toolCalls.length > 0) {
@@ -238,6 +278,8 @@ function historyToMessages(
         ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
       });
     }
+    appendToolResultMessages(messages, responseNodes, filteredToolCallIds);
+    appendToolResultMessages(messages, requestNodes, filteredToolCallIds);
 
     if (messages.length === 0) {
       const roleRaw = text(record.role || record.speaker || record.type)
@@ -290,6 +332,17 @@ function toolCallArgumentsJson(call: JsonObject): string {
   if (!fn || typeof fn !== "object" || Array.isArray(fn)) return "{}";
   const args = (fn as JsonObject).arguments;
   return typeof args === "string" ? args : JSON.stringify(args ?? {});
+}
+
+function parsedToolCallToOpenAI(parsed: ParsedToolCall): JsonObject {
+  return {
+    id: parsed.id,
+    type: "function",
+    function: {
+      name: parsed.name,
+      arguments: parsed.argumentsJson,
+    },
+  };
 }
 
 function parseHistoricalStrReplaceArgs(
@@ -442,7 +495,8 @@ function toolResultLooksSuccessful(result: JsonObject): boolean {
     content.includes("path does not exist") ||
     content.includes("no such file") ||
     content.includes("not found") ||
-    content.includes("is a directory")
+    content.includes("is a directory") ||
+    content.includes("tool call rejected")
   );
 }
 
@@ -457,6 +511,30 @@ function hasToolResultNodes(nodes: JsonValue): boolean {
   });
 }
 
+function hasRecentHistoryToolResultNodes(
+  history: JsonValue,
+  maxTurns = 3,
+): boolean {
+  for (const item of asArray(history).slice(-maxTurns)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    if (
+      hasToolResultNodes(record.request_nodes) ||
+      hasToolResultNodes(record.response_nodes)
+    ) return true;
+  }
+  return false;
+}
+
+function hasToolDefinitions(ctx: RequestContext): boolean {
+  const body = objectBody(ctx);
+  return asArray(body.tool_definitions).some((item) =>
+    Boolean(item) && typeof item === "object" && !Array.isArray(item) &&
+    typeof (item as JsonObject).name === "string" &&
+    ((item as JsonObject).name as string).trim().length > 0
+  );
+}
+
 function isContinuationText(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   return normalized === "继续" || normalized === "continue" ||
@@ -468,7 +546,38 @@ function shouldRetryStalledContinuation(ctx: RequestContext): boolean {
   const body = objectBody(ctx);
   const currentText = currentNodeUserText(body.nodes) || text(body.message) ||
     text(body.prompt) || text(body.instruction);
-  return hasToolResultNodes(body.nodes) || isContinuationText(currentText);
+  if (hasToolResultNodes(body.nodes) || isContinuationText(currentText)) {
+    return true;
+  }
+  return !currentText.trim() && hasRecentHistoryToolResultNodes(body.chat_history);
+}
+
+function continuationControlNudge(ctx: RequestContext): string | undefined {
+  if (!shouldRetryStalledContinuation(ctx)) return undefined;
+  return [
+    "Continuation control: do not stop after a brief status update.",
+    "If the task is not fully complete, call the next appropriate tool now.",
+    "Only produce a final natural-language answer when there is no concrete tool action left to take.",
+  ].join(" ");
+}
+
+function shouldPreferToolContinuation(
+  config: ProxyConfig,
+  ctx: RequestContext,
+): boolean {
+  if (config.switchApi !== "CODEX" || !hasToolDefinitions(ctx)) return false;
+  const body = objectBody(ctx);
+  const currentText = currentNodeUserText(body.nodes) || text(body.message) ||
+    text(body.prompt) || text(body.instruction);
+  if (
+    hasToolResultNodes(body.nodes) ||
+    isContinuationText(currentText) ||
+    (!currentText.trim() && hasRecentHistoryToolResultNodes(body.chat_history))
+  ) {
+    return true;
+  }
+  const mode = text(body.mode).toUpperCase();
+  return mode.includes("AGENT");
 }
 
 function pruneUnresolvedToolHistory(messages: OpenAIMessage[]): {
@@ -590,7 +699,11 @@ function buildMessages(
     messages.push({ role: "system", content: systemParts.join("\n\n") });
   }
   const fallbackPath = workspaceFallbackPath(ctx);
-  const historyMessages = historyToMessages(body.chat_history, fallbackPath);
+  const historyMessages = historyToMessages(
+    body.chat_history,
+    fallbackPath,
+    config.switchApi === "CODEX",
+  );
   messages.push(...historyMessages.messages);
   if (historyMessages.filteredToolCalls > 0) {
     logWarn(config, "openai:messages:filtered-invalid-tool-history", {
@@ -730,7 +843,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- If str-replace-editor reports old_str not found or no changes, do not repeat the same edit call. Re-read the file and regenerate fresh old_str/new_str from current content.",
     "- For launch-process checks that may legitimately return no matches (for example grep probes), append `|| true` to avoid unnecessary hard-failure retries.",
     "- For project evaluation, inspect the workspace root/directory first, then read specific files discovered from listings, then synthesize a final answer.",
-    '- Final-answer format is mandatory: after the main answer, append a section titled "Next Steps" with 1-3 numbered, concrete, executable follow-up actions tailored to the user\'s goal. Do not omit this section.',
+    "- Final answers must be concise. While concrete tool work remains, use tools instead of appending follow-up suggestions.",
     "- If you already have a directory listing result, do not call view on the same root directory again in later turns. Move forward by reading specific files or using codebase-retrieval with a concrete information_request.",
   ];
   if (workspacePath) {
@@ -904,8 +1017,48 @@ function workspaceFallbackPath(ctx: RequestContext): string | undefined {
     if (extracted) return extracted;
     return body.path;
   }
+  const idePath = currentIdeWorkspacePath(body);
+  if (idePath) return idePath;
   const discovered = collectWorkspacePaths(body);
   return discovered[0];
+}
+
+function currentIdeWorkspacePath(body: JsonObject): string | undefined {
+  const candidates: string[] = [];
+  const collectFromNode = (node: JsonValue): void => {
+    if (!node || typeof node !== "object" || Array.isArray(node)) return;
+    const ideState = (node as JsonObject).ide_state_node;
+    if (!ideState || typeof ideState !== "object" || Array.isArray(ideState)) {
+      return;
+    }
+    const state = ideState as JsonObject;
+    for (const folder of asArray(state.workspace_folders)) {
+      if (!folder || typeof folder !== "object" || Array.isArray(folder)) continue;
+      const record = folder as JsonObject;
+      const root = record.repository_root ?? record.folder_root;
+      if (typeof root === "string" && root.startsWith("/")) candidates.push(root);
+    }
+    const terminal = state.current_terminal;
+    if (terminal && typeof terminal === "object" && !Array.isArray(terminal)) {
+      const cwd = (terminal as JsonObject).current_working_directory;
+      if (typeof cwd === "string" && cwd.startsWith("/")) candidates.push(cwd);
+    }
+  };
+
+  for (const node of asArray(body.nodes)) collectFromNode(node);
+  for (const item of asArray(body.chat_history).slice(-8)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    for (const node of asArray(record.request_nodes)) collectFromNode(node);
+  }
+
+  for (const candidate of candidates) {
+    const cleaned = cleanExtractedPath(candidate);
+    if (cleaned && isPathWithinAllowedHome(cleaned) && pathExists(cleaned)) {
+      return cleaned;
+    }
+  }
+  return undefined;
 }
 
 function collectWorkspacePaths(
@@ -1727,9 +1880,7 @@ function normalizeStrReplacePath(
 }
 
 function repairFilePath(path: string, fallbackPath?: string): string | undefined {
-  const repaired = repairViewPath(path, fallbackPath);
-  if (repaired && isFilePath(repaired)) return repaired;
-  const cleaned = cleanExtractedPath(path);
+  const cleaned = pathCandidateFromPossiblyEmbeddedPath(path);
   const fallback = fallbackPath ? normalizePathSlashes(fallbackPath.trim()) : undefined;
   const candidates = [cleaned];
   if (fallback && cleaned && !isAbsolutePath(cleaned)) {
@@ -1737,8 +1888,8 @@ function repairFilePath(path: string, fallbackPath?: string): string | undefined
   }
   for (const candidate of candidates) {
     if (!candidate) continue;
-    const sibling = uniqueExtensionSibling(candidate) ?? uniqueFilePrefixSibling(candidate);
-    if (sibling && isFilePath(sibling)) return sibling;
+    const normalized = canonicalizePath(candidate);
+    if (isFilePath(normalized)) return normalized;
   }
   return undefined;
 }
@@ -1972,6 +2123,13 @@ function firstAbsolutePathFromText(value: string): string | undefined {
   return undefined;
 }
 
+function pathCandidateFromPossiblyEmbeddedPath(path: string): string {
+  const cleaned = cleanExtractedPath(path);
+  const embedded = firstAbsolutePathFromText(cleaned);
+  if (embedded && isPathWithinAllowedHome(embedded)) return cleanExtractedPath(embedded);
+  return cleaned;
+}
+
 const VIEW_PATH_EXTENSION_CANDIDATES = [
   ".ts",
   ".tsx",
@@ -2116,8 +2274,48 @@ function saveFilePathLooksLikeDirectory(path: string): boolean {
   return !hasFileExtension(base) && !EXTENSIONLESS_SAVE_FILE_NAMES.has(base);
 }
 
+function splitFileStemAndExtension(name: string): { stem: string; extension: string } {
+  const index = name.lastIndexOf(".");
+  if (index <= 0) return { stem: name, extension: "" };
+  return { stem: name.slice(0, index), extension: name.slice(index) };
+}
+
+function stripGeneratedFileSuffix(stem: string): string {
+  let output = stem;
+  while (true) {
+    const next = output
+      .replace(/(?:[-_. ](?:new|copy|copied|duplicate|dup|backup|bak|old|tmp|temp|final|updated|modified|revised|latest))(?:[-_. ]?\d+)?$/i, "")
+      .replace(/(?:[-_. ]v\d+)$/i, "")
+      .replace(/(?:[-_. ]20\d{2}[-_.]\d{2}[-_.]\d{2})(?:[-_.]\d{2}[-_.]\d{2}[-_.]\d{2})?$/i, "")
+      .replace(/(?:[-_. ]\d{8})(?:[-_.]\d{6})?$/i, "")
+      .replace(/\s*\(\d+\)$/i, "");
+    if (next === output) return output;
+    output = next;
+  }
+}
+
+function fileNameStemWithExtension(name: string): string {
+  const { stem, extension } = splitFileStemAndExtension(name);
+  return `${stripGeneratedFileSuffix(stem).toLowerCase()}${extension.toLowerCase()}`;
+}
+
+function saveFilePathLooksLikeGeneratedSibling(path: string): boolean {
+  const normalized = canonicalizePath(path);
+  if (pathExists(normalized)) return false;
+  const dir = pathDirname(normalized);
+  const base = pathBasename(normalized);
+  if (!dir || !base || !directoryExists(dir)) return false;
+  const strippedTarget = fileNameStemWithExtension(base);
+  if (strippedTarget.toLowerCase() === base.toLowerCase()) return false;
+  for (const entry of Deno.readDirSync(dir)) {
+    if (!entry.isFile) continue;
+    if (fileNameStemWithExtension(entry.name) === strippedTarget) return true;
+  }
+  return false;
+}
+
 function repairSaveFilePath(path: string, fallbackPath?: string): string {
-  const cleaned = cleanExtractedPath(path);
+  const cleaned = pathCandidateFromPossiblyEmbeddedPath(path);
   if (!cleaned) return cleaned;
   const fallback = fallbackPath
     ? normalizePathSlashes(fallbackPath.trim())
@@ -2467,6 +2665,9 @@ function invalidToolReason(
       if (saveFilePathLooksLikeDirectory(args.path)) {
         return `Tool ${toolName} path is a directory: ${args.path}. Provide a concrete file path including the filename.`;
       }
+      if (saveFilePathLooksLikeGeneratedSibling(args.path)) {
+        return `Tool ${toolName} path looks like a renamed copy of an existing sibling file: ${args.path}. Read and edit the existing file instead of creating date, _new, copy, or backup suffix variants.`;
+      }
       const content = args.file_content ?? args.content ?? args.file_contents ??
         args.contents ?? args.text ?? args.new_content ?? args.new_contents ??
         args.data ?? args.body;
@@ -2696,30 +2897,29 @@ function invalidToolCallHint(
   return `Tool call rejected (${name}): ${reason}`;
 }
 
+function appendInvalidToolCallHint(
+  content: string,
+  invalidToolCalls: JsonObject[],
+): string {
+  const hint = invalidToolCallHint(invalidToolCalls);
+  if (!hint || content.includes(hint)) return content;
+  return content.trim() ? `${content.trimEnd()}\n\n${hint}` : hint;
+}
+
 function recoveryToolNodesForInvalidToolCalls(
   invalidToolCalls: JsonObject[],
   startingId = 1,
+  fallbackPath?: string,
 ): JsonObject[] {
   const nodes: JsonObject[] = [];
-  const seenPaths = new Set<string>();
+  const seenRecoveries = new Set<string>();
   let id = startingId;
   for (const call of invalidToolCalls) {
-    if (call.name !== "str-replace-editor") continue;
-    const reason = typeof call.reason === "string" ? call.reason : "";
-    if (!reason.includes("no effective str_replace_entries")) continue;
-    const argumentsJson = typeof call.arguments === "string" ? call.arguments : "{}";
-    let args: JsonObject;
-    try {
-      const parsed = JSON.parse(argumentsJson);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-      args = parsed as JsonObject;
-    } catch {
-      continue;
-    }
-    const path = typeof args.path === "string" ? args.path : "";
-    if (!path || seenPaths.has(path)) continue;
-    if (!isPathWithinAllowedHome(path) || !isFilePath(path)) continue;
-    seenPaths.add(path);
+    const recovery = recoveryToolForInvalidToolCall(call, fallbackPath);
+    if (!recovery) continue;
+    const recoveryKey = `${recovery.toolName}:${JSON.stringify(recovery.input)}`;
+    if (seenRecoveries.has(recoveryKey)) continue;
+    seenRecoveries.add(recoveryKey);
     const sourceId = typeof call.id === "string" && call.id
       ? call.id
       : `invalid_${id}`;
@@ -2727,14 +2927,82 @@ function recoveryToolNodesForInvalidToolCalls(
       id,
       type: 5,
       tool_use: {
-        tool_name: "view",
-        tool_use_id: `${sourceId}_recovery_view`,
-        input_json: JSON.stringify({ path, type: "file" }),
+        tool_name: recovery.toolName,
+        tool_use_id: `${sourceId}_recovery_${recovery.toolName.replace(/[^a-z0-9]+/gi, "_")}`,
+        input_json: JSON.stringify(recovery.input),
       },
     });
     id += 1;
   }
   return nodes;
+}
+
+function recoveryToolForInvalidToolCall(
+  call: JsonObject,
+  fallbackPath?: string,
+): { toolName: string; input: JsonObject } | undefined {
+  const name = typeof call.name === "string" ? call.name : "";
+  const reason = typeof call.reason === "string" ? call.reason : "";
+  if (
+    name === "read-process" ||
+    name === "write-process" ||
+    name === "kill-process" ||
+    reason.includes("terminal_id")
+  ) {
+    return { toolName: "list-processes", input: {} };
+  }
+  const viewTarget = recoveryViewTargetForInvalidToolCall(call, fallbackPath);
+  if (viewTarget) return { toolName: "view", input: viewTarget };
+  return undefined;
+}
+
+function recoveryToolNodesForStaleRejectedText(
+  startingId = 1,
+  fallbackPath?: string,
+): JsonObject[] {
+  return recoveryToolNodesForInvalidToolCalls(
+    [{
+      id: "stale_tool_rejection",
+      name: "stale-response",
+      arguments: "{}",
+      reason: "The model repeated stale tool rejection text without a tool call.",
+    }],
+    startingId,
+    fallbackPath,
+  );
+}
+
+function recoveryViewTargetForInvalidToolCall(
+  call: JsonObject,
+  fallbackPath?: string,
+): JsonObject | undefined {
+  const argumentsJson = typeof call.arguments === "string" ? call.arguments : "{}";
+  try {
+    const parsed = JSON.parse(argumentsJson);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const rawPath = (parsed as JsonObject).path;
+      if (typeof rawPath === "string" && rawPath.trim()) {
+        const candidate = repairViewPath(rawPath, fallbackPath);
+        if (isPathWithinAllowedHome(candidate) && pathExists(candidate)) {
+          return {
+            path: candidate,
+            type: directoryExists(candidate) ? "directory" : "file",
+          };
+        }
+      }
+    }
+  } catch {
+    // Fall back to workspace inspection below.
+  }
+
+  const fallback = workspaceFolderFromPath(fallbackPath) ?? fallbackPath;
+  if (!fallback || !isPathWithinAllowedHome(fallback) || !pathExists(fallback)) {
+    return undefined;
+  }
+  return {
+    path: fallback,
+    type: directoryExists(fallback) ? "directory" : "file",
+  };
 }
 
 function hasMeaningfulVisibleText(content: string): boolean {
@@ -2902,6 +3170,25 @@ function buildOpenAIRequest(
   stream: boolean,
   continuationNudge?: string,
   forceToolChoiceRequired = false,
+): OpenAIUpstreamRequest {
+  if (config.switchApi === "CODEX") {
+    return buildResponsesRequest(
+      config,
+      ctx,
+      stream,
+      continuationNudge,
+      forceToolChoiceRequired,
+    );
+  }
+  return buildChatRequest(config, ctx, stream, continuationNudge, forceToolChoiceRequired);
+}
+
+function buildChatRequest(
+  config: ProxyConfig,
+  ctx: RequestContext,
+  stream: boolean,
+  continuationNudge?: string,
+  forceToolChoiceRequired = false,
 ): OpenAIChatRequest {
   const body = objectBody(ctx);
   const messages = buildMessages(config, ctx);
@@ -2926,11 +3213,131 @@ function buildOpenAIRequest(
   return request;
 }
 
+function buildResponsesRequest(
+  config: ProxyConfig,
+  ctx: RequestContext,
+  stream: boolean,
+  continuationNudge?: string,
+  forceToolChoiceRequired = false,
+): OpenAIResponsesRequest {
+  const messages = buildMessages(config, ctx);
+  if (continuationNudge) {
+    messages.push({ role: "user", content: continuationNudge });
+  }
+  const tools = buildResponsesTools(ctx);
+  const preferToolContinuation = shouldPreferToolContinuation(config, ctx);
+  if (preferToolContinuation) {
+    messages.push({
+      role: "user",
+      content: [
+        "CODEX tool-continuation control: this is an active agent turn with tools available.",
+        "If the task is not fully complete, emit the next function call now instead of a final answer.",
+        "Do not include follow-up suggestions unless no concrete tool action remains.",
+      ].join(" "),
+    });
+  }
+  const instructions = messages[0]?.role === "system" ? messages[0].content : "";
+  const conversationMessages = instructions ? messages.slice(1) : messages;
+  return {
+    model: config.codexModel,
+    ...(instructions ? { instructions } : {}),
+    input: messagesToResponsesInput(conversationMessages),
+    tools,
+    tool_choice: tools.length > 0 && (forceToolChoiceRequired || preferToolContinuation)
+      ? "required"
+      : "auto",
+    parallel_tool_calls: true,
+    store: false,
+    stream,
+    include: [],
+  };
+}
+
+function buildResponsesTools(ctx: RequestContext): JsonObject[] {
+  return buildOpenAITools(ctx).map((tool) => {
+    const fn = tool.function && typeof tool.function === "object" && !Array.isArray(tool.function)
+      ? tool.function as JsonObject
+      : {};
+    return {
+      type: "function",
+      name: text(fn.name),
+      description: text(fn.description),
+      strict: false,
+      parameters: fn.parameters && typeof fn.parameters === "object" && !Array.isArray(fn.parameters)
+        ? fn.parameters
+        : { type: "object", properties: {} },
+    };
+  }).filter((tool) => typeof tool.name === "string" && tool.name.length > 0);
+}
+
+function messagesToResponsesInput(messages: OpenAIMessage[]): JsonObject[] {
+  const input: JsonObject[] = [];
+  for (const message of messages) {
+    if (message.role === "tool") {
+      input.push({
+        type: "function_call_output",
+        call_id: message.tool_call_id ?? `call_${crypto.randomUUID()}`,
+        output: message.content,
+      });
+      continue;
+    }
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      if (message.content.trim()) {
+        input.push(responseMessageItem(message.role, "output_text", message.content));
+      }
+      for (const call of message.tool_calls) {
+        const parsed = parseToolCall(call);
+        if (!parsed) continue;
+        input.push({
+          type: "function_call",
+          name: parsed.name,
+          arguments: parsed.argumentsJson,
+          call_id: parsed.id,
+        });
+      }
+      continue;
+    }
+    const role = message.role === "system" ? "developer" : message.role;
+    const contentType = role === "assistant" ? "output_text" : "input_text";
+    input.push(responseMessageItem(role, contentType, message.content));
+  }
+  return input;
+}
+
+function responseMessageItem(role: string, contentType: "input_text" | "output_text", content: string): JsonObject {
+  return {
+    type: "message",
+    role,
+    content: [{ type: contentType, text: content }],
+  };
+}
+
 function numberField(value: JsonValue | undefined): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function estimatePromptTokens(request: OpenAIChatRequest): number {
+function isResponsesRequest(
+  request: OpenAIUpstreamRequest,
+): request is OpenAIResponsesRequest {
+  return Array.isArray((request as OpenAIResponsesRequest).input);
+}
+
+function requestMessageCount(request: OpenAIUpstreamRequest): number {
+  return isResponsesRequest(request) ? request.input.length : request.messages.length;
+}
+
+function requestToolCount(request: OpenAIUpstreamRequest): number {
+  return request.tools?.length ?? 0;
+}
+
+function estimatePromptTokens(request: OpenAIUpstreamRequest): number {
+  if (isResponsesRequest(request)) {
+    return estimateTextTokens(
+      `${request.instructions ?? ""}\n${JSON.stringify(request.input)}\n${
+        JSON.stringify(request.tools)
+      }`,
+    );
+  }
   const chars = request.messages.reduce((sum, message) => {
     const toolCalls = message.tool_calls ? JSON.stringify(message.tool_calls).length : 0;
     return sum + message.content.length + toolCalls;
@@ -2951,18 +3358,44 @@ function estimateMessageTokens(message: OpenAIMessage): number {
   return estimateTextTokens(message.content) + estimateJsonTokens(message.tool_calls);
 }
 
-function estimateToolResultTokens(messages: OpenAIMessage[]): number {
+function estimateResponsesItemTokens(item: JsonObject): number {
+  return estimateTextTokens(JSON.stringify(item));
+}
+
+function estimateToolResultTokens(request: OpenAIUpstreamRequest): number {
+  if (isResponsesRequest(request)) {
+    return request.input.reduce((sum, item) => {
+      return item.type === "function_call_output"
+        ? sum + estimateResponsesItemTokens(item)
+        : sum;
+    }, 0);
+  }
+  const messages = request.messages;
   return messages.reduce((sum, message) => {
     return message.role === "tool" ? sum + estimateMessageTokens(message) : sum;
   }, 0);
 }
 
-function estimateSystemPromptTokens(messages: OpenAIMessage[]): number {
+function estimateSystemPromptTokens(request: OpenAIUpstreamRequest): number {
+  if (isResponsesRequest(request)) {
+    return estimateTextTokens(request.instructions ?? "");
+  }
+  const messages = request.messages;
   const first = messages[0];
   return first?.role === "system" ? estimateMessageTokens(first) : 0;
 }
 
-function estimateCurrentMessageTokens(messages: OpenAIMessage[]): number {
+function estimateCurrentMessageTokens(request: OpenAIUpstreamRequest): number {
+  if (isResponsesRequest(request)) {
+    for (let index = request.input.length - 1; index >= 0; index -= 1) {
+      const item = request.input[index];
+      if (item.type === "message" && item.role === "user") {
+        return estimateResponsesItemTokens(item);
+      }
+    }
+    return 0;
+  }
+  const messages = request.messages;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role === "user") return estimateMessageTokens(message);
@@ -2971,16 +3404,16 @@ function estimateCurrentMessageTokens(messages: OpenAIMessage[]): number {
 }
 
 function estimateAssistantResponseTokens(usage: JsonObject): number {
-  return numberField(usage.completion_tokens) ?? 0;
+  return numberField(usage.completion_tokens) ?? numberField(usage.output_tokens) ?? 0;
 }
 
-function estimateToolDefinitionTokens(request: OpenAIChatRequest): number {
+function estimateToolDefinitionTokens(request: OpenAIUpstreamRequest): number {
   return estimateJsonTokens(request.tools);
 }
 
 function tokenUsageNode(
   config: ProxyConfig,
-  request: OpenAIChatRequest,
+  request: OpenAIUpstreamRequest,
   usage: JsonValue,
 ): JsonObject {
   return {
@@ -2992,18 +3425,25 @@ function tokenUsageNode(
 
 function augmentTokenUsage(
   config: ProxyConfig,
-  request: OpenAIChatRequest,
+  request: OpenAIUpstreamRequest,
   usage: JsonValue,
 ): JsonObject {
   const record = usage && typeof usage === "object" && !Array.isArray(usage)
     ? usage as JsonObject
     : {};
-  const promptTokens = numberField(record.prompt_tokens) ?? estimatePromptTokens(request);
-  const completionTokens = numberField(record.completion_tokens) ?? 0;
-  const systemPromptTokens = estimateSystemPromptTokens(request.messages);
-  const currentMessageTokens = estimateCurrentMessageTokens(request.messages);
+  const inputDetails = record.input_tokens_details &&
+      typeof record.input_tokens_details === "object" &&
+      !Array.isArray(record.input_tokens_details)
+    ? record.input_tokens_details as JsonObject
+    : {};
+  const promptTokens = numberField(record.prompt_tokens) ??
+    numberField(record.input_tokens) ?? estimatePromptTokens(request);
+  const completionTokens = numberField(record.completion_tokens) ??
+    numberField(record.output_tokens) ?? 0;
+  const systemPromptTokens = estimateSystemPromptTokens(request);
+  const currentMessageTokens = estimateCurrentMessageTokens(request);
   const toolDefinitionsTokens = estimateToolDefinitionTokens(request);
-  const toolResultTokens = estimateToolResultTokens(request.messages);
+  const toolResultTokens = estimateToolResultTokens(request);
   const assistantResponseTokens = estimateAssistantResponseTokens(record);
   const knownPromptTokens = systemPromptTokens + currentMessageTokens +
     toolDefinitionsTokens + toolResultTokens;
@@ -3011,7 +3451,8 @@ function augmentTokenUsage(
   return {
     input_tokens: promptTokens,
     output_tokens: completionTokens,
-    cache_read_input_tokens: numberField(record.cached_tokens) ?? 0,
+    cache_read_input_tokens: numberField(record.cached_tokens) ??
+      numberField(inputDetails.cached_tokens) ?? 0,
     cache_creation_input_tokens: 0,
     system_prompt_tokens: systemPromptTokens,
     chat_history_tokens: chatHistoryTokens,
@@ -3024,7 +3465,7 @@ function augmentTokenUsage(
   };
 }
 
-function openAIUsage(config: ProxyConfig, request: OpenAIChatRequest, usage: JsonValue): JsonObject {
+function openAIUsage(config: ProxyConfig, request: OpenAIUpstreamRequest, usage: JsonValue): JsonObject {
   const tokenUsage = augmentTokenUsage(config, request, usage);
   const promptTokens = numberField(tokenUsage.input_tokens) ?? 0;
   const completionTokens = numberField(tokenUsage.output_tokens) ?? 0;
@@ -3037,7 +3478,8 @@ function openAIUsage(config: ProxyConfig, request: OpenAIChatRequest, usage: Jso
 
 function openAIHeaders(config: ProxyConfig, stream: boolean): Headers {
   const headers = new Headers();
-  headers.set("authorization", `Bearer ${config.openaiApiKey}`);
+  const apiKey = config.switchApi === "CODEX" ? config.codexApiKey : config.openaiApiKey;
+  headers.set("authorization", `Bearer ${apiKey}`);
   headers.set("content-type", "application/json");
   headers.set("accept", stream ? "text/event-stream" : "application/json");
   if (config.openaiUserAgent) headers.set("user-agent", config.openaiUserAgent);
@@ -3045,7 +3487,97 @@ function openAIHeaders(config: ProxyConfig, stream: boolean): Headers {
 }
 
 function openAIUrl(config: ProxyConfig): string {
+  if (config.switchApi === "CODEX") return `${config.codexBaseUrl}/responses`;
   return `${config.openaiBaseUrl}/chat/completions`;
+}
+
+function activeUpstreamModel(config: ProxyConfig): string {
+  return config.switchApi === "CODEX" ? config.codexModel : config.openaiModel;
+}
+
+function normalizeResponsesUsage(usage: JsonValue): JsonValue {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return usage;
+  const record = usage as JsonObject;
+  if (record.prompt_tokens !== undefined || record.completion_tokens !== undefined) {
+    return record;
+  }
+  return {
+    ...record,
+    prompt_tokens: record.input_tokens ?? 0,
+    completion_tokens: record.output_tokens ?? 0,
+  };
+}
+
+function outputTextFromResponsesContent(content: JsonValue): string {
+  if (!Array.isArray(content)) return text(content);
+  const parts: string[] = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    const type = text(record.type);
+    if (type === "output_text" || type === "input_text" || type === "text") {
+      const value = text(record.text).trim();
+      if (value) parts.push(value);
+    }
+  }
+  return parts.join("\n");
+}
+
+function responsesFunctionCallToChatToolCall(item: JsonObject): JsonObject | undefined {
+  const name = typeof item.name === "string" && item.name ? item.name : "";
+  if (!name) return undefined;
+  const callId = typeof item.call_id === "string" && item.call_id
+    ? item.call_id
+    : typeof item.id === "string" && item.id ? item.id : `call_${crypto.randomUUID()}`;
+  const rawArgs = item.arguments ?? item.input ?? "{}";
+  const args = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs);
+  return {
+    id: callId,
+    type: "function",
+    function: {
+      name,
+      arguments: args,
+    },
+  };
+}
+
+function parseResponsesJson(data: JsonObject): {
+  content: string;
+  toolCalls: JsonObject[];
+  thinking: string[];
+  usage: JsonValue;
+} {
+  const output = Array.isArray(data.output) ? data.output : [];
+  const contentParts: string[] = [];
+  const toolCalls: JsonObject[] = [];
+  const thinking: string[] = [];
+  const directOutputText = text(data.output_text).trim();
+  if (directOutputText) contentParts.push(directOutputText);
+
+  for (const item of output) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    const type = text(record.type);
+    if (type === "message") {
+      const content = outputTextFromResponsesContent(record.content).trim();
+      if (content) contentParts.push(content);
+    } else if (type === "function_call") {
+      const call = responsesFunctionCallToChatToolCall(record);
+      if (call) toolCalls.push(call);
+    } else if (type === "reasoning") {
+      const summary = outputTextFromResponsesContent(record.summary).trim();
+      if (summary) thinking.push(summary);
+      const content = outputTextFromResponsesContent(record.content).trim();
+      if (content) thinking.push(content);
+    }
+  }
+
+  return {
+    content: contentParts.join("\n"),
+    toolCalls,
+    thinking,
+    usage: normalizeResponsesUsage(data.usage),
+  };
 }
 
 function delay(ms: number): Promise<void> {
@@ -3097,18 +3629,28 @@ export async function forwardAugmentJson(
   config: ProxyConfig,
   ctx: RequestContext,
 ): Promise<Response> {
-  const request = buildOpenAIRequest(config, ctx, false);
+  const continuationNudge = continuationControlNudge(ctx);
+  const forceToolChoiceRequired = Boolean(continuationNudge);
+  const request = buildOpenAIRequest(
+    config,
+    ctx,
+    false,
+    continuationNudge,
+    forceToolChoiceRequired,
+  );
   const fallbackPath = workspaceFallbackPath(ctx);
   const readFilePaths = collectReadFilePaths(ctx, fallbackPath);
   logInfo(config, "openai:json:start", {
     requestId: ctx.requestId,
-    model: config.openaiModel,
+    api: config.switchApi,
+    model: activeUpstreamModel(config),
     url: openAIUrl(config),
   });
   logInfo(config, "openai:json:payload", {
     requestId: ctx.requestId,
-    messages: request.messages.length,
-    tools: request.tools?.length ?? 0,
+    messages: requestMessageCount(request),
+    tools: requestToolCount(request),
+    toolChoice: request.tool_choice,
     bytes: JSON.stringify(request).length,
   });
   const requestBody = JSON.stringify(request);
@@ -3202,54 +3744,90 @@ export async function forwardAugmentJson(
     );
   }
 
-  const choices = Array.isArray(data.choices) ? data.choices : [];
-  const first = choices[0];
   let content = "";
   let nodes: JsonObject[] = [];
   let reasoningFallback = "";
-  if (first && typeof first === "object" && !Array.isArray(first)) {
-    const message = (first as JsonObject).message;
-    if (message && typeof message === "object" && !Array.isArray(message)) {
-      const messageRecord = message as JsonObject;
-      content = text(messageRecord.content);
-      const reasoning = collectReasoningFields(messageRecord);
-      reasoningFallback = reasoning.join("\n\n").trim();
-      if (reasoning.length > 0) nodes = [...thinkingNodes(reasoning), ...nodes];
-      const invalidToolCalls = invalidToolCallSummaries(
-        messageRecord.tool_calls,
-        fallbackPath,
-      );
-      const validToolNodes = toolCallsToNodes(
-        messageRecord.tool_calls,
-        1,
-        fallbackPath,
-        undefined,
-        readFilePaths,
-      );
-      const recoveryToolNodes = validToolNodes.length === 0
-        ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1)
-        : [];
-      nodes = [
-        ...nodes,
-        ...(recoveryToolNodes.length > 0 ? recoveryToolNodes : validToolNodes),
-      ];
-      if (nodes.length === 0) {
-        const renderedToolCalls = renderToolCalls(
-          (message as JsonObject).tool_calls,
+  let invalidToolCallsForHint: JsonObject[] = [];
+  const usage = isResponsesRequest(request) ? parseResponsesJson(data).usage : data.usage;
+  if (isResponsesRequest(request)) {
+    const parsed = parseResponsesJson(data);
+    content = parsed.content;
+    reasoningFallback = parsed.thinking.join("\n\n").trim();
+    if (parsed.thinking.length > 0) nodes = [...thinkingNodes(parsed.thinking), ...nodes];
+    const invalidToolCalls = invalidToolCallSummaries(parsed.toolCalls, fallbackPath);
+    const validToolNodes = toolCallsToNodes(
+      parsed.toolCalls,
+      1,
+      fallbackPath,
+      undefined,
+      readFilePaths,
+    );
+    const recoveryToolNodes = validToolNodes.length === 0
+      ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1, fallbackPath)
+      : [];
+    invalidToolCallsForHint = recoveryToolNodes.length > 0 ? [] : invalidToolCalls;
+    nodes = [
+      ...nodes,
+      ...(recoveryToolNodes.length > 0 ? recoveryToolNodes : validToolNodes),
+    ];
+  } else {
+    const choices = Array.isArray(data.choices) ? data.choices : [];
+    const first = choices[0];
+    if (first && typeof first === "object" && !Array.isArray(first)) {
+      const message = (first as JsonObject).message;
+      if (message && typeof message === "object" && !Array.isArray(message)) {
+        const messageRecord = message as JsonObject;
+        content = text(messageRecord.content);
+        const reasoning = collectReasoningFields(messageRecord);
+        reasoningFallback = reasoning.join("\n\n").trim();
+        if (reasoning.length > 0) nodes = [...thinkingNodes(reasoning), ...nodes];
+        const invalidToolCalls = invalidToolCallSummaries(
+          messageRecord.tool_calls,
+          fallbackPath,
         );
-        if (renderedToolCalls) {
-          content = content
-            ? `${content}\n${renderedToolCalls}`
-            : renderedToolCalls;
+        const validToolNodes = toolCallsToNodes(
+          messageRecord.tool_calls,
+          1,
+          fallbackPath,
+          undefined,
+          readFilePaths,
+        );
+        const recoveryToolNodes = validToolNodes.length === 0
+          ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1, fallbackPath)
+          : [];
+        invalidToolCallsForHint = recoveryToolNodes.length > 0 ? [] : invalidToolCalls;
+        nodes = [
+          ...nodes,
+          ...(recoveryToolNodes.length > 0 ? recoveryToolNodes : validToolNodes),
+        ];
+        if (nodes.length === 0) {
+          const renderedToolCalls = renderToolCalls(
+            (message as JsonObject).tool_calls,
+          );
+          if (renderedToolCalls) {
+            content = content
+              ? `${content}\n${renderedToolCalls}`
+              : renderedToolCalls;
+          }
         }
       }
+      content ||= text((first as JsonObject).text);
     }
-    content ||= text((first as JsonObject).text);
   }
 
   const requestId = ctx.requestId;
   const split = splitThinkingTags(content);
-  content = split.visible;
+  const staleRejectedText =
+    invalidToolCallsForHint.length === 0 && hasToolCallRejectedText(split.visible);
+  content = invalidToolCallsForHint.length > 0
+    ? appendInvalidToolCallHint(split.visible, invalidToolCallsForHint)
+    : stripToolCallRejectedTail(split.visible);
+  if (staleRejectedText && nodes.every((node) => !(node as JsonObject).tool_use)) {
+    nodes = [
+      ...nodes,
+      ...recoveryToolNodesForStaleRejectedText(1, fallbackPath),
+    ];
+  }
   if (
     !content && reasoningFallback &&
     nodes.every((node) => !(node as JsonObject).tool_use)
@@ -3268,10 +3846,10 @@ export async function forwardAugmentJson(
     ...(responseNode ? [responseNode] : []),
     ...thinking,
     ...toolNodes,
-    tokenUsageNode(config, request, data.usage),
+    tokenUsageNode(config, request, usage),
   ];
-  const tokenUsage = augmentTokenUsage(config, request, data.usage);
-  const usage = openAIUsage(config, request, data.usage);
+  const tokenUsage = augmentTokenUsage(config, request, usage);
+  const outputUsage = openAIUsage(config, request, usage);
   return jsonResponse({
     text: content,
     response_text: content,
@@ -3280,8 +3858,8 @@ export async function forwardAugmentJson(
     requestId,
     stop_reason: "stop",
     token_usage: tokenUsage,
-    total_tokens: usage.total_tokens,
-    usage,
+    total_tokens: outputUsage.total_tokens,
+    usage: outputUsage,
     nodes,
   });
 }
@@ -3498,6 +4076,7 @@ function parseOpenAIStreamLine(
   line: string,
 ): {
   content?: string;
+  contentFromDone?: boolean;
   thinking?: string[];
   toolCalls?: JsonObject[];
   usage?: JsonValue;
@@ -3510,6 +4089,56 @@ function parseOpenAIStreamLine(
   if (payload === "[DONE]") return { done: true };
   try {
     const data = JSON.parse(payload) as JsonObject;
+    const type = text(data.type);
+    if (type.startsWith("response.")) {
+      if (type === "response.output_text.delta") {
+        return { content: text(data.delta) || undefined };
+      }
+      if (
+        type === "response.reasoning_summary_text.delta" ||
+        type === "response.reasoning_text.delta"
+      ) {
+        const delta = text(data.delta).trim();
+        return delta ? { thinking: [delta] } : {};
+      }
+      if (type === "response.output_item.done") {
+        const item = data.item && typeof data.item === "object" && !Array.isArray(data.item)
+          ? data.item as JsonObject
+          : undefined;
+        if (!item) return {};
+        const itemType = text(item.type);
+        if (itemType === "function_call") {
+          const call = responsesFunctionCallToChatToolCall(item);
+          return call ? { toolCalls: [call] } : {};
+        }
+        if (itemType === "message") {
+          const content = outputTextFromResponsesContent(item.content).trim();
+          return content ? { content, contentFromDone: true } : {};
+        }
+        if (itemType === "reasoning") {
+          const thinking = [
+            outputTextFromResponsesContent(item.summary).trim(),
+            outputTextFromResponsesContent(item.content).trim(),
+          ].filter(Boolean);
+          return thinking.length > 0 ? { thinking } : {};
+        }
+      }
+      if (type === "response.completed") {
+        const response = data.response &&
+            typeof data.response === "object" && !Array.isArray(data.response)
+          ? data.response as JsonObject
+          : {};
+        return {
+          usage: normalizeResponsesUsage(response.usage),
+          done: true,
+          finishReason: text(response.status) || "completed",
+        };
+      }
+      if (type === "response.failed" || type === "response.incomplete") {
+        return { done: true, finishReason: type };
+      }
+      return {};
+    }
     const usage = data.usage;
     const choices = Array.isArray(data.choices) ? data.choices : [];
     const first = choices[0];
@@ -3548,13 +4177,7 @@ export async function forwardAugmentStream(
     });
     return compactStreamResponse(config, ctx, compactSummary);
   }
-  const continuationNudge = shouldRetryStalledContinuation(ctx)
-    ? [
-      "Continuation control: do not stop after a brief status update.",
-      "If the task is not fully complete, call the next appropriate tool now.",
-      "Only produce a final natural-language answer when there is no concrete tool action left to take.",
-    ].join(" ")
-    : undefined;
+  const continuationNudge = continuationControlNudge(ctx);
   const forceToolChoiceRequired = Boolean(continuationNudge);
   const request = buildOpenAIRequest(
     config,
@@ -3582,6 +4205,7 @@ export async function forwardAugmentStream(
       let upstreamContentChars = 0;
       let streamUsage: JsonValue | undefined;
       let finishReason = "";
+      let staleRejectedStreamText = false;
       let closed = false;
       const safeEnqueue = (value: JsonObject) => {
         if (closed) return;
@@ -3614,6 +4238,34 @@ export async function forwardAugmentStream(
           ...extra,
         });
         finish();
+      };
+      const enqueueVisibleText = (visible: string) => {
+        if (!visible) return;
+        if (staleRejectedStreamText) return;
+        const candidate = visibleText + visible;
+        if (hasToolCallRejectedText(candidate)) {
+          staleRejectedStreamText = true;
+          const stripped = stripToolCallRejectedTail(candidate);
+          const delta = stripped.startsWith(visibleText)
+            ? stripped.slice(visibleText.length)
+            : "";
+          visibleText = stripped;
+          if (!delta) return;
+          emittedVisibleText = true;
+          safeEnqueue({
+            text: delta,
+            delta,
+            request_id: requestId,
+          });
+          return;
+        }
+        emittedVisibleText = true;
+        visibleText = candidate;
+        safeEnqueue({
+          text: visible,
+          delta: visible,
+          request_id: requestId,
+        });
       };
       const finish = () => {
         if (closed) return;
@@ -3654,13 +4306,15 @@ export async function forwardAugmentStream(
           let upstreamAttempts = 0;
           logInfo(config, "openai:stream:start", {
             requestId,
-            model: config.openaiModel,
+            api: config.switchApi,
+            model: activeUpstreamModel(config),
             url: openAIUrl(config),
           });
           logInfo(config, "openai:stream:payload", {
             requestId,
-            messages: request.messages.length,
-            tools: request.tools?.length ?? 0,
+            messages: requestMessageCount(request),
+            tools: requestToolCount(request),
+            toolChoice: request.tool_choice,
             bytes: JSON.stringify(request).length,
           });
           let requestBody = JSON.stringify(request);
@@ -3718,7 +4372,7 @@ export async function forwardAugmentStream(
             ) {
               const fallbackRequest = {
                 ...request,
-                tool_choice: "auto" as const,
+                tool_choice: "auto",
               };
               requestBody = JSON.stringify(fallbackRequest);
               usedToolChoiceFallback = true;
@@ -3817,31 +4471,16 @@ export async function forwardAugmentStream(
                 thinkingBuffer.push(...parsed.thinking);
               }
               if (parsed.content) {
+                if (parsed.contentFromDone && emittedVisibleText) continue;
                 upstreamChunks += 1;
                 upstreamContentChars += parsed.content.length;
                 const visible = thinkingFilter.push(parsed.content);
-                if (visible) {
-                  emittedVisibleText = true;
-                  visibleText += visible;
-                  safeEnqueue({
-                    text: visible,
-                    delta: visible,
-                    request_id: requestId,
-                  });
-                }
+                enqueueVisibleText(visible);
               }
             }
           }
           const flushed = thinkingFilter.flush();
-          if (flushed.visible) {
-            emittedVisibleText = true;
-            visibleText += flushed.visible;
-            safeEnqueue({
-              text: flushed.visible,
-              delta: flushed.visible,
-              request_id: requestId,
-            });
-          }
+          enqueueVisibleText(flushed.visible);
           const launchCommandFallback = inferLaunchCommandFromContext(ctx);
           const mergedToolCalls = mergeStreamToolCalls(streamToolCalls);
           if (streamToolCalls.length > 0) {
@@ -3879,16 +4518,16 @@ export async function forwardAugmentStream(
             readFilePaths,
           );
           const recoveryToolNodes = validToolNodes.length === 0
-            ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1)
+            ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1, fallbackPath)
             : [];
           if (recoveryToolNodes.length > 0) {
             logWarn(config, "openai:stream:invalid-tool-recovery-nodes", {
               requestId,
-              nodes: recoveryToolNodes.map((node) =>
+              nodes: recoveryToolNodes.map((node: JsonObject) =>
                 (node.tool_use as JsonObject | undefined)?.tool_name ??
                   "unknown"
               ),
-              inputs: recoveryToolNodes.map((node) => {
+              inputs: recoveryToolNodes.map((node: JsonObject) => {
                 const input =
                   ((node.tool_use as JsonObject | undefined)?.input_json ??
                     "") as string;
@@ -3896,7 +4535,7 @@ export async function forwardAugmentStream(
               }),
             });
           }
-          const toolNodes = recoveryToolNodes.length > 0
+          let toolNodes = recoveryToolNodes.length > 0
             ? recoveryToolNodes
             : validToolNodes;
           if (validToolNodes.length > 0) {
@@ -3917,7 +4556,7 @@ export async function forwardAugmentStream(
           }
           if (invalidToolCalls.length > 0 && toolNodes.length === 0) {
             const invalidHint = invalidToolCallHint(invalidToolCalls);
-            if (invalidHint) {
+            if (invalidHint && !visibleText.includes(invalidHint)) {
               const hintText = visibleText.trim()
                 ? `\n\n${invalidHint}`
                 : invalidHint;
@@ -3929,6 +4568,18 @@ export async function forwardAugmentStream(
                 request_id: requestId,
               });
             }
+          }
+          if (
+            invalidToolCalls.length === 0 &&
+            toolNodes.length === 0 &&
+            (staleRejectedStreamText || hasToolCallRejectedText(visibleText))
+          ) {
+            visibleText = stripToolCallRejectedTail(visibleText);
+            toolNodes = recoveryToolNodesForStaleRejectedText(1, fallbackPath);
+            logWarn(config, "openai:stream:stale-rejection-recovery-node", {
+              requestId,
+              fallbackPath,
+            });
           }
           const allThinking = [...thinkingBuffer, ...flushed.thinking].filter((
             item,

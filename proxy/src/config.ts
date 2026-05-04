@@ -1,4 +1,4 @@
-import type { ProxyConfig } from "./types.ts";
+import type { ProxyConfig, SwitchApi } from "./types.ts";
 
 function env(name: string, fallback = ""): string {
   return Deno.env.get(name)?.trim() || fallback;
@@ -15,6 +15,13 @@ function envBoolean(name: string, fallback: boolean): boolean {
   if (["1", "true", "yes", "on"].includes(value)) return true;
   if (["0", "false", "no", "off"].includes(value)) return false;
   return fallback;
+}
+
+function normalizeSwitchApi(value: string): SwitchApi {
+  const normalized = value.trim().toUpperCase();
+  if (!normalized || normalized === "OPENAI") return "OPENAI";
+  if (normalized === "CODEX") return "CODEX";
+  throw new Error("SWITCH_API must be OPENAI or CODEX");
 }
 
 function normalizeBaseUrl(value: string): string {
@@ -42,16 +49,30 @@ const defaultHistorySummaryPrompt = [
 ].join("\n");
 
 export function loadConfig(): ProxyConfig {
+  const switchApi = normalizeSwitchApi(
+    env("SWITCH_API") || env("SWTICHAPI") || env("SWITCHAPI") || "OPENAI",
+  );
   const openaiApiKey = env("OPENAI_API_KEY");
-  if (!openaiApiKey) {
+  const codexApiKey = env("CODEX_API_KEY");
+  const codexBaseUrl = env("CODEX_BASE_URL");
+  if (switchApi === "OPENAI" && !openaiApiKey) {
     throw new Error("OPENAI_API_KEY is required");
+  }
+  if (switchApi === "CODEX") {
+    if (!codexBaseUrl) throw new Error("CODEX_BASE_URL is required when SWITCH_API=CODEX");
+    if (!codexApiKey) throw new Error("CODEX_API_KEY is required when SWITCH_API=CODEX");
+    if (!env("CODEX_MODEL")) throw new Error("CODEX_MODEL is required when SWITCH_API=CODEX");
   }
 
   return {
     port: envNumber("PROXY_PORT", 8765),
+    switchApi,
     openaiBaseUrl: normalizeBaseUrl(env("OPENAI_BASE_URL", "https://api.openai.com")),
+    codexBaseUrl: codexBaseUrl ? normalizeBaseUrl(codexBaseUrl) : "",
     openaiApiKey,
+    codexApiKey,
     openaiModel: env("OPENAI_MODEL", "gpt-4o-mini"),
+    codexModel: env("CODEX_MODEL"),
     openaiUserAgent: env("OPENAI_USER_AGENT", "codex-cli"),
     upstreamAppName: env("OPENAI_UPSTREAM_APP_NAME", "Codex"),
     sanitizeUpstreamPrompts: envBoolean("OPENAI_SANITIZE_UPSTREAM_PROMPTS", false),

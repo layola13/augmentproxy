@@ -50,6 +50,8 @@ OPENAI_SANITIZE_UPSTREAM_PROMPTS=false
 ```
 
 - `OPENAI_USER_AGENT`：设置转发到 `/chat/completions` 的 `user-agent`。
+- `SWITCH_API=OPENAI|CODEX`：选择上游协议；`OPENAI` 使用 `OPENAI_BASE_URL/chat/completions`，`CODEX` 使用 `CODEX_BASE_URL/responses`。
+- `OPENAI_API_KEY/OPENAI_MODEL` 和 `CODEX_API_KEY/CODEX_MODEL` 分开配置，不互相 fallback。
 - `OPENAI_SANITIZE_UPSTREAM_PROMPTS=false`：默认不改 prompt，避免误改真实路径、目录名、文件名。
 - 本地 Augment 协议、登录模拟、工具节点返回不变；只影响发给大模型供应商的请求。
 

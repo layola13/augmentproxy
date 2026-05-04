@@ -14,9 +14,13 @@ function assertEquals(actual: unknown, expected: unknown): void {
 function testConfig(): ProxyConfig {
   return {
     port: 0,
+    switchApi: "OPENAI",
     openaiBaseUrl: "https://example.test/v1",
+    codexBaseUrl: "https://codex.example.test/v1",
     openaiApiKey: "test-key",
+    codexApiKey: "codex-test-key",
     openaiModel: "test-model",
+    codexModel: "codex-test-model",
     openaiUserAgent: "test-agent",
     upstreamAppName: "test",
     sanitizeUpstreamPrompts: false,
@@ -55,6 +59,66 @@ function testContext(body: JsonObject): RequestContext {
 
 function workspaceContext(): JsonObject {
   return { path: "/home/vscode/projects/augmentproxy/proxy" };
+}
+
+function ideWorkspaceContext(root: string): JsonObject {
+  return {
+    nodes: [{
+      id: 1,
+      type: 4,
+      ide_state_node: {
+        workspace_folders: [{
+          repository_root: root,
+          folder_root: root,
+        }],
+        workspace_folders_unchanged: true,
+        current_terminal: {
+          terminal_id: 0,
+          current_working_directory: root,
+        },
+      },
+    }],
+  };
+}
+
+function toolDefinitions(): JsonObject[] {
+  return [{
+    name: "view",
+    description: "Read a file or directory",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        type: { type: "string" },
+      },
+      required: ["path"],
+    },
+  }];
+}
+
+function historyAfterToolResult(content = "Read file result\n"): JsonObject[] {
+  return [{
+    response_nodes: [{
+      id: 1,
+      type: 5,
+      tool_use: {
+        tool_name: "view",
+        tool_use_id: "call_view_previous",
+        input_json: JSON.stringify({
+          path: "/home/vscode/projects/augmentproxy/proxy",
+          type: "directory",
+        }),
+      },
+    }],
+    request_nodes: [{
+      id: 2,
+      type: 1,
+      tool_result_node: {
+        tool_use_id: "call_view_previous",
+        content,
+      },
+    }],
+  }];
 }
 
 function contextAfterView(path: string): JsonObject {
@@ -161,6 +225,41 @@ async function withFakeFetch(
   }
 }
 
+async function withCaptureFetch(
+  response: Response,
+  run: (requests: { url: string; headers: Headers; body: JsonObject }[]) => Promise<void>,
+): Promise<void> {
+  const requests: { url: string; headers: Headers; body: JsonObject }[] = [];
+  const originalFetch = globalThis.fetch;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch =
+    ((input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({
+        url: String(input),
+        headers: new Headers(init?.headers),
+        body: JSON.parse(String(init?.body ?? "{}")) as JsonObject,
+      });
+      return Promise.resolve(response.clone());
+    }) as typeof fetch;
+  try {
+    await run(requests);
+  } finally {
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+  }
+}
+
+function codexConfig(): ProxyConfig {
+  return {
+    ...testConfig(),
+    switchApi: "CODEX",
+    openaiBaseUrl: "https://openai.example.test/v1",
+    codexBaseUrl: "https://codex.example.test/v1",
+    openaiApiKey: "openai-key",
+    codexApiKey: "codex-key",
+    openaiModel: "openai-model",
+    codexModel: "codex-model",
+  };
+}
+
 async function makeTempTargetPath(suffix = ".txt"): Promise<string> {
   const path = await Deno.makeTempFile({
     dir: "/home/vscode/projects/augmentproxy/proxy",
@@ -253,6 +352,557 @@ function hasToolName(
   return scan(responseBody);
 }
 
+function responseTextContains(
+  responseBody: JsonObject | JsonObject[],
+  needle: string,
+): boolean {
+  const scan = (value: JsonObject | JsonObject[]): boolean => {
+    if (Array.isArray(value)) return value.some((item) => scan(item));
+    if (typeof value.text === "string" && value.text.includes(needle)) return true;
+    if (
+      typeof value.response_text === "string" &&
+      value.response_text.includes(needle)
+    ) return true;
+    const nodes = Array.isArray(value.nodes) ? value.nodes : [];
+    for (const node of nodes) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      if (typeof (node as JsonObject).content === "string" && ((node as JsonObject).content as string).includes(needle)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return scan(responseBody);
+}
+
+Deno.test("openai switch uses chat completions endpoint and OPENAI credentials", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "openai ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({ ...workspaceContext(), message: "hello" }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(body.text, "openai ok");
+      assertEquals(requests.length, 1);
+      assertEquals(requests[0].url, "https://example.test/v1/chat/completions");
+      assertEquals(requests[0].headers.get("authorization"), "Bearer test-key");
+      assertEquals(requests[0].body.model, "test-model");
+      assertEquals(Array.isArray(requests[0].body.messages), true);
+    },
+  );
+});
+
+Deno.test("codex switch uses responses endpoint and CODEX credentials/model", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "codex ok" }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext({ ...workspaceContext(), message: "hello" }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(body.text, "codex ok");
+      assertEquals(requests.length, 1);
+      assertEquals(requests[0].url, "https://codex.example.test/v1/responses");
+      assertEquals(requests[0].headers.get("authorization"), "Bearer codex-key");
+      assertEquals(requests[0].body.model, "codex-model");
+      assertEquals(Array.isArray(requests[0].body.input), true);
+      assertEquals(typeof requests[0].body.instructions, "string");
+      assertEquals(requests[0].body.stream, false);
+    },
+  );
+});
+
+Deno.test("codex instructions do not mandate Next Steps final answers", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: toolDefinitions(),
+          message: "inspect the project",
+        }),
+      );
+      const instructions = String(requests[0].body.instructions ?? "");
+      assertEquals(instructions.includes("Final-answer format is mandatory"), false);
+      assertEquals(instructions.includes("Do not omit this section"), false);
+      assertEquals(
+        instructions.includes("While concrete tool work remains, use tools instead of appending follow-up suggestions"),
+        true,
+      );
+      assertEquals(instructions.includes("Next Steps"), false);
+    },
+  );
+});
+
+Deno.test("openai continuation with recent history tool result requires next tool call", async () => {
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({
+            choices: [{ delta: {} }],
+            usage: { prompt_tokens: 8, completion_tokens: 0 },
+          })
+        }`,
+        "data: [DONE]",
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: toolDefinitions(),
+          chat_history: historyAfterToolResult(),
+          message: "",
+        }),
+      );
+      await collectStreamObjects(response);
+      assertEquals(requests[0].body.tool_choice, "required");
+      const messagesText = JSON.stringify(requests[0].body.messages);
+      assertEquals(messagesText.includes("Continuation control"), true);
+    },
+  );
+});
+
+Deno.test("codex continuation with tool results requires next tool call", async () => {
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: "resp-stream",
+              status: "completed",
+              usage: { input_tokens: 8, output_tokens: 0, total_tokens: 8 },
+            },
+          })
+        }`,
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentStream(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: toolDefinitions(),
+          nodes: [{
+            id: 1,
+            type: 1,
+            tool_result_node: {
+              tool_use_id: "call_view_previous",
+              content: "Read file result\n",
+            },
+          }],
+        }),
+      );
+      await collectStreamObjects(response);
+      assertEquals(requests[0].body.tool_choice, "required");
+      const inputText = JSON.stringify(requests[0].body.input);
+      assertEquals(inputText.includes("CODEX tool-continuation control"), true);
+      assertEquals(inputText.includes("Do not include follow-up suggestions"), true);
+      assertEquals(inputText.includes("Next Steps"), false);
+    },
+  );
+});
+
+Deno.test("codex agent task with user text requires first tool call", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          mode: "CLI_AGENT",
+          tool_definitions: toolDefinitions(),
+          nodes: [{
+            id: 1,
+            type: 0,
+            text_node: {
+              content: "Implement the macro layer and run tests.",
+            },
+          }],
+        }),
+      );
+      assertEquals(requests[0].body.tool_choice, "required");
+      const inputText = JSON.stringify(requests[0].body.input);
+      assertEquals(inputText.includes("CODEX tool-continuation control"), true);
+      assertEquals(inputText.includes("Implement the macro layer"), true);
+    },
+  );
+});
+
+Deno.test("openai request strips historical stale tool rejection text", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: toolDefinitions(),
+          chat_history: [{
+            response_nodes: [{
+              content:
+                "Let me write the fix script first.\n\nTool call rejected (save-file): Tool save-file path is outside the allowed scope.",
+            }],
+          }],
+          message: "continue",
+        }),
+      );
+      const messagesText = JSON.stringify(requests[0].body.messages);
+      assertEquals(messagesText.includes("Let me write the fix script first."), true);
+      assertEquals(messagesText.includes("Tool call rejected"), false);
+      assertEquals(messagesText.includes("outside the allowed scope"), false);
+    },
+  );
+});
+
+Deno.test("codex request strips historical assistant Next Steps sections", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: toolDefinitions(),
+          chat_history: [{
+            request_nodes: [{
+              text_node: { content: "continue implementing" },
+            }],
+            response_nodes: [{
+              content:
+                "I will keep working.\n\n### Next Steps\n1. Read the file.\n2. Edit it.\n",
+            }],
+          }],
+          message: "continue",
+        }),
+      );
+      const inputText = JSON.stringify(requests[0].body.input);
+      assertEquals(inputText.includes("I will keep working."), true);
+      assertEquals(inputText.includes("Read the file."), false);
+      assertEquals(inputText.includes("Next Steps"), false);
+    },
+  );
+});
+
+Deno.test("codex json function_call emits Augment tool node", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-tool",
+          output: [{
+            type: "function_call",
+            call_id: "call_view",
+            name: "view",
+            arguments: JSON.stringify({
+              path: "/home/vscode/projects/augmentproxy/proxy",
+              type: "directory",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "view"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("openai json invalid save-file recovers with view tool", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_openai_bad_save",
+        type: "function",
+        function: {
+          name: "save-file",
+          arguments: JSON.stringify({
+            path: "/tmp/outside.py",
+            file_content: "print('bad')\n",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "save-file"), false);
+      assertEquals(hasToolName(body, "view"), true);
+      assertEquals(responseTextContains(body, "Tool call rejected"), false);
+      const input = firstToolInput(body);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("codex json invalid save-file recovers with view tool", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-bad-save",
+          output: [{
+            type: "function_call",
+            call_id: "call_codex_bad_save_json",
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: "/tmp/outside.py",
+              file_content: "print('bad')\n",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "save-file"), false);
+      assertEquals(hasToolName(body, "view"), true);
+      assertEquals(responseTextContains(body, "Tool call rejected"), false);
+      const input = firstToolInput(body);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("codex stream parses Responses SSE text and function_call", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        [
+          `data: ${
+            JSON.stringify({
+              type: "response.created",
+              response: { id: "resp-stream" },
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              type: "response.output_text.delta",
+              delta: "codex ",
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              type: "response.output_text.delta",
+              delta: "stream",
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: "call_view_stream",
+                name: "view",
+                arguments: JSON.stringify({
+                  path: "/home/vscode/projects/augmentproxy/proxy",
+                  type: "directory",
+                }),
+              },
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              type: "response.completed",
+              response: {
+                id: "resp-stream",
+                usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 },
+              },
+            })
+          }`,
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    async () => {
+      const response = await forwardAugmentStream(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const objects = await collectStreamObjects(response);
+      const final = objects.find((item) => item.done === true);
+      assertEquals(final?.response_text, "codex stream");
+      assertEquals(hasToolName(objects, "view"), true);
+    },
+  );
+});
+
+Deno.test("openai stream stale rejection text recovers with view tool", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        [
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: {
+                  content:
+                    "Let me write the fix script first.\n\nTool call rejected (save-file): Tool save-file path is outside the allowed scope.",
+                },
+              }],
+            })
+          }`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "view"), true);
+      assertEquals(responseTextContains(objects, "Tool call rejected"), false);
+      const final = objects.find((item) => item.done === true);
+      assertEquals(final?.response_text, "Let me write the fix script first.");
+      const input = firstToolInput(objects);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("codex stream invalid save-file recovers with view tool", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        [
+          `data: ${
+            JSON.stringify({
+              type: "response.output_item.done",
+              item: {
+                type: "function_call",
+                call_id: "call_codex_bad_save",
+                name: "save-file",
+                arguments: JSON.stringify({
+                  path: "/tmp/outside.py",
+                  file_content: "print('bad')\n",
+                }),
+              },
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              type: "response.completed",
+              response: {
+                id: "resp-stream",
+                status: "completed",
+                usage: { input_tokens: 8, output_tokens: 4, total_tokens: 12 },
+              },
+            })
+          }`,
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    async () => {
+      const response = await forwardAugmentStream(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "save-file"), false);
+      assertEquals(hasToolName(objects, "view"), true);
+      assertEquals(responseTextContains(objects, "Tool call rejected"), false);
+      const input = firstToolInput(objects);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
 Deno.test("str-replace without prior view is redirected to file read", async () => {
   const path = await makeTempTargetPath();
   await Deno.writeTextFile(path, "alpha\n");
@@ -334,6 +984,224 @@ Deno.test("str-replace after prior view is allowed", async () => {
   } finally {
     await Deno.remove(path).catch(() => undefined);
   }
+});
+
+Deno.test("str-replace relative path is resolved from IDE workspace root", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-ide-root-",
+  });
+  const nested = `${root}/src/haxe/state`;
+  const path = `${nested}/State.hx`;
+  await Deno.mkdir(nested, { recursive: true });
+  await Deno.writeTextFile(path, "alpha\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_relative_edit",
+          type: "function",
+          function: {
+            name: "str-replace-editor",
+            arguments: JSON.stringify({
+              command: "str_replace",
+              path: "src/haxe/state/State.hx",
+              str_replace_entries: [{
+                old_str: "alpha\n",
+                new_str: "beta\n",
+              }],
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_view_relative_target",
+                  input_json: JSON.stringify({ path, type: "file" }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_view_relative_target",
+                  content: "alpha\n",
+                },
+              }],
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "str-replace-editor"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+        assertEquals(responseTextContains(body, "Tool call rejected"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("historical relative str-replace is normalized before upstream replay", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-history-root-",
+  });
+  const nested = `${root}/src/haxe/state`;
+  const path = `${nested}/State.hx`;
+  await Deno.mkdir(nested, { recursive: true });
+  await Deno.writeTextFile(path, "beta\n");
+  try {
+    await withCaptureFetch(
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "ok" } }],
+          usage: { prompt_tokens: 5, completion_tokens: 2 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+      async (requests) => {
+        await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "str-replace-editor",
+                  tool_use_id: "call_history_relative_edit",
+                  input_json: JSON.stringify({
+                    command: "str_replace",
+                    path: "src/haxe/state/State.hx",
+                    str_replace_entries: [{
+                      old_str: "alpha\n",
+                      new_str: "beta\n",
+                    }],
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_history_relative_edit",
+                  content: JSON.stringify({
+                    path: "src/haxe/state/State.hx",
+                    action: "Update",
+                  }),
+                },
+              }],
+            }],
+            message: "continue",
+          }),
+        );
+        const messagesText = JSON.stringify(requests[0].body.messages);
+        assertEquals(messagesText.includes("\"path\":\"src/haxe/state/State.hx\""), false);
+        assertEquals(messagesText.includes(path), true);
+        assertEquals(messagesText.includes("Tool call rejected"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("str-replace does not repair missing path to generated sibling", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-edit-sibling-",
+  });
+  const existing = `${directoryPath}/plan-bevy-input-module.md`;
+  const generated = `${directoryPath}/plan-bevy-input-module-2025-02-20.md`;
+  await Deno.writeTextFile(existing, "alpha\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_edit_generated_sibling",
+          type: "function",
+          function: {
+            name: "str-replace-editor",
+            arguments: JSON.stringify({
+              command: "str_replace",
+              path: generated,
+              str_replace_entries: [{
+                old_str: "alpha\n",
+                new_str: "beta\n",
+                old_str_start_line_number: 1,
+                old_str_end_line_number: 1,
+              }],
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(contextAfterView(existing)),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "str-replace-editor"), false);
+        assertEquals(hasToolName(body, "view"), true);
+        assertEquals(responseTextContains(body, "Tool call rejected"), false);
+        const input = firstToolInput(body);
+        assertEquals(input.path, directoryPath);
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("str-replace outside scope recovers with view tool without rejection text", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_edit_outside_scope",
+        type: "function",
+        function: {
+          name: "str-replace-editor",
+          arguments: JSON.stringify({
+            command: "str_replace",
+            path: "/tmp/outside.hx",
+            str_replace_entries: [{
+              old_str: "alpha\n",
+              new_str: "beta\n",
+            }],
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "str-replace-editor"), false);
+      assertEquals(hasToolName(body, "view"), true);
+      assertEquals(responseTextContains(body, "Tool call rejected"), false);
+      const input = firstToolInput(body);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+    },
+  );
 });
 
 Deno.test("stream str-replace without prior view is redirected to file read", async () => {
@@ -1124,6 +1992,116 @@ Deno.test("save-file with relative path is repaired via workspace fallback", asy
   }
 });
 
+Deno.test("save-file with generated _new sibling path is rejected", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-sibling-",
+  });
+  const existing = `${directoryPath}/plan-bevy-input-module.md`;
+  const generated = `${directoryPath}/plan-bevy-input-module_new.md`;
+  await Deno.writeTextFile(existing, "existing\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_generated_sibling",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: generated,
+              file_content: "new copy\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: directoryPath }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "save-file"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file with generated date sibling path is rejected", async () => {
+  const directoryPath = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-date-sibling-",
+  });
+  const existing = `${directoryPath}/plan-bevy-input-module.md`;
+  const generated = `${directoryPath}/plan-bevy-input-module-2025-02-20.md`;
+  await Deno.writeTextFile(existing, "existing\n");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_date_sibling",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: generated,
+              file_content: "dated copy\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: directoryPath }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "save-file"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("save-file with embedded explanatory path is repaired", async () => {
+  const path = await makeTempTargetPath(".py");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_embedded_path",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: `Let me write the fix script first: ${path}`,
+              file_content: "print('ok')\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(workspaceContext()),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "save-file"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, path);
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
 Deno.test("save-file without content is rejected", async () => {
   const path = await makeTempTargetPath();
   try {
@@ -1682,6 +2660,8 @@ Deno.test("stream save-file with directory path is rejected", async () => {
         );
         const objects = await collectStreamObjects(response);
         assertEquals(hasToolName(objects, "save-file"), false);
+        assertEquals(hasToolName(objects, "view"), true);
+        assertEquals(responseTextContains(objects, "Tool call rejected"), false);
       },
     );
   } finally {
@@ -1893,6 +2873,33 @@ Deno.test("write-process normalizes terminal and input aliases", async () => {
       const input = firstToolInput(body);
       assertEquals(input.terminal_id, 2);
       assertEquals(input.input_text, "continue\n");
+    },
+  );
+});
+
+Deno.test("invalid read-process recovers with list-processes without rejection text", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_read_process_missing_terminal",
+        type: "function",
+        function: {
+          name: "read-process",
+          arguments: JSON.stringify({ wait: false, max_wait_seconds: 1 }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "read-process"), false);
+      assertEquals(hasToolName(body, "list-processes"), true);
+      assertEquals(responseTextContains(body, "Tool call rejected"), false);
+      assertEquals(firstToolInput(body), {});
     },
   );
 });

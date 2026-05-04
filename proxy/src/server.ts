@@ -5,10 +5,13 @@ import { routeAugment } from "./augment-router.ts";
 import { logError, logInfo } from "./logger.ts";
 
 const config = await loadConfigFromEnvFile();
+const activeBaseUrl = config.switchApi === "CODEX" ? config.codexBaseUrl : config.openaiBaseUrl;
+const activeModel = config.switchApi === "CODEX" ? config.codexModel : config.openaiModel;
 
 console.log(`Augment intercept proxy listening on http://127.0.0.1:${config.port}`);
-console.log(`OpenAI upstream: ${config.openaiBaseUrl}`);
-console.log(`OpenAI model: ${config.openaiModel}`);
+console.log(`Upstream API: ${config.switchApi}`);
+console.log(`Upstream base URL: ${activeBaseUrl}`);
+console.log(`Upstream model: ${activeModel}`);
 console.log(`Request logs: ${config.requestLogDir}`);
 
 Deno.serve({ port: config.port }, async (request) => {
