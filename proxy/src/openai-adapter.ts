@@ -1103,6 +1103,12 @@ function normalizeToolArguments(
   if (
     (toolName === "launch-process") && typeof args.max_wait_seconds !== "number"
   ) args.max_wait_seconds = 120;
+  if (
+    toolName === "read-process" || toolName === "write-process" ||
+    toolName === "kill-process"
+  ) {
+    normalizeProcessToolArguments(args);
+  }
   if (toolName === "str-replace-editor") {
     normalizeStrReplaceToolArguments(args, argumentsJson);
     normalizeStrReplacePath(args, fallbackPath);
@@ -1154,6 +1160,28 @@ function normalizeSaveFileArguments(
   if (typeof args.path !== "string" && fallbackPath) {
     args.path = repairViewPath(fallbackPath, fallbackPath);
   }
+}
+
+function normalizeProcessToolArguments(args: JsonObject): void {
+  if (args.terminal_id === undefined || args.terminal_id === null || args.terminal_id === "") {
+    const terminalAlias = args.session_id ?? args.terminal ?? args.terminalId ??
+      args.terminalID;
+    if (
+      typeof terminalAlias === "number" ||
+      typeof terminalAlias === "string"
+    ) args.terminal_id = terminalAlias;
+  }
+  if (typeof args.terminal_id === "string") {
+    const trimmed = args.terminal_id.trim();
+    if (/^\d+$/.test(trimmed)) args.terminal_id = Number(trimmed);
+    else args.terminal_id = trimmed;
+  }
+  if (args.input_text === undefined || args.input_text === null) {
+    const inputAlias = args.input ?? args.chars ?? args.text ?? args.stdin;
+    if (typeof inputAlias === "string") args.input_text = inputAlias;
+  }
+  if (typeof args.wait !== "boolean") args.wait = true;
+  if (typeof args.max_wait_seconds !== "number") args.max_wait_seconds = 120;
 }
 
 function normalizeTaskToolArguments(

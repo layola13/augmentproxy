@@ -677,3 +677,425 @@ Deno.test("view path supports markdown/uri/line-suffixed references", async () =
     await Deno.remove(filePath).catch(() => undefined);
   }
 });
+
+Deno.test("stream distributes anonymous tool fragments across unresolved calls", async () => {
+  const pathA = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-a-",
+    suffix: ".txt",
+  });
+  const pathB = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-b-",
+    suffix: ".txt",
+  });
+  await Deno.writeTextFile(pathA, "alpha\n");
+  await Deno.writeTextFile(pathB, "beta\n");
+  try {
+    await withFakeFetch(
+      () =>
+        new Response(
+          [
+            // Two unresolved calls with ids but no initial arguments.
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        id: "call_a",
+                        index: 0,
+                        type: "function",
+                        function: { name: "view", arguments: "" },
+                      },
+                      {
+                        id: "call_b",
+                        index: 1,
+                        type: "function",
+                        function: { name: "view", arguments: "" },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            // Anonymous fragments should be distributed, not collapsed.
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        type: "function",
+                        function: {
+                          name: "view",
+                          arguments: `{"path":"${pathA}","type":"file"}`,
+                        },
+                      },
+                      {
+                        type: "function",
+                        function: {
+                          name: "view",
+                          arguments: `{"path":"${pathB}","type":"file"}`,
+                        },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const inputs = toolInputs(await collectStreamObjects(response));
+        assertEquals(inputs.length, 2);
+        const paths = inputs
+          .map((input) => input.path)
+          .filter((value): value is string => typeof value === "string")
+          .sort();
+        assertEquals(paths, [pathA, pathB].sort());
+      },
+    );
+  } finally {
+    await Deno.remove(pathA).catch(() => undefined);
+    await Deno.remove(pathB).catch(() => undefined);
+  }
+});
+
+Deno.test("stream keeps repeated single-thread view reads to same file", async () => {
+  const filePath = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-view-repeat-",
+    suffix: ".txt",
+  });
+  await Deno.writeTextFile(filePath, "hello\n");
+  try {
+    await withFakeFetch(
+      () =>
+        new Response(
+          [
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        id: "call_view_1",
+                        index: 0,
+                        type: "function",
+                        function: {
+                          name: "view",
+                          arguments: JSON.stringify({
+                            path: filePath,
+                            type: "file",
+                          }),
+                        },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        id: "call_view_2",
+                        index: 1,
+                        type: "function",
+                        function: {
+                          name: "view",
+                          arguments: JSON.stringify({
+                            path: filePath,
+                            type: "file",
+                          }),
+                        },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const inputs = toolInputs(await collectStreamObjects(response));
+        assertEquals(inputs.length, 2);
+        assertEquals(inputs[0].path, filePath);
+        assertEquals(inputs[1].path, filePath);
+      },
+    );
+  } finally {
+    await Deno.remove(filePath).catch(() => undefined);
+  }
+});
+
+Deno.test("stream keeps repeated single-thread save-file writes to same file", async () => {
+  const path = await Deno.makeTempFile({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-save-repeat-",
+    suffix: ".txt",
+  });
+  try {
+    await withFakeFetch(
+      () =>
+        new Response(
+          [
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        id: "call_save_1",
+                        index: 0,
+                        type: "function",
+                        function: {
+                          name: "save-file",
+                          arguments: JSON.stringify({
+                            path,
+                            content: "first\n",
+                          }),
+                        },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            `data: ${
+              JSON.stringify({
+                choices: [{
+                  delta: {
+                    tool_calls: [
+                      {
+                        id: "call_save_2",
+                        index: 1,
+                        type: "function",
+                        function: {
+                          name: "save-file",
+                          arguments: JSON.stringify({
+                            path,
+                            content: "second\n",
+                          }),
+                        },
+                      },
+                    ],
+                  },
+                }],
+              })
+            }`,
+            "data: [DONE]",
+            "",
+          ].join("\n\n"),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+        );
+        const inputs = toolInputs(await collectStreamObjects(response));
+        assertEquals(inputs.length, 2);
+        assertEquals(inputs[0].path, path);
+        assertEquals(inputs[1].path, path);
+        assertEquals(inputs[0].content, "first\n");
+        assertEquals(inputs[1].content, "second\n");
+      },
+    );
+  } finally {
+    await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("write-process normalizes write_stdin style session_id and chars", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_write_stdin",
+        type: "function",
+        function: {
+          name: "write-process",
+          arguments: JSON.stringify({
+            session_id: "77126",
+            chars: "",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+      );
+      const body = await response.json() as JsonObject;
+      const input = firstToolInput(body);
+      assertEquals(input.terminal_id, 77126);
+      assertEquals(input.input_text, "");
+    },
+  );
+});
+
+Deno.test("write-process normalizes terminal and input aliases", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_write_alias",
+        type: "function",
+        function: {
+          name: "write-process",
+          arguments: JSON.stringify({
+            terminal: "2",
+            input: "continue\n",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+      );
+      const body = await response.json() as JsonObject;
+      const input = firstToolInput(body);
+      assertEquals(input.terminal_id, 2);
+      assertEquals(input.input_text, "continue\n");
+    },
+  );
+});
+
+Deno.test("stream keeps repeated write-process writes to same terminal", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        [
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: {
+                  tool_calls: [
+                    {
+                      id: "call_write_1",
+                      index: 0,
+                      type: "function",
+                      function: {
+                        name: "write-process",
+                        arguments: JSON.stringify({
+                          session_id: 10205,
+                          chars: "",
+                        }),
+                      },
+                    },
+                  ],
+                },
+              }],
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: {
+                  tool_calls: [
+                    {
+                      id: "call_write_2",
+                      index: 1,
+                      type: "function",
+                      function: {
+                        name: "write-process",
+                        arguments: JSON.stringify({
+                          session_id: 10205,
+                          chars: "continue\n",
+                        }),
+                      },
+                    },
+                  ],
+                },
+              }],
+            })
+          }`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+      );
+      const inputs = toolInputs(await collectStreamObjects(response));
+      assertEquals(inputs.length, 2);
+      assertEquals(inputs[0].terminal_id, 10205);
+      assertEquals(inputs[1].terminal_id, 10205);
+      assertEquals(inputs[0].input_text, "");
+      assertEquals(inputs[1].input_text, "continue\n");
+    },
+  );
+});
+
+Deno.test("stream keeps parallel write-process calls across terminals", async () => {
+  await withFakeOpenAIStreamToolCalls(
+    [
+      {
+        id: "call_write_a",
+        index: 0,
+        type: "function",
+        function: {
+          name: "write-process",
+          arguments: JSON.stringify({
+            session_id: 2,
+            chars: "",
+          }),
+        },
+      },
+      {
+        id: "call_write_b",
+        index: 1,
+        type: "function",
+        function: {
+          name: "write-process",
+          arguments: JSON.stringify({
+            session_id: 3,
+            chars: "go\n",
+          }),
+        },
+      },
+    ],
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({ path: "/home/vscode/projects/augmentproxy/proxy" }),
+      );
+      const inputs = toolInputs(await collectStreamObjects(response));
+      assertEquals(inputs.length, 2);
+      const terminals = inputs
+        .map((input) => input.terminal_id)
+        .filter((value): value is number => typeof value === "number")
+        .sort((a, b) => a - b);
+      assertEquals(terminals, [2, 3]);
+      const texts = inputs
+        .map((input) => input.input_text)
+        .filter((value): value is string => typeof value === "string")
+        .sort();
+      assertEquals(texts, ["", "go\n"].sort());
+    },
+  );
+});
