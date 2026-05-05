@@ -203,15 +203,45 @@ function historyToMessages(
   const filteredToolCallIds = new Set<string>();
   const filteredToolReasons: string[] = [];
   let filteredToolCalls = 0;
+  let pendingToolCallIds = new Set<string>();
+  const orphanToolResults: OpenAIMessage[] = [];
+  const pushMatchedToolResults = (results: OpenAIMessage[]): OpenAIMessage[] => {
+    const unmatched: OpenAIMessage[] = [];
+    for (const result of results) {
+      const id = result.tool_call_id;
+      if (id && pendingToolCallIds.has(id)) {
+        messages.push(result);
+        pendingToolCallIds.delete(id);
+      } else {
+        unmatched.push(result);
+      }
+    }
+    return unmatched;
+  };
+  const rememberPendingToolCalls = (toolCalls: JsonObject[]): void => {
+    pendingToolCallIds = new Set(
+      toolCalls
+        .map((call) => typeof call.id === "string" ? call.id : "")
+        .filter(Boolean),
+    );
+  };
   for (const item of asArray(history)) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const record = item as JsonObject;
 
     const requestNodes = asArray(record.request_nodes);
     const responseNodes = asArray(record.response_nodes);
-    const toolResults = [
-      ...toolResultSummaries(responseNodes, filteredToolCallIds),
-      ...toolResultSummaries(requestNodes, filteredToolCallIds),
+    const requestToolResults = toolResultMessages(
+      requestNodes,
+      filteredToolCallIds,
+    );
+    const responseToolResults = toolResultMessages(
+      responseNodes,
+      filteredToolCallIds,
+    );
+    let unmatchedToolResults = [
+      ...pushMatchedToolResults(requestToolResults),
+      ...pushMatchedToolResults(responseToolResults),
     ];
     let responseText =
       responseNodes.map(nodeText).filter(Boolean).join("\n") ||
@@ -246,21 +276,23 @@ function historyToMessages(
       text(record.request_message).trim();
 
     if (
-      toolResults.length > 0 && !userText && !responseText &&
+      unmatchedToolResults.length > 0 &&
+      !userText && !responseText &&
       toolCalls.length === 0
     ) {
       messages.push({
         role: "user",
         content: [
           "Previous tool results were recorded without a following assistant continuation. Treat them as context and continue the task.",
-          ...toolResults,
+          ...toolResultSummaryLines(unmatchedToolResults),
         ].join("\n\n"),
       });
       continue;
     }
 
     if (
-      toolResults.length === 0 && userText && isContinuationText(userText) &&
+      requestToolResults.length === 0 && responseToolResults.length === 0 &&
+      userText && isContinuationText(userText) &&
       !responseText && toolCalls.length === 0
     ) {
       continue;
@@ -277,9 +309,10 @@ function historyToMessages(
         content: responseText,
         ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
       });
+      rememberPendingToolCalls(toolCalls);
+      unmatchedToolResults = pushMatchedToolResults(unmatchedToolResults);
     }
-    appendToolResultMessages(messages, responseNodes, filteredToolCallIds);
-    appendToolResultMessages(messages, requestNodes, filteredToolCallIds);
+    orphanToolResults.push(...unmatchedToolResults);
 
     if (messages.length === 0) {
       const roleRaw = text(record.role || record.speaker || record.type)
@@ -293,12 +326,38 @@ function historyToMessages(
       if (content) messages.push({ role, content });
     }
   }
+  if (orphanToolResults.length > 0) {
+    const orphanMessage: OpenAIMessage = {
+      role: "user",
+      content: [
+        "Previous tool results were recorded without a matching assistant tool call in retained history. Treat them as context and continue the task.",
+        ...toolResultSummaryLines(orphanToolResults),
+      ].join("\n\n"),
+    };
+    if (pendingToolCallIds.size > 0) {
+      const pendingAssistantIndex = findLastPendingAssistantIndex(messages);
+      if (pendingAssistantIndex >= 0) messages.splice(pendingAssistantIndex, 0, orphanMessage);
+      else messages.push(orphanMessage);
+    } else {
+      messages.push(orphanMessage);
+    }
+  }
   return {
     messages,
     filteredToolCalls,
     filteredToolCallIds: [...filteredToolCallIds],
     filteredToolReasons,
   };
+}
+
+function findLastPendingAssistantIndex(messages: OpenAIMessage[]): number {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function historicalToolCallDropReason(
@@ -367,11 +426,11 @@ function isNoopStrReplaceEntry(entry: JsonValue): boolean {
       normalizeForNoopCompare(record.new_str);
 }
 
-function toolResultSummaries(
+function toolResultMessages(
   nodes: JsonValue,
   skipToolCallIds = new Set<string>(),
-): string[] {
-  const output: string[] = [];
+): OpenAIMessage[] {
+  const output: OpenAIMessage[] = [];
   for (const node of asArray(nodes)) {
     if (!node || typeof node !== "object" || Array.isArray(node)) continue;
     const toolResult = (node as JsonObject).tool_result_node;
@@ -384,9 +443,15 @@ function toolResultSummaries(
     if (id && skipToolCallIds.has(id)) continue;
     const content = compactToolResultContent(text(result.content));
     if (!content.trim()) continue;
-    output.push(`Tool result${id ? ` ${id}` : ""}:\n${content}`);
+    if (id) output.push({ role: "tool", tool_call_id: id, content });
   }
   return output;
+}
+
+function toolResultSummaryLines(results: OpenAIMessage[]): string[] {
+  return results.map((result) =>
+    `Tool result${result.tool_call_id ? ` ${result.tool_call_id}` : ""}:\n${result.content}`
+  );
 }
 
 function appendToolResultMessages(
@@ -394,22 +459,7 @@ function appendToolResultMessages(
   nodes: JsonValue,
   skipToolCallIds = new Set<string>(),
 ): void {
-  for (const node of asArray(nodes)) {
-    if (!node || typeof node !== "object" || Array.isArray(node)) continue;
-    const toolResult = (node as JsonObject).tool_result_node;
-    if (
-      !toolResult || typeof toolResult !== "object" || Array.isArray(toolResult)
-    ) continue;
-    const result = toolResult as JsonObject;
-    const toolCallId = typeof result.tool_use_id === "string"
-      ? result.tool_use_id
-      : undefined;
-    if (toolCallId && skipToolCallIds.has(toolCallId)) continue;
-    const content = compactToolResultContent(text(result.content));
-    if (toolCallId) {
-      messages.push({ role: "tool", tool_call_id: toolCallId, content });
-    }
-  }
+  messages.push(...toolResultMessages(nodes, skipToolCallIds));
 }
 
 function collectReadFilePaths(
@@ -2817,6 +2867,17 @@ interface RecentFailedToolCall {
   count: number;
   content: string;
   parsed: ParsedToolCall;
+  recoverySignature?: string;
+  recoverySatisfied?: boolean;
+  continuationSignature?: string;
+  continuationSatisfied?: boolean;
+  continuationContent?: string;
+  resolutionSignature?: string;
+  resolutionSatisfied?: boolean;
+  directiveSignature?: string;
+  directiveSatisfied?: boolean;
+  exhaustedContinuationSignature?: string;
+  exhaustedContinuationSatisfied?: boolean;
 }
 
 function recentFailedToolCalls(
@@ -2826,6 +2887,8 @@ function recentFailedToolCalls(
   const failures = new Map<string, RecentFailedToolCall>();
   const body = objectBody(ctx);
   const toolById = new Map<string, ParsedToolCall>();
+  const successfulToolSignatures = new Set<string>();
+  const successfulToolContent = new Map<string, string>();
   const rememberToolCalls = (nodes: JsonValue): void => {
     for (const node of asArray(nodes)) {
       const call = nodeToolUse(node);
@@ -2844,23 +2907,59 @@ function recentFailedToolCalls(
       const result = toolResult as JsonObject;
       if (toolResultMutatedWorkspace(result)) {
         failures.clear();
+        successfulToolSignatures.clear();
+        successfulToolContent.clear();
         continue;
       }
       const id = typeof result.tool_use_id === "string" ? result.tool_use_id : "";
       const parsed = id ? toolById.get(id) : undefined;
       const content = text(result.content);
-      if (!parsed || !toolResultIndicatesFailure(content, result)) continue;
+      if (!parsed) continue;
+      const successSignature = toolResultLooksSuccessful(result)
+        ? successfulRecoverySignature(parsed)
+        : undefined;
+      if (successSignature) {
+        successfulToolSignatures.add(successSignature);
+        successfulToolContent.set(successSignature, content);
+        for (const failure of failures.values()) {
+          refreshRecentFailureProgress(
+            failure,
+            successfulToolSignatures,
+            successfulToolContent,
+            fallbackPath,
+          );
+        }
+      }
+      if (!toolResultIndicatesFailure(content, result)) continue;
       const key = toolCallKey(parsed.name, parsed.argumentsJson);
       const previous = failures.get(key);
-      failures.set(key, {
+      const failure: RecentFailedToolCall = {
         count: (previous?.count ?? 0) + 1,
         content,
         parsed,
-      });
+        recoverySignature: previous?.recoverySignature,
+        recoverySatisfied: previous?.recoverySatisfied,
+        continuationSignature: previous?.continuationSignature,
+        continuationSatisfied: previous?.continuationSatisfied,
+        continuationContent: previous?.continuationContent,
+        resolutionSignature: previous?.resolutionSignature,
+        resolutionSatisfied: previous?.resolutionSatisfied,
+        directiveSignature: previous?.directiveSignature,
+        directiveSatisfied: previous?.directiveSatisfied,
+        exhaustedContinuationSignature: previous?.exhaustedContinuationSignature,
+        exhaustedContinuationSatisfied: previous?.exhaustedContinuationSatisfied,
+      };
+      refreshRecentFailureProgress(
+        failure,
+        successfulToolSignatures,
+        successfulToolContent,
+        fallbackPath,
+      );
+      failures.set(key, failure);
     }
   };
 
-  for (const item of asArray(body.chat_history).slice(-16)) {
+  for (const item of asArray(body.chat_history)) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const record = item as JsonObject;
     rememberToolCalls(record.response_nodes);
@@ -2870,7 +2969,192 @@ function recentFailedToolCalls(
   }
   rememberToolCalls(body.nodes);
   rememberToolResults(body.nodes);
+  for (const failure of failures.values()) {
+    refreshRecentFailureProgress(
+      failure,
+      successfulToolSignatures,
+      successfulToolContent,
+      fallbackPath,
+    );
+  }
   return failures;
+}
+
+function refreshRecentFailureProgress(
+  failure: RecentFailedToolCall,
+  successfulToolSignatures: Set<string>,
+  successfulToolContent: Map<string, string>,
+  fallbackPath?: string,
+): void {
+  const recovery = recoveryToolForRepeatedFailure(
+    failure.parsed,
+    failure,
+    fallbackPath,
+  );
+  const previousRecoverySignature = failure.recoverySignature;
+  const nextRecoverySignature = recovery
+    ? recoverySignature(recovery.toolName, recovery.input)
+    : previousRecoverySignature;
+  failure.recoverySignature = nextRecoverySignature;
+  failure.recoverySatisfied = stageSatisfied(
+    failure.recoverySatisfied,
+    previousRecoverySignature,
+    nextRecoverySignature,
+    successfulToolSignatures,
+  );
+
+  const continuation = continuationSearchToolForRepeatedFailure(
+    failure.parsed,
+    failure,
+    fallbackPath,
+  );
+  const previousContinuationSignature = failure.continuationSignature;
+  const nextContinuationSignature = continuation
+    ? recoverySignature(continuation.toolName, continuation.input)
+    : previousContinuationSignature;
+  failure.continuationSignature = nextContinuationSignature;
+  failure.continuationSatisfied = stageSatisfied(
+    failure.continuationSatisfied,
+    previousContinuationSignature,
+    nextContinuationSignature,
+    successfulToolSignatures,
+  );
+  failure.continuationContent = failure.continuationSatisfied &&
+      nextContinuationSignature
+    ? successfulToolContent.get(nextContinuationSignature) ??
+      (previousContinuationSignature === nextContinuationSignature
+        ? failure.continuationContent
+        : undefined)
+    : undefined;
+
+  const resolution = failure.continuationSatisfied &&
+      failure.continuationContent
+    ? resolutionToolForSatisfiedRepeatedFailure(failure, fallbackPath)
+    : undefined;
+  const previousResolutionSignature = failure.resolutionSignature;
+  const nextResolutionSignature = resolution
+    ? recoverySignature(resolution.toolName, resolution.input)
+    : previousResolutionSignature;
+  failure.resolutionSignature = nextResolutionSignature;
+  failure.resolutionSatisfied = stageSatisfied(
+    failure.resolutionSatisfied,
+    previousResolutionSignature,
+    nextResolutionSignature,
+    successfulToolSignatures,
+  );
+
+  const directive = failure.resolutionSatisfied
+    ? directiveToolForSatisfiedRepeatedFailure(
+      failure.parsed,
+      failure,
+      fallbackPath,
+    )
+    : undefined;
+  const previousDirectiveSignature = failure.directiveSignature;
+  const nextDirectiveSignature = directive
+    ? recoverySignature(directive.toolName, directive.input)
+    : previousDirectiveSignature;
+  failure.directiveSignature = nextDirectiveSignature;
+  failure.directiveSatisfied = stageSatisfied(
+    failure.directiveSatisfied,
+    previousDirectiveSignature,
+    nextDirectiveSignature,
+    successfulToolSignatures,
+  );
+
+  const exhaustedContinuation =
+    failure.recoverySatisfied &&
+      !continuationToolForSatisfiedRepeatedFailure(
+        failure.parsed,
+        failure,
+        fallbackPath,
+      )
+      ? exhaustedContinuationToolForRepeatedFailure(
+        failure.parsed,
+        failure,
+        fallbackPath,
+      )
+      : undefined;
+  const previousExhaustedContinuationSignature =
+    failure.exhaustedContinuationSignature;
+  const nextExhaustedContinuationSignature = exhaustedContinuation
+    ? recoverySignature(exhaustedContinuation.toolName, exhaustedContinuation.input)
+    : previousExhaustedContinuationSignature;
+  failure.exhaustedContinuationSignature = nextExhaustedContinuationSignature;
+  failure.exhaustedContinuationSatisfied = stageSatisfied(
+    failure.exhaustedContinuationSatisfied,
+    previousExhaustedContinuationSignature,
+    nextExhaustedContinuationSignature,
+    successfulToolSignatures,
+  );
+}
+
+function stageSatisfied(
+  previousSatisfied: boolean | undefined,
+  previousSignature: string | undefined,
+  nextSignature: string | undefined,
+  successfulToolSignatures: Set<string>,
+): boolean {
+  if (!nextSignature) return false;
+  return previousSatisfied === true && previousSignature === nextSignature ||
+    successfulToolSignatures.has(nextSignature);
+}
+
+function successfulRecoverySignature(
+  parsed: ParsedToolCall,
+): string | undefined {
+  let args: JsonObject;
+  try {
+    const decoded = JSON.parse(parsed.argumentsJson);
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return undefined;
+    }
+    args = decoded as JsonObject;
+  } catch {
+    return undefined;
+  }
+  if (parsed.name === "view") {
+    const path = typeof args.path === "string" ? canonicalizePath(args.path) : "";
+    if (!path) return undefined;
+    return recoverySignature("view", {
+      path,
+      type: directoryExists(path) ? "directory" : "file",
+    });
+  }
+  if (parsed.name === "list-processes") {
+    return recoverySignature("list-processes", {});
+  }
+  if (parsed.name === "launch-process") {
+    let args: JsonObject;
+    try {
+      const decoded = JSON.parse(parsed.argumentsJson);
+      if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+        return undefined;
+      }
+      args = decoded as JsonObject;
+    } catch {
+      return undefined;
+    }
+    const command = typeof args.command === "string"
+      ? normalizeLaunchCommandForRepeatKey(args.command)
+      : "";
+    if (!command) return undefined;
+    return recoverySignature("launch-process", {
+      ...args,
+      command,
+      cwd: typeof args.cwd === "string" ? canonicalizePath(args.cwd) : args.cwd,
+    });
+  }
+  return undefined;
+}
+
+function recoverySignature(toolName: string, input: JsonObject): string {
+  if (toolName === "view") {
+    const path = typeof input.path === "string" ? canonicalizePath(input.path) : "";
+    const type = typeof input.type === "string" ? input.type : "";
+    return `view:${JSON.stringify({ path, type })}`;
+  }
+  return `${toolName}:${JSON.stringify(input)}`;
 }
 
 function toolResultMutatedWorkspace(result: JsonObject): boolean {
@@ -2994,6 +3278,41 @@ function filterRepeatedFailedToolCalls(
       continue;
     }
     repeated.push(call);
+    if (failure.recoverySatisfied) {
+      const continuation = continuationToolNodeForSatisfiedRepeatedFailure(
+        parsed,
+        failure,
+        fallbackPath,
+        recoveryNodes.length + 1,
+      );
+      if (continuation) {
+        const continuationKey = JSON.stringify(
+          (continuation.tool_use as JsonObject | undefined)?.input_json ?? "",
+        );
+        if (!seenRecoveries.has(continuationKey)) {
+          seenRecoveries.add(continuationKey);
+          recoveryNodes.push(continuation);
+        }
+      }
+      const exhaustedContinuation = continuation ? undefined
+        : exhaustedContinuationToolNodeForRepeatedFailure(
+          parsed,
+          failure,
+          fallbackPath,
+          recoveryNodes.length + 1,
+        );
+      if (exhaustedContinuation) {
+        const exhaustedContinuationKey = JSON.stringify(
+          (exhaustedContinuation.tool_use as JsonObject | undefined)
+            ?.input_json ?? "",
+        );
+        if (!seenRecoveries.has(exhaustedContinuationKey)) {
+          seenRecoveries.add(exhaustedContinuationKey);
+          recoveryNodes.push(exhaustedContinuation);
+        }
+      }
+      continue;
+    }
     const recovery = recoveryToolNodeForRepeatedFailure(
       parsed,
       failure,
@@ -3043,6 +3362,171 @@ function repeatedToolCallDetails(parsed: ParsedToolCall): string {
     // Fall through to the tool name.
   }
   return parsed.name;
+}
+
+function continuationToolNodeForSatisfiedRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath: string | undefined,
+  id: number,
+): JsonObject | undefined {
+  const recovery = continuationToolForSatisfiedRepeatedFailure(
+    parsed,
+    failure,
+    fallbackPath,
+  );
+  if (!recovery) return undefined;
+  return {
+    id,
+    type: 5,
+    tool_use: {
+      tool_name: recovery.toolName,
+      tool_use_id: `${parsed.id}_repeated_failure_continue_${
+        recovery.toolName.replace(/[^a-z0-9]+/gi, "_")
+      }`,
+      input_json: JSON.stringify(recovery.input),
+    },
+  };
+}
+
+function continuationToolForSatisfiedRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath?: string,
+): { toolName: string; input: JsonObject } | undefined {
+  if (parsed.name !== "launch-process") return undefined;
+  if (failure.continuationSatisfied) {
+    if (failure.resolutionSatisfied) {
+      if (failure.directiveSatisfied) return undefined;
+      return directiveToolForSatisfiedRepeatedFailure(parsed, failure, fallbackPath);
+    }
+    return resolutionToolForSatisfiedRepeatedFailure(failure, fallbackPath);
+  }
+  return continuationSearchToolForRepeatedFailure(parsed, failure, fallbackPath);
+}
+
+function directiveToolForSatisfiedRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath?: string,
+): { toolName: string; input: JsonObject } | undefined {
+  if (parsed.name !== "launch-process") return undefined;
+  const cwd = launchProcessCwd(parsed, fallbackPath);
+  if (!cwd) return undefined;
+  const diagnostic = diagnosticOutput(failure.content).trim().replace(/\s+/g, " ");
+  const message = [
+    "augmentproxy: repeated compile failure already has diagnostic files loaded.",
+    diagnostic ? `latest diagnostic: ${diagnostic}` : "",
+    "Do not read the same files again. Edit the relevant Haxe file with str-replace-editor, then rerun the compile command.",
+  ].filter(Boolean).join(" ");
+  return {
+    toolName: "launch-process",
+    input: {
+      command: `printf '%s\\n' '${shellSingleQuoteContent(message)}'`,
+      cwd,
+      wait: true,
+      max_wait_seconds: 10,
+    },
+  };
+}
+
+function exhaustedContinuationToolNodeForRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath: string | undefined,
+  id: number,
+): JsonObject | undefined {
+  if (failure.exhaustedContinuationSatisfied) return undefined;
+  const recovery = exhaustedContinuationToolForRepeatedFailure(
+    parsed,
+    failure,
+    fallbackPath,
+  );
+  if (!recovery) return undefined;
+  return {
+    id,
+    type: 5,
+    tool_use: {
+      tool_name: recovery.toolName,
+      tool_use_id: `${parsed.id}_repeated_failure_exhausted_${
+        recovery.toolName.replace(/[^a-z0-9]+/gi, "_")
+      }`,
+      input_json: JSON.stringify(recovery.input),
+    },
+  };
+}
+
+function exhaustedContinuationToolForRepeatedFailure(
+  parsed: ParsedToolCall,
+  _failure: RecentFailedToolCall,
+  fallbackPath?: string,
+): { toolName: string; input: JsonObject } | undefined {
+  const cwd = launchProcessCwd(parsed, fallbackPath);
+  if (!cwd) return undefined;
+  const details = repeatedToolCallDetails(parsed);
+  const message = [
+    "augmentproxy: repeated failed tool call was suppressed after recovery actions were already completed.",
+    details ? `suppressed: ${details}.` : "",
+    "Do not repeat that same tool call.",
+    "Modify the relevant file or run a different diagnostic, then retry verification.",
+  ].filter(Boolean).join(" ");
+  return {
+    toolName: "launch-process",
+    input: {
+      command: `printf '%s\\n' '${shellSingleQuoteContent(message)}'`,
+      cwd,
+      wait: true,
+      max_wait_seconds: 10,
+    },
+  };
+}
+
+function continuationSearchToolForRepeatedFailure(
+  parsed: ParsedToolCall,
+  failure: RecentFailedToolCall,
+  fallbackPath?: string,
+): { toolName: string; input: JsonObject } | undefined {
+  if (parsed.name !== "launch-process") return undefined;
+  const diagnostic = diagnosticOutput(failure.content);
+  const symbol = unresolvedSymbolFromDiagnostic(diagnostic);
+  if (!symbol) return undefined;
+  const cwd = launchProcessCwd(parsed, fallbackPath);
+  if (!cwd) return undefined;
+  const pattern = `\\b(interface|class|enum|typedef)[[:space:]]+${symbol}\\b|\\b${symbol}\\b`;
+  return {
+    toolName: "launch-process",
+    input: {
+      command:
+        `grep -RIn --include='*.hx' -E '${pattern}' . || true`,
+      cwd,
+      wait: true,
+      max_wait_seconds: 60,
+    },
+  };
+}
+
+function resolutionToolForSatisfiedRepeatedFailure(
+  failure: RecentFailedToolCall,
+  fallbackPath?: string,
+): { toolName: string; input: JsonObject } | undefined {
+  const diagnostic = diagnosticOutput(failure.content);
+  const symbol = unresolvedSymbolFromDiagnostic(diagnostic);
+  if (!symbol || !failure.continuationContent) return undefined;
+  const cwd = launchProcessCwd(failure.parsed, fallbackPath);
+  const definitionPath = definitionPathFromSearchResult(
+    failure.continuationContent,
+    symbol,
+    cwd,
+    fallbackPath,
+  );
+  if (!definitionPath) return undefined;
+  return {
+    toolName: "view",
+    input: {
+      path: definitionPath,
+      type: directoryExists(definitionPath) ? "directory" : "file",
+    },
+  };
 }
 
 function recoveryToolNodeForRepeatedFailure(
@@ -3156,8 +3640,7 @@ function firstExistingPathFromDiagnostic(
   content: string,
   fallbackPath?: string,
 ): string | undefined {
-  const outputMatch = content.match(/<output>\s*([\s\S]*?)<\/output>/i);
-  const diagnostic = outputMatch?.[1] ?? content;
+  const diagnostic = diagnosticOutput(content);
   const candidates: string[] = [];
   for (const match of diagnostic.matchAll(/(?:\/[^\s"'`<>:]+|[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+)(?::\d+(?::\d+)?(?:\s*:\s*characters\s+\d+-\d+)?)?/g)) {
     const raw = match[0];
@@ -3174,6 +3657,77 @@ function firstExistingPathFromDiagnostic(
     ) return repaired;
   }
   return undefined;
+}
+
+function diagnosticOutput(content: string): string {
+  const outputMatch = content.match(/<output>\s*([\s\S]*?)<\/output>/i);
+  return outputMatch?.[1] ?? content;
+}
+
+function unresolvedSymbolFromDiagnostic(diagnostic: string): string | undefined {
+  const match = diagnostic.match(
+    /\b(?:Type|Class|Module|Identifier)\s+not\s+found\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\b/i,
+  ) ?? diagnostic.match(/\bUnknown identifier\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\b/i);
+  return match?.[1];
+}
+
+function definitionPathFromSearchResult(
+  content: string,
+  symbol: string,
+  cwd?: string,
+  fallbackPath?: string,
+): string | undefined {
+  const output = diagnosticOutput(content);
+  const escaped = escapeRegExp(symbol);
+  const definition = new RegExp(
+    `^(.+?):\\d+:.*\\b(?:interface|class|enum|typedef)\\s+${escaped}\\b`,
+  );
+  for (const line of output.split(/\r?\n/)) {
+    const match = line.match(definition);
+    if (!match) continue;
+    const rawPath = match[1].trim();
+    const candidate = isAbsolutePath(rawPath)
+      ? rawPath
+      : cwd
+      ? joinPath(cwd, rawPath.replace(/^\.\//, ""))
+      : rawPath;
+    const repaired = repairFilePath(candidate, fallbackPath) ??
+      repairViewPath(candidate, fallbackPath);
+    if (
+      repaired &&
+      isPathWithinAllowedHome(repaired) &&
+      pathExists(repaired)
+    ) return repaired;
+  }
+  return undefined;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function shellSingleQuoteContent(value: string): string {
+  return value.replace(/'/g, `'\\''`);
+}
+
+function launchProcessCwd(
+  parsed: ParsedToolCall,
+  fallbackPath?: string,
+): string | undefined {
+  try {
+    const decoded = JSON.parse(parsed.argumentsJson);
+    if (decoded && typeof decoded === "object" && !Array.isArray(decoded)) {
+      const cwd = (decoded as JsonObject).cwd;
+      if (
+        typeof cwd === "string" &&
+        isPathWithinAllowedHome(cwd) &&
+        directoryExists(cwd)
+      ) return canonicalizePath(cwd);
+    }
+  } catch {
+    // Fall back to the workspace path below.
+  }
+  return workspaceFolderFromPath(fallbackPath);
 }
 
 function invalidToolCallSummaries(

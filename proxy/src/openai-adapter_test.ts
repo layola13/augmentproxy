@@ -500,6 +500,101 @@ Deno.test("openai continuation with recent history tool result requires next too
   );
 });
 
+Deno.test("openai history keeps Auggie tool results after previous assistant tool calls", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          chat_history: [{
+            response_nodes: [{
+              id: 1,
+              type: 5,
+              tool_use: {
+                tool_name: "view",
+                tool_use_id: "call_read_previous",
+                input_json: JSON.stringify({
+                  path: "/home/vscode/projects/augmentproxy/proxy",
+                  type: "directory",
+                }),
+              },
+            }],
+          }, {
+            request_nodes: [{
+              id: 2,
+              type: 1,
+              tool_result_node: {
+                tool_use_id: "call_read_previous",
+                content: "Directory listing result\n",
+              },
+            }],
+            response_nodes: [{
+              id: 3,
+              type: 5,
+              tool_use: {
+                tool_name: "launch-process",
+                tool_use_id: "call_compile_previous",
+                input_json: JSON.stringify({
+                  command: "deno test proxy/src/openai-adapter_test.ts",
+                  cwd: "/home/vscode/projects/augmentproxy",
+                  wait: true,
+                  max_wait_seconds: 60,
+                }),
+              },
+            }],
+          }, {
+            request_nodes: [{
+              id: 4,
+              type: 1,
+              tool_result_node: {
+                tool_use_id: "call_compile_previous",
+                content: [
+                  "Here are the results from executing the command.",
+                  "<return-code>",
+                  "0",
+                  "</return-code>",
+                  "<output>",
+                  "ok | 1 passed | 0 failed",
+                  "</output>",
+                ].join("\n"),
+              },
+            }],
+          }],
+          message: "continue",
+        }),
+      );
+      const messages = requests[0].body.messages as JsonObject[];
+      const readAssistant = messages.findIndex((message) =>
+        message.role === "assistant" &&
+        JSON.stringify(message.tool_calls ?? "").includes("call_read_previous")
+      );
+      assertEquals(readAssistant >= 0, true);
+      assertEquals(messages[readAssistant + 1].role, "tool");
+      assertEquals(messages[readAssistant + 1].tool_call_id, "call_read_previous");
+      const compileAssistant = messages.findIndex((message) =>
+        message.role === "assistant" &&
+        JSON.stringify(message.tool_calls ?? "").includes("call_compile_previous")
+      );
+      assertEquals(compileAssistant >= 0, true);
+      assertEquals(messages[compileAssistant + 1].role, "tool");
+      assertEquals(messages[compileAssistant + 1].tool_call_id, "call_compile_previous");
+      const messageText = JSON.stringify(messages);
+      assertEquals(
+        messageText.includes("Previous tool results were recorded without a matching assistant tool call"),
+        false,
+      );
+    },
+  );
+});
+
 Deno.test("codex continuation with tool results requires next tool call", async () => {
   await withCaptureFetch(
     new Response(
@@ -3038,6 +3133,1097 @@ Deno.test("repeated failed launch-process recovers by reading diagnostic file", 
         const input = firstToolInput(body);
         assertEquals(input.path, path);
         assertEquals(input.type, "file");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("successful recovery view suppresses repeated auto-recovery loop", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-recovery-satisfied-",
+  });
+  const path = `${root}/src/haxe/state/NextState.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(path, "class NextState {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_compile_after_recovery",
+          type: "function",
+          function: {
+            name: "launch-process",
+            arguments: JSON.stringify({
+              command,
+              cwd: root,
+              wait: true,
+              max_wait_seconds: 60,
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_original",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_original",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_recovery_view",
+                  input_json: JSON.stringify({
+                    path,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_view",
+                  content: `Here's the result of running \`cat -n\` on ${path}:\n     1\tclass NextState {}\n`,
+                },
+              }],
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "view"), false);
+        assertEquals(hasToolName(body, "launch-process"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.cwd, root);
+        assertEquals(String(input.command).includes("grep -RIn"), true);
+        assertEquals(String(input.command).includes("States"), true);
+        assertEquals(String(input.command).includes("haxe -p src"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream successful recovery view suppresses repeated auto-recovery loop", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-stream-recovery-satisfied-",
+  });
+  const path = `${root}/src/haxe/state/NextState.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(path, "class NextState {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_repeat_compile_after_recovery_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command,
+            cwd: root,
+            wait: true,
+            max_wait_seconds: 60,
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_original_stream",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_original_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_recovery_view_stream",
+                  input_json: JSON.stringify({
+                    path,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_view_stream",
+                  content: `Here's the result of running \`cat -n\` on ${path}:\n     1\tclass NextState {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 5,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_repeat_stream",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 6,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_repeat_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }],
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), false);
+        assertEquals(hasToolName(objects, "launch-process"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.cwd, root);
+        assertEquals(String(input.command).includes("grep -RIn"), true);
+        assertEquals(String(input.command).includes("States"), true);
+        assertEquals(String(input.command).includes("haxe -p src"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream successful repeated grep advances to definition file read", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-stream-grep-satisfied-",
+  });
+  const nextStatePath = `${root}/src/haxe/state/NextState.hx`;
+  const statePath = `${root}/src/haxe/state/State.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
+  await Deno.writeTextFile(statePath, "interface States {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const grepCommand =
+    "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true";
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_repeat_compile_after_grep_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command,
+            cwd: root,
+            wait: true,
+            max_wait_seconds: 60,
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_original_stream",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_original_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_recovery_view_stream",
+                  input_json: JSON.stringify({
+                    path: nextStatePath,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_view_stream",
+                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 5,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_recovery_grep_stream",
+                  input_json: JSON.stringify({
+                    command: grepCommand,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 6,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_grep_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "./src/haxe/state/State.hx:1:interface States {}",
+                    "./src/haxe/state/NextState.hx:1:class NextState<T:States> {}",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 7,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_repeat_stream",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 8,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_repeat_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }],
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "launch-process"), false);
+        assertEquals(hasToolName(objects, "view"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.path, statePath);
+        assertEquals(input.type, "file");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream successful definition view advances to edit directive", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-stream-definition-view-satisfied-",
+  });
+  const nextStatePath = `${root}/src/haxe/state/NextState.hx`;
+  const statePath = `${root}/src/haxe/state/State.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
+  await Deno.writeTextFile(statePath, "interface States {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const grepCommand =
+    "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true";
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_repeat_compile_after_definition_view_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command,
+            cwd: root,
+            wait: true,
+            max_wait_seconds: 60,
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_original_stream",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_original_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_recovery_view_stream",
+                  input_json: JSON.stringify({
+                    path: nextStatePath,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_view_stream",
+                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 5,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_recovery_grep_stream",
+                  input_json: JSON.stringify({
+                    command: grepCommand,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 6,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_grep_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "./src/haxe/state/State.hx:1:interface States {}",
+                    "./src/haxe/state/NextState.hx:1:class NextState<T:States> {}",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 7,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_definition_view_stream",
+                  input_json: JSON.stringify({
+                    path: statePath,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 8,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_definition_view_stream",
+                  content: `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 9,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_repeat_stream",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 10,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_repeat_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }],
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), false);
+        assertEquals(hasToolName(objects, "launch-process"), true);
+        const input = firstToolInput(objects);
+        assertEquals(String(input.command).includes("printf"), true);
+        assertEquals(String(input.command).includes("str-replace-editor"), true);
+        assertEquals(String(input.command).includes("grep -RIn"), false);
+        assertEquals(String(input.command).includes("haxe -p src"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream current definition result advances to edit directive without another failed result", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-stream-current-definition-result-",
+  });
+  const nextStatePath = `${root}/src/haxe/state/NextState.hx`;
+  const statePath = `${root}/src/haxe/state/State.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
+  await Deno.writeTextFile(statePath, "interface States {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const grepCommand =
+    "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true";
+  const ideContext = ideWorkspaceContext(root);
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_repeat_compile_after_current_definition_result_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command,
+            cwd: root,
+            wait: true,
+            max_wait_seconds: 60,
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            ...ideContext,
+            nodes: [
+              ...((ideContext.nodes as JsonObject[]) ?? []),
+              {
+                id: 100,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_definition_view_current_stream",
+                  content: `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
+                },
+              },
+            ],
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_original_stream",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+            }, {
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_original_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "1",
+                    "</return-code>",
+                    "<output>",
+                    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_recovery_view_stream",
+                  input_json: JSON.stringify({
+                    path: nextStatePath,
+                    type: "file",
+                  }),
+                },
+              }],
+            }, {
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_view_stream",
+                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                },
+              }],
+              response_nodes: [{
+                id: 5,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_recovery_grep_stream",
+                  input_json: JSON.stringify({
+                    command: grepCommand,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+            }, {
+              request_nodes: [{
+                id: 6,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_grep_stream",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "./src/haxe/state/State.hx:1:interface States {}",
+                    "./src/haxe/state/NextState.hx:1:class NextState<T:States> {}",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+              response_nodes: [{
+                id: 7,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_definition_view_current_stream",
+                  input_json: JSON.stringify({
+                    path: statePath,
+                    type: "file",
+                  }),
+                },
+              }],
+            }],
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), false);
+        assertEquals(hasToolName(objects, "launch-process"), true);
+        const input = firstToolInput(objects);
+        assertEquals(String(input.command).includes("printf"), true);
+        assertEquals(String(input.command).includes("str-replace-editor"), true);
+        assertEquals(String(input.command).includes("grep -RIn"), false);
+        assertEquals(String(input.command).includes("haxe -p src"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream repeated compile recovery does not restart after long idle history", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-stream-long-loop-",
+  });
+  const nextStatePath = `${root}/src/haxe/state/NextState.hx`;
+  const statePath = `${root}/src/haxe/state/State.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
+  await Deno.writeTextFile(statePath, "interface States {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const compileFailure = [
+    "Here are the results from executing the command.",
+    "<return-code>",
+    "1",
+    "</return-code>",
+    "<output>",
+    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+    "",
+    "</output>",
+  ].join("\n");
+  const classify = (node: JsonObject): string => {
+    const toolUse = node.tool_use as JsonObject;
+    const input = JSON.parse(String(toolUse.input_json ?? "{}")) as JsonObject;
+    if (toolUse.tool_name === "view") return `view:${input.path}`;
+    const launched = String(input.command ?? "");
+    if (launched.includes("grep -RIn")) return "launch:grep";
+    if (launched.includes("repeated failed tool call was suppressed")) {
+      return "launch:exhausted";
+    }
+    if (launched.includes("printf")) return "launch:directive";
+    return "launch:compile";
+  };
+  const resultFor = (node: JsonObject): JsonObject => {
+    const toolUse = node.tool_use as JsonObject;
+    const input = JSON.parse(String(toolUse.input_json ?? "{}")) as JsonObject;
+    const path = String(input.path ?? "");
+    let content = compileFailure;
+    let isError = true;
+    if (toolUse.tool_name === "view" && path === nextStatePath) {
+      content = `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`;
+      isError = false;
+    } else if (toolUse.tool_name === "view" && path === statePath) {
+      content = `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`;
+      isError = false;
+    } else if (String(input.command ?? "").includes("grep -RIn")) {
+      content = [
+        "Here are the results from executing the command.",
+        "<return-code>",
+        "0",
+        "</return-code>",
+        "<output>",
+        "./src/haxe/state/State.hx:1:interface States {}",
+        "./src/haxe/state/NextState.hx:1:class NextState<T:States> {}",
+        "",
+        "</output>",
+      ].join("\n");
+      isError = false;
+    } else if (String(input.command ?? "").includes("printf")) {
+      content = [
+        "Here are the results from executing the command.",
+        "<return-code>",
+        "0",
+        "</return-code>",
+        "<output>",
+        "augmentproxy directive printed",
+        "</output>",
+      ].join("\n");
+      isError = false;
+    }
+    return {
+      id: 1,
+      type: 1,
+      tool_result_node: {
+        tool_use_id: String(toolUse.tool_use_id),
+        content,
+        is_error: isError,
+      },
+    };
+  };
+  const history: JsonObject[] = [];
+  let nodes: JsonObject[] = (ideWorkspaceContext(root).nodes as JsonObject[]) ?? [];
+  const counts = new Map<string, number>();
+  try {
+    for (let round = 0; round < 80; round += 1) {
+      await withFakeOpenAIStreamToolCall(
+        {
+          id: `call_model_compile_${round}`,
+          index: 0,
+          type: "function",
+          function: {
+            name: "launch-process",
+            arguments: JSON.stringify({
+              command,
+              cwd: root,
+              wait: true,
+              max_wait_seconds: 60,
+            }),
+          },
+        },
+        async () => {
+          const response = await forwardAugmentStream(
+            testConfig(),
+            testContext({
+              ...ideWorkspaceContext(root),
+              chat_history: history,
+              nodes,
+              tool_definitions: toolDefinitions(),
+            }),
+          );
+          const objects = await collectStreamObjects(response);
+          const responseNodes = objects.flatMap((object) =>
+            Array.isArray(object.nodes) ? object.nodes as JsonObject[] : []
+          ).filter((node) =>
+            Boolean(node && typeof node === "object" && !Array.isArray(node) && node.tool_use)
+          );
+          for (const node of responseNodes) {
+            const key = classify(node);
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+          }
+          history.push({
+            request_nodes: nodes,
+            response_nodes: responseNodes,
+          });
+          nodes = [
+            ...((ideWorkspaceContext(root).nodes as JsonObject[]) ?? []),
+            ...responseNodes.map(resultFor),
+          ];
+        },
+      );
+    }
+    assertEquals(counts.get(`view:${nextStatePath}`), 1);
+    assertEquals(counts.get("launch:grep"), 1);
+    assertEquals(counts.get(`view:${statePath}`), 1);
+    assertEquals(counts.get("launch:directive"), 1);
+    assertEquals(counts.get("launch:exhausted"), 1);
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream exhausted repeated failure emits continuation tool instead of text-only stop", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-stream-exhausted-loop-",
+  });
+  const nextStatePath = `${root}/src/haxe/state/NextState.hx`;
+  const statePath = `${root}/src/haxe/state/State.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
+  await Deno.writeTextFile(statePath, "interface States {}\n");
+  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const compileFailure = [
+    "Here are the results from executing the command.",
+    "<return-code>",
+    "1",
+    "</return-code>",
+    "<output>",
+    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+    "",
+    "</output>",
+  ].join("\n");
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_model_compile_after_exhausted",
+        index: 0,
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command,
+            cwd: root,
+            wait: true,
+            max_wait_seconds: 60,
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_original",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_original",
+                  content: compileFailure,
+                  is_error: true,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_recovery_view",
+                  input_json: JSON.stringify({
+                    path: nextStatePath,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_view",
+                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 5,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_recovery_grep",
+                  input_json: JSON.stringify({
+                    command:
+                      "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true",
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 6,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_grep",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "./src/haxe/state/State.hx:1:interface States {}",
+                    "./src/haxe/state/NextState.hx:1:class NextState<T:States> {}",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 7,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_definition_view",
+                  input_json: JSON.stringify({
+                    path: statePath,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 8,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_definition_view",
+                  content: `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 9,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_directive",
+                  input_json: JSON.stringify({
+                    command:
+                      "printf '%s\\n' 'augmentproxy: repeated compile failure already has diagnostic files loaded. latest diagnostic: src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States Do not read the same files again. Edit the relevant Haxe file with str-replace-editor, then rerun the compile command.'",
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 10,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 10,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_directive",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "augmentproxy directive printed",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }],
+            tool_definitions: toolDefinitions(),
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(responseTextContains(objects, "Repeated failed tool call suppressed"), false);
+        assertEquals(hasToolName(objects, "launch-process"), true);
+        const input = firstToolInput(objects);
+        assertEquals(String(input.command).includes("repeated failed tool call was suppressed"), true);
+        assertEquals(String(input.command).includes("haxe -p src"), false);
+        assertEquals(String(input.command).includes("grep -RIn"), false);
       },
     );
   } finally {
