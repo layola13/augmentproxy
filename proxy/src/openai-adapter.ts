@@ -3338,10 +3338,8 @@ function appendRepeatedToolCallHint(
     .map((call) => {
       const parsed = parseToolCall(call, fallbackPath);
       if (!parsed) return "";
-      const details = repeatedToolCallDetails(parsed);
-      return details
-        ? `Repeated failed tool call suppressed: ${details}. Inspect or edit the failing file instead of running the same command again.`
-        : `Repeated failed tool call suppressed: ${parsed.name}. Inspect the latest error and change the workspace before retrying.`;
+      const details = repeatedToolCallSummary(parsed);
+      return `Repeated failed tool call suppressed: ${details}. Inspect the latest error and change the workspace before retrying.`;
     })
     .filter(Boolean)
     .join("\n");
@@ -3349,14 +3347,14 @@ function appendRepeatedToolCallHint(
   return content.trim() ? `${content.trimEnd()}\n\n${rendered}` : rendered;
 }
 
-function repeatedToolCallDetails(parsed: ParsedToolCall): string {
+function repeatedToolCallSummary(parsed: ParsedToolCall): string {
   try {
     const args = JSON.parse(parsed.argumentsJson) as JsonObject;
     const command = typeof args.command === "string"
       ? normalizeLaunchCommandForRepeatKey(args.command)
       : "";
     if (parsed.name === "launch-process" && command) {
-      return `${parsed.name} ${command}`;
+      return "launch-process command";
     }
   } catch {
     // Fall through to the tool name.
@@ -3436,7 +3434,6 @@ function exhaustedContinuationToolNodeForRepeatedFailure(
   fallbackPath: string | undefined,
   id: number,
 ): JsonObject | undefined {
-  if (failure.exhaustedContinuationSatisfied) return undefined;
   const recovery = exhaustedContinuationToolForRepeatedFailure(
     parsed,
     failure,
@@ -3463,7 +3460,7 @@ function exhaustedContinuationToolForRepeatedFailure(
 ): { toolName: string; input: JsonObject } | undefined {
   const cwd = launchProcessCwd(parsed, fallbackPath);
   if (!cwd) return undefined;
-  const details = repeatedToolCallDetails(parsed);
+  const details = repeatedToolCallSummary(parsed);
   const message = [
     "augmentproxy: repeated failed tool call was suppressed after recovery actions were already completed.",
     details ? `suppressed: ${details}.` : "",

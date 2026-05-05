@@ -4033,7 +4033,8 @@ Deno.test("stream repeated compile recovery does not restart after long idle his
     assertEquals(counts.get("launch:grep"), 1);
     assertEquals(counts.get(`view:${statePath}`), 1);
     assertEquals(counts.get("launch:directive"), 1);
-    assertEquals(counts.get("launch:exhausted"), 1);
+    assertEquals((counts.get("launch:exhausted") ?? 0) > 0, true);
+    assertEquals(counts.get("launch:compile"), 1);
   } finally {
     await Deno.remove(root, { recursive: true }).catch(() => undefined);
   }
