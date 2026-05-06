@@ -1,6 +1,6 @@
 # Proxy Configuration in TOML
 # Active channel to use
-model_provider = "mimo_sgp"
+model_provider = "difu"
 
 [model_providers.difu]
 base_url = "https://df.dawnloadai.com:9888/v1"

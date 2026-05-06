@@ -1570,11 +1570,70 @@ function normalizeProcessToolArguments(args: JsonObject): void {
 
 function normalizeLaunchProcessArguments(args: JsonObject): void {
   if (typeof args.command !== "string") return;
-  const command = args.command.trim();
+  let command = args.command.trim();
   if (!command) return;
-  if (!/[|]/.test(command)) return;
-  if (/\bset\s+-o\s+pipefail\b/.test(command)) return;
-  args.command = `set -o pipefail; ${command}`;
+  command = expandSimpleMkdirBraceCommand(command);
+  if (/[|]/.test(command) && !/\bset\s+-o\s+pipefail\b/.test(command)) {
+    command = `set -o pipefail; ${command}`;
+  }
+  args.command = command;
+}
+
+function expandSimpleMkdirBraceCommand(command: string): string {
+  const mkdirPattern = /\bmkdir\s+-p\b/g;
+  let output = "";
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = mkdirPattern.exec(command))) {
+    const segmentStart = match.index;
+    const argsStart = mkdirPattern.lastIndex;
+    const tail = command.slice(argsStart);
+    const separatorMatch = /&&|\|\||[;|\n]/.exec(tail);
+    const separatorIndex = separatorMatch ? argsStart + separatorMatch.index : command.length;
+    const argsText = command.slice(argsStart, separatorIndex);
+    const expandedArgs = expandSimpleMkdirBraceArgs(argsText);
+
+    output += command.slice(lastIndex, segmentStart);
+    output += expandedArgs ? `mkdir -p ${expandedArgs}` : "mkdir -p";
+    if (separatorMatch) output += " ";
+
+    lastIndex = separatorIndex;
+    mkdirPattern.lastIndex = separatorIndex;
+  }
+
+  if (lastIndex === 0) return command;
+  return `${output}${command.slice(lastIndex)}`;
+}
+
+function expandSimpleMkdirBraceArgs(argsText: string): string {
+  const tokens = argsText.trim().split(/\s+/).filter(Boolean);
+  const expanded: string[] = [];
+
+  for (const token of tokens) {
+    const braceMatch = token.match(
+      /^([^\s"'`;&|{}]+)\/\{([^{}\n]+?)(?:\})?$/,
+    );
+    if (!braceMatch) {
+      expanded.push(token);
+      continue;
+    }
+
+    const [, prefix, variantsRaw] = braceMatch;
+    if (!variantsRaw.includes(",")) {
+      expanded.push(token);
+      continue;
+    }
+
+    const variants = variantsRaw.split(",").map((item) => item.trim()).filter(Boolean);
+    if (variants.length === 0) {
+      expanded.push(token);
+      continue;
+    }
+    expanded.push(...variants.map((item) => `${prefix}/${item}`));
+  }
+
+  return expanded.join(" ");
 }
 
 function normalizeTaskToolArguments(

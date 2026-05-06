@@ -15,9 +15,17 @@ function testConfig(): ProxyConfig {
   return {
     port: 0,
     switchApi: "OPENAI",
+    activeChannel: "default",
+    channels: {
+      default: {
+        baseUrl: "https://example.test/v1",
+        apiKeys: ["test-key"],
+        model: "test-model",
+      },
+    },
     openaiBaseUrl: "https://example.test/v1",
     codexBaseUrl: "https://codex.example.test/v1",
-    openaiApiKey: "test-key",
+    openaiApiKeys: ["test-key"],
     codexApiKey: "codex-test-key",
     openaiModel: "test-model",
     codexModel: "codex-test-model",
@@ -34,7 +42,7 @@ function testConfig(): ProxyConfig {
     requestLogDir: "",
     indexingMode: "off",
     embedBaseUrl: "",
-    embedApiKey: "",
+    embedApiKeys: [],
     embedModel: "",
     embedDimensions: 0,
     qdrantUrl: "",
@@ -253,7 +261,14 @@ function codexConfig(): ProxyConfig {
     switchApi: "CODEX",
     openaiBaseUrl: "https://openai.example.test/v1",
     codexBaseUrl: "https://codex.example.test/v1",
-    openaiApiKey: "openai-key",
+    channels: {
+      default: {
+        baseUrl: "https://openai.example.test/v1",
+        apiKeys: ["openai-key"],
+        model: "openai-model",
+      },
+    },
+    openaiApiKeys: ["openai-key"],
     codexApiKey: "codex-key",
     openaiModel: "openai-model",
     codexModel: "codex-model",
@@ -3055,6 +3070,102 @@ Deno.test("launch-process with pipe gets pipefail guard", async () => {
       assertEquals(
         input.command,
         "set -o pipefail; haxe -p src -main TestAll --interp 2>&1 | head -30",
+      );
+    },
+  );
+});
+
+Deno.test("launch-process expands mkdir brace paths to explicit directories", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_mkdir_brace",
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command:
+              "mkdir -p /home/vscode/projects/rust-wiki/docs/{compiler,library,tools} && echo \"Directory created\"",
+            cwd: "/home/vscode/projects",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      const input = firstToolInput(body);
+      assertEquals(
+        input.command,
+        "mkdir -p /home/vscode/projects/rust-wiki/docs/compiler /home/vscode/projects/rust-wiki/docs/library /home/vscode/projects/rust-wiki/docs/tools && echo \"Directory created\"",
+      );
+    },
+  );
+});
+
+Deno.test("launch-process expands mkdir brace paths before later chained commands", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_mkdir_brace_ls",
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command:
+              "mkdir -p /home/vscode/projects/rust-wiki-docs/{compiler,library,tools,architecture} && ls /home/vscode/projects/rust-wiki-docs/",
+            cwd: "/home/vscode/projects",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      const input = firstToolInput(body);
+      assertEquals(
+        input.command,
+        "mkdir -p /home/vscode/projects/rust-wiki-docs/compiler /home/vscode/projects/rust-wiki-docs/library /home/vscode/projects/rust-wiki-docs/tools /home/vscode/projects/rust-wiki-docs/architecture && ls /home/vscode/projects/rust-wiki-docs/",
+      );
+    },
+  );
+});
+
+Deno.test("launch-process expands mkdir brace paths even when closing brace is missing", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_mkdir_brace_missing_close",
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command:
+              "mkdir -p /home/vscode/projects/bevy_haxe/src/haxe/{ecs,math,utils && echo \"created\"",
+            cwd: "/home/vscode/projects",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      const input = firstToolInput(body);
+      assertEquals(
+        input.command,
+        "mkdir -p /home/vscode/projects/bevy_haxe/src/haxe/ecs /home/vscode/projects/bevy_haxe/src/haxe/math /home/vscode/projects/bevy_haxe/src/haxe/utils && echo \"created\"",
       );
     },
   );
