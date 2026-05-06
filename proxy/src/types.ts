@@ -6,6 +6,7 @@ export interface ChannelConfig {
   baseUrl: string;
   apiKeys: string[];
   model?: string;
+  modelMapping?: Record<string, string>;
 }
 
 export interface ProxyConfig {
@@ -13,6 +14,7 @@ export interface ProxyConfig {
   switchApi: SwitchApi;
   activeChannel: string;
   channels: Record<string, ChannelConfig>;
+  modelMapping: Record<string, string>;
   openaiBaseUrl: string;
   codexBaseUrl: string;
   openaiApiKeys: string[];

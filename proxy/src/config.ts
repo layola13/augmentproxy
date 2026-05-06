@@ -63,7 +63,11 @@ function parseApiKeys(envVar: string, fileEnvVar: string): string[] {
   return [...new Set(keys)];
 }
 
-function loadTomlConfig(path: string): { activeChannel?: string; channels?: Record<string, ChannelConfig> } {
+function loadTomlConfig(path: string): { 
+  activeChannel?: string; 
+  channels?: Record<string, ChannelConfig>;
+  modelMapping?: Record<string, string>;
+} {
   try {
     const text = Deno.readTextFileSync(path);
     const data = parseToml(text) as any;
@@ -77,6 +81,7 @@ function loadTomlConfig(path: string): { activeChannel?: string; channels?: Reco
             baseUrl: p.base_url || "",
             apiKeys: Array.isArray(p.api_keys) ? p.api_keys : (p.api_key ? [p.api_key] : []),
             model: p.model,
+            modelMapping: p.model_mapping && typeof p.model_mapping === "object" ? p.model_mapping : undefined,
           };
         }
       }
@@ -85,6 +90,7 @@ function loadTomlConfig(path: string): { activeChannel?: string; channels?: Reco
     return {
       activeChannel: data.model_provider || data.active_channel,
       channels,
+      modelMapping: data.model_mapping && typeof data.model_mapping === "object" ? data.model_mapping : undefined,
     };
   } catch (e) {
     if (!(e instanceof Deno.errors.NotFound)) {
@@ -113,11 +119,25 @@ export function loadConfig(): ProxyConfig {
   const codexApiKey = env("CODEX_API_KEY");
   const codexBaseUrl = env("CODEX_BASE_URL");
 
+  const modelMapping = tomlData.modelMapping || {};
+  // Parse MODEL_MAP_ logical model mappings from env
+  for (const [key, value] of Object.entries(Deno.env.toObject())) {
+    if (key.startsWith("MODEL_MAP_")) {
+      const logicalName = key.slice("MODEL_MAP_".length).toLowerCase().replace(/_/g, ".");
+      // e.g. MODEL_MAP_GPT_5_4_MINI -> gpt.5.4.mini
+      // We also handle common variants
+      modelMapping[logicalName] = value;
+      // Also try dash version: gpt-5.4-mini
+      modelMapping[logicalName.replace(/\./g, "-")] = value;
+    }
+  }
+
   const config: ProxyConfig = {
     port: envNumber("PROXY_PORT", 8765),
     switchApi,
     activeChannel: tomlData.activeChannel || env("ACTIVE_CHANNEL", "default"),
     channels: tomlData.channels || {},
+    modelMapping,
     openaiBaseUrl: normalizeBaseUrl(env("OPENAI_BASE_URL", "https://api.openai.com")),
     codexBaseUrl: codexBaseUrl ? normalizeBaseUrl(codexBaseUrl) : "",
     openaiApiKeys,
@@ -191,8 +211,21 @@ export function getOpenAIUrl(config: ProxyConfig): string {
   return channel ? channel.baseUrl : config.openaiBaseUrl;
 }
 
-export function getOpenAIModel(config: ProxyConfig): string {
+export function getOpenAIModel(config: ProxyConfig, requestedModel?: string): string {
   const channel = getCurrentChannel(config);
+  
+  if (requestedModel) {
+    // 1. Try channel-specific mapping
+    if (channel?.modelMapping?.[requestedModel]) {
+      return channel.modelMapping[requestedModel];
+    }
+    
+    // 2. Try global mapping
+    if (config.modelMapping[requestedModel]) {
+      return config.modelMapping[requestedModel];
+    }
+  }
+
   return (channel && channel.model) ? channel.model : config.openaiModel;
 }
 

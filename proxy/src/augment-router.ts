@@ -160,8 +160,18 @@ export async function routeAugment(
   }
 
   if (path === "agents/codebase-retrieval") {
-    await recordRequest(config, ctx, "codebase-retrieval-recorded");
-    return jsonResponse(await handleCodebaseRetrieval(config, ctx));
+    const body = bodyObject(ctx);
+    logInfo(config, "agents:codebase-retrieval:call", {
+      requestId: ctx.requestId,
+      query: body.information_request,
+      folder: body.workspace_folder,
+    });
+    const result = await handleCodebaseRetrieval(config, ctx);
+    logInfo(config, "agents:codebase-retrieval:result", {
+      requestId: ctx.requestId,
+      chars: (result as any).formattedRetrieval?.length ?? 0,
+    });
+    return jsonResponse(result);
   }
 
   if (

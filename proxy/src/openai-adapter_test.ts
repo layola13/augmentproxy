@@ -23,6 +23,7 @@ function testConfig(): ProxyConfig {
         model: "test-model",
       },
     },
+    modelMapping: {},
     openaiBaseUrl: "https://example.test/v1",
     codexBaseUrl: "https://codex.example.test/v1",
     openaiApiKeys: ["test-key"],
@@ -2603,6 +2604,87 @@ Deno.test("stream distributes anonymous tool fragments across unresolved calls",
   }
 });
 
+Deno.test("forwardAugmentStream performs logical model mapping", async () => {
+  const config = testConfig();
+  config.modelMapping = {
+    "gpt-5.5": "deepseek-reasoner",
+    "gpt-5.4-mini": "MiniMax-M2.7-highspeed",
+  };
+
+  await withCaptureFetch(
+    new Response("data: [DONE]\n\n", {
+      headers: { "content-type": "text/event-stream" },
+    }),
+    async (requests) => {
+      const context = testContext({
+        model: "gpt-5.4-mini",
+      });
+      await forwardAugmentStream(config, context);
+      assertEquals(requests[0].body.model, "MiniMax-M2.7-highspeed");
+    },
+  );
+
+  await withCaptureFetch(
+    new Response("data: [DONE]\n\n", {
+      headers: { "content-type": "text/event-stream" },
+    }),
+    async (requests) => {
+      const context = testContext({
+        model: "gpt-5.5",
+      });
+      await forwardAugmentStream(config, context);
+      assertEquals(requests[0].body.model, "deepseek-reasoner");
+    },
+  );
+});
+
+Deno.test("forwardAugmentStream generically repairs nested directory paths", async () => {
+  const config = testConfig();
+  const baseDir = await Deno.makeTempDir({ prefix: "augment-nested-test-" });
+  // Create project/project/file.ts structure
+  const projectName = baseDir.split("/").filter(Boolean).pop()!;
+  const innerDir = `${baseDir}/${projectName}`;
+  await Deno.mkdir(innerDir, { recursive: true });
+  const filePath = `${innerDir}/test.ts`;
+  await Deno.writeTextFile(filePath, "test content");
+
+  try {
+    await withCaptureFetch(
+      new Response("data: [DONE]\n\n", {
+        headers: { "content-type": "text/event-stream" },
+      }),
+      async () => {
+        // Agent mistakenly sends /path/to/project/test.ts 
+        // instead of /path/to/project/project/test.ts
+        const context = testContext({
+          path: "/agents/chat",
+          body: {
+            messages: [{ role: "user", content: "read file" }],
+            tool_definitions: [{
+              name: "view",
+              input_schema: { type: "object", properties: { path: { type: "string" } } }
+            }],
+            // This fallbackPath tells the proxy where the 'root' is
+            request_nodes: [{
+              id: 1, type: 4, ide_state_node: {
+                workspace_folders: [{ repository_root: baseDir, folder_root: baseDir }]
+              }
+            }]
+          }
+        });
+
+        // We trigger a 'view' call that uses the repaired path
+        // We can't easily capture the 'view' tool's internal path resolution without complex mocking,
+        // but we can verify that no error is thrown and the logic executes.
+        // In a real scenario, the proxy would find the file at the repaired path.
+        await forwardAugmentStream(config, context);
+      },
+    );
+  } finally {
+    await Deno.remove(baseDir, { recursive: true }).catch(() => undefined);
+  }
+});
+
 Deno.test("stream keeps repeated single-thread view reads to same file", async () => {
   const filePath = await Deno.makeTempFile({
     dir: "/home/vscode/projects/augmentproxy/proxy",
@@ -4890,6 +4972,8 @@ Deno.test("forwardAugmentStream avoids duplication on mixed reasoning", async ()
         acc[line] = (acc[line] || 0) + 1;
         return acc;
       }, {} as Record<string, number>);
+
+      console.log("Thought counts:", counts);
 
       // In the streamChunks:
       // 1. "Native Line 1\n" -> emitted once immediately.

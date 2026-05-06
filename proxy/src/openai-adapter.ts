@@ -31,11 +31,11 @@ function collectReasoningFields(value: JsonObject): string[] {
   const output: string[] = [];
   for (const key of ["reasoning_content", "reasoning", "thinking", "reason"]) {
     const field = value[key];
-    if (typeof field === "string" && field.trim()) output.push(field.trim());
+    if (typeof field === "string" && field) output.push(field);
     else if (field && typeof field === "object" && !Array.isArray(field)) {
       const nested = field as JsonObject;
       const nestedText = text(nested.content ?? nested.summary ?? nested.text);
-      if (nestedText.trim()) output.push(nestedText.trim());
+      if (nestedText) output.push(nestedText);
     }
   }
   return output;
@@ -229,6 +229,7 @@ function historyToMessages(
   for (const item of asArray(history)) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const record = item as JsonObject;
+    const messagesAtStartOfTurn = messages.length;
 
     const requestNodes = asArray(record.request_nodes);
     const responseNodes = asArray(record.response_nodes);
@@ -315,7 +316,9 @@ function historyToMessages(
     }
     orphanToolResults.push(...unmatchedToolResults);
 
-    if (messages.length === 0) {
+    // If this turn hasn't been captured via nodes yet, try the fallback role/content format.
+    // We check if we added any new messages for THIS turn by comparing length with start.
+    if (messages.length === messagesAtStartOfTurn) {
       const roleRaw = text(record.role || record.speaker || record.type)
         .toLowerCase();
       const role: "user" | "assistant" =
@@ -432,6 +435,8 @@ function toolResultMessages(
   skipToolCallIds = new Set<string>(),
 ): OpenAIMessage[] {
   const output: OpenAIMessage[] = [];
+  const orphanResults: string[] = [];
+
   for (const node of asArray(nodes)) {
     if (!node || typeof node !== "object" || Array.isArray(node)) continue;
     const toolResult = (node as JsonObject).tool_result_node;
@@ -444,8 +449,24 @@ function toolResultMessages(
     if (id && skipToolCallIds.has(id)) continue;
     const content = compactToolResultContent(text(result.content));
     if (!content.trim()) continue;
-    if (id) output.push({ role: "tool", tool_call_id: id, content });
+    
+    if (id) {
+      output.push({ role: "tool", tool_call_id: id, content });
+    } else {
+      orphanResults.push(content);
+    }
   }
+
+  if (orphanResults.length > 0) {
+    output.push({
+      role: "user",
+      content: [
+        "Proxy context: the following tool results were recorded without a valid tool_use_id. Treat them as context and continue.",
+        ...orphanResults,
+      ].join("\n\n"),
+    });
+  }
+
   return output;
 }
 
@@ -977,16 +998,37 @@ function buildOpenAITools(ctx: RequestContext): JsonObject[] {
     ? body.tool_definitions
     : [];
   const tools: JsonObject[] = [];
+  let hasSaveFile = false;
   for (const item of toolDefinitions) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const tool = item as JsonObject;
     if (typeof tool.name !== "string" || !tool.name) continue;
+    if (tool.name === "save-file") hasSaveFile = true;
     tools.push({
       type: "function",
       function: {
         name: tool.name,
         description: toolDescriptionForModel(tool),
         parameters: parseToolSchema(tool),
+      },
+    });
+  }
+
+  // Inject save-file if missing, as sub-agents often need it to persist results
+  if (!hasSaveFile) {
+    tools.push({
+      type: "function",
+      function: {
+        name: "save-file",
+        description: "Save a new file to the workspace. Use this to persist generated content or create new source files.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Absolute path to the new file." },
+            file_content: { type: "string", description: "Complete content of the file." },
+          },
+          required: ["path", "file_content"],
+        },
       },
     });
   }
@@ -2608,6 +2650,19 @@ function repairViewPath(path: string, fallbackPath?: string): string {
   };
 
   addCandidate(cleaned);
+  
+  // Generic nested directory repair: 
+  // If we have a path like /root/project/subdir and it doesn't exist, 
+  // agents often miss that it's actually /root/project/project/subdir.
+  if (fallback && cleaned.startsWith(fallback)) {
+    const relativePart = cleaned.slice(fallback.length).replace(/^\/+/, "");
+    const lastBaseSegment = fallback.split("/").filter(Boolean).pop();
+    if (lastBaseSegment) {
+      // Try injecting the last segment of the base path again
+      addCandidate(`${fallback}/${lastBaseSegment}/${relativePart}`);
+    }
+  }
+  
   if (fallback && cleaned === ".") addCandidate(fallback);
   if (fallback && !isAbsolutePath(cleaned)) {
     addCandidate(joinPath(fallback, cleaned.replace(/^\.\//, "")));
@@ -4137,7 +4192,7 @@ function buildChatRequest(
     messages.push({ role: "user", content: continuationNudge });
   }
   const request: OpenAIChatRequest = {
-    model: activeUpstreamModel(config),
+    model: activeUpstreamModel(config, body.model as string | undefined),
     messages,
     stream,
   };
@@ -4432,8 +4487,13 @@ function openAIUrl(config: ProxyConfig): string {
   return `${getOpenAIUrl(config)}/chat/completions`;
 }
 
-function activeUpstreamModel(config: ProxyConfig): string {
-  return config.switchApi === "CODEX" ? config.codexModel : getOpenAIModel(config);
+function activeUpstreamModel(config: ProxyConfig, requestedModel?: string): string {
+  if (config.switchApi === "CODEX") return config.codexModel;
+  const mapped = getOpenAIModel(config, requestedModel);
+  if (requestedModel && mapped !== requestedModel) {
+    logInfo(config, "openai:model:mapped", { original: requestedModel, mapped });
+  }
+  return mapped;
 }
 
 function normalizeResponsesUsage(usage: JsonValue): JsonValue {
@@ -4666,6 +4726,7 @@ export async function forwardAugmentJson(
   config: ProxyConfig,
   ctx: RequestContext,
 ): Promise<Response> {
+  const body = objectBody(ctx);
   const continuationNudge = continuationControlNudge(ctx);
   const forceToolChoiceRequired = Boolean(continuationNudge);
   const request = buildOpenAIRequest(
@@ -4680,7 +4741,7 @@ export async function forwardAugmentJson(
   logInfo(config, "openai:json:start", {
     requestId: ctx.requestId,
     api: config.switchApi,
-    model: activeUpstreamModel(config),
+    model: activeUpstreamModel(config, body.model as string | undefined),
     url: openAIUrl(config),
   });
   logInfo(config, "openai:json:payload", {
@@ -5306,12 +5367,31 @@ export async function forwardAugmentStream(
       const encoder = new TextEncoder();
       const decoder = new TextDecoder();
       let buffer = "";
-      const thinkingFilter = new ThinkingStreamFilter();
-      let nativeThinking = "";
-      // Keep track of finished lines to avoid re-processing everything
-      const nativeLinesBuffer: string[] = [];
-      let tagLinesEmitted = 0;
-      let nativeLinesEmitted = 0;
+      let emittedLinesCount = 0;
+      const allFinishedLines: string[] = [];
+      const lineBuffer = {
+        buffer: "",
+        push(text: string) {
+          this.buffer += text;
+          if (this.buffer.includes("\n")) {
+            const lines = this.buffer.split("\n");
+            for (let i = 0; i < lines.length - 1; i++) {
+              const trimmed = lines[i].trim();
+              if (trimmed) allFinishedLines.push(trimmed);
+            }
+            this.buffer = lines[lines.length - 1];
+          }
+        },
+        flush() {
+          const trimmed = this.buffer.trim();
+          if (trimmed) allFinishedLines.push(trimmed);
+          this.buffer = "";
+        },
+      };
+
+      const thinkingFilter = new ThinkingStreamFilter((text) =>
+        lineBuffer.push(text)
+      );
       
       let visibleText = "";
       let emittedVisibleText = false;
@@ -5323,6 +5403,7 @@ export async function forwardAugmentStream(
       let staleRejectedStreamText = false;
       let closed = false;
       let nextNodeId = 2; // ID 1 reserved for text node
+
       const safeEnqueue = (value: JsonObject) => {
         if (closed) return;
         try {
@@ -5332,47 +5413,20 @@ export async function forwardAugmentStream(
         }
       };
 
-      const emitNewThoughts = (isFinal = false) => {
-        // 1. Process tag thoughts (from thinkingFilter)
-        // thinkingFilter.thinking is already an array of completed thoughts
-        const currentTags = thinkingFilter.thinking.flatMap(t => 
-          t.split("\n").map(l => l.trim()).filter(Boolean)
-        );
-        const newTags = currentTags.slice(tagLinesEmitted);
-
-        // 2. Process native reasoning incrementally
-        if (nativeThinking.includes("\n") || (isFinal && nativeThinking.trim())) {
-          const parts = nativeThinking.split("\n");
-          // If not final, the last part might be incomplete
-          const complete = isFinal ? parts : parts.slice(0, -1);
-          for (const line of complete) {
-            const trimmed = line.trim();
-            if (trimmed) nativeLinesBuffer.push(trimmed);
-          }
-          // Keep only the incomplete part in nativeThinking
-          nativeThinking = isFinal ? "" : parts[parts.length - 1];
-        }
-
-        const newNative = nativeLinesBuffer.slice(nativeLinesEmitted);
-        const combined = [...newTags, ...newNative];
-
-        if (combined.length > 0) {
-          const nodes = thinkingNodes(combined).map((node) => ({
+      const emitNewThoughts = () => {
+        if (closed) return;
+        const newThoughts = allFinishedLines.slice(emittedLinesCount);
+        if (newThoughts.length > 0) {
+          const nodes = thinkingNodes(newThoughts).map((node) => ({
             ...node,
             id: nextNodeId++,
           }));
           safeEnqueue({ text: "", nodes, request_id: requestId });
-          tagLinesEmitted = currentTags.length;
-          nativeLinesEmitted = nativeLinesBuffer.length;
+          emittedLinesCount = allFinishedLines.length;
         }
       };
       
-      const allCurrentThinking = () => {
-        const currentTags = thinkingFilter.thinking.flatMap(t => 
-          t.split("\n").map(l => l.trim()).filter(Boolean)
-        );
-        return [...currentTags, ...nativeLinesBuffer];
-      };
+      const allCurrentThinking = () => allFinishedLines;
 
       const enqueueTerminalError = (message: string) => {
         safeEnqueue({
@@ -5441,7 +5495,7 @@ export async function forwardAugmentStream(
         finish();
       };
       const enqueueVisibleText = (visible: string) => {
-        if (!visible) return;
+        if (!visible || closed) return;
         if (staleRejectedStreamText) return;
         const candidate = visibleText + visible;
         if (hasToolCallRejectedText(candidate)) {
@@ -5506,10 +5560,11 @@ export async function forwardAugmentStream(
           let upstream: Response | undefined;
           let upstreamAttempts = 0;
           let streamInterruptionReason = "";
+          const body = objectBody(ctx);
           logInfo(config, "openai:stream:start", {
             requestId,
             api: config.switchApi,
-            model: activeUpstreamModel(config),
+            model: activeUpstreamModel(config, body.model as string | undefined),
             url: openAIUrl(config),
           });
           logInfo(config, "openai:stream:payload", {
@@ -5521,7 +5576,7 @@ export async function forwardAugmentStream(
           });
           let requestBody = JSON.stringify(request);
           let usedToolChoiceFallback = false;
-          while (true) {
+          while (!closed) {
             upstreamAttempts += 1;
             const waitLogger = setInterval(
               () =>
@@ -5540,7 +5595,7 @@ export async function forwardAugmentStream(
             } catch (error) {
               clearInterval(waitLogger);
               const message = error instanceof Error ? error.message : String(error);
-              const retry = upstreamAttempts < 2;
+              const retry = upstreamAttempts < 2 && !closed;
               logError(config, "openai:stream:fetch-error", {
                 requestId,
                 attempt: upstreamAttempts,
@@ -5557,6 +5612,11 @@ export async function forwardAugmentStream(
               return;
             } finally {
               clearInterval(waitLogger);
+            }
+
+            if (closed) {
+               // Client disconnected while we were waiting for upstream headers
+               return;
             }
 
             logInfo(config, "openai:stream:headers", {
@@ -5665,9 +5725,12 @@ export async function forwardAugmentStream(
           }
 
           const reader = upstream.body.getReader();
-          while (true) {
+          while (!closed) {
             const { value, done } = await reader.read();
-            if (done) break;
+            if (done || closed) {
+              if (closed) await reader.cancel().catch(() => {});
+              break;
+            }
             if (!value) continue;
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split(/\r?\n/);
@@ -5684,25 +5747,23 @@ export async function forwardAugmentStream(
                 streamToolCalls.push(...parsed.toolCalls);
               }
               if (parsed.thinking?.length) {
-                nativeThinking += parsed.thinking.join("");
-                emitNewThoughts(false);
+                lineBuffer.push(parsed.thinking.join(""));
+                emitNewThoughts();
               }
               if (parsed.content) {
                 if (parsed.contentFromDone && emittedVisibleText) continue;
-                // If content started, any pending native thinking should be flushed
-                emitNewThoughts(true);
                 upstreamChunks += 1;
                 upstreamContentChars += parsed.content.length;
                 const visible = thinkingFilter.push(parsed.content);
                 enqueueVisibleText(visible);
-                emitNewThoughts(false);
+                emitNewThoughts();
               }
             }
           }
           const flushed = thinkingFilter.flush();
           enqueueVisibleText(flushed.visible);
-          // Final flush of all remaining reasoning
-          emitNewThoughts(true);
+          lineBuffer.flush();
+          emitNewThoughts();
           if (streamInterruptionReason) {
             logWarn(config, "openai:stream:upstream-interrupted", {
               requestId,
@@ -5714,7 +5775,7 @@ export async function forwardAugmentStream(
           }
           if (
             !sawDone && streamToolCalls.length === 0 &&
-            !visibleText.trim() && !nativeThinking.trim() &&
+            !visibleText.trim() && allFinishedLines.length === 0 &&
             !flushed.visible.trim() && flushed.thinking.length === 0
           ) {
             logWarn(config, "openai:stream:ended-without-done-or-content", {
@@ -5859,7 +5920,7 @@ export async function forwardAugmentStream(
           
           // IMPORTANT: Only include thoughts that haven't been emitted yet during the stream.
           // The CLI TUI prints every thinking node it receives, so re-sending them causes duplication.
-          const finalNewThoughts = allThinking.slice(tagLinesEmitted + nativeLinesEmitted);
+          const finalNewThoughts = allThinking.slice(emittedLinesCount);
           
           let currentFinalNodeId = nextNodeId; // Continue from where incremental emission left off
           const thoughtNodes = thinkingNodes(finalNewThoughts).map((node) => ({
