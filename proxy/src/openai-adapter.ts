@@ -1054,10 +1054,20 @@ function splitThinkingTags(
 }
 
 function thinkingNodes(thinking: string[], startingId = 1000): JsonObject[] {
-  return thinking.map((content, index) => ({
+  const lines: string[] = [];
+  for (const t of thinking) {
+    for (const line of t.split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed) lines.push(trimmed);
+    }
+  }
+  return lines.map((text, index) => ({
     id: startingId + index,
     type: 8,
-    thinking: { content },
+    thinking: {
+      summary: text.length > 120 ? text.slice(0, 117) + "..." : text,
+      content: text,
+    },
   }));
 }
 
@@ -5078,19 +5088,33 @@ class ThinkingStreamFilter {
         }
         const open = this.pending.search(/<\/?(?:think|thinking|reason)\b/i);
         if (open < 0) {
-          const keep = Math.min(this.pending.length, 16);
-          const flushLen = Math.max(0, this.pending.length - keep);
-          for (let index = 0; index < flushLen;) {
-            if (this.pending.startsWith("```")) {
-              visible += this.consumeVisibleChar();
-              index += 3;
-            } else {
-              visible += this.consumeVisibleChar();
-              index += 1;
+          // If no tag found, we can safely consume everything EXCEPT the last few chars
+          // in case they are a partial tag (e.g. "<thi")
+          const lastOpenBracket = this.pending.lastIndexOf("<");
+          let safeLen = this.pending.length;
+          if (lastOpenBracket >= 0) {
+            // Check if from lastOpenBracket to end could be a partial tag
+            const partial = this.pending.slice(lastOpenBracket);
+            if (/^<(?!\s)/.test(partial)) {
+              safeLen = lastOpenBracket;
+            }
+          }
+
+          if (safeLen > 0) {
+            for (let index = 0; index < safeLen;) {
+              if (this.pending.startsWith("```")) {
+                visible += this.consumeVisibleChar();
+                index += 3;
+              } else {
+                visible += this.consumeVisibleChar();
+                index += 1;
+              }
             }
           }
           break;
         }
+
+        // Tag found at 'open'. Consume everything before it.
         for (let index = 0; index < open;) {
           if (this.pending.startsWith("```")) {
             visible += this.consumeVisibleChar();
@@ -5100,10 +5124,16 @@ class ThinkingStreamFilter {
             index += 1;
           }
         }
-        if (this.inCode()) continue;
+
         const match = this.pending.match(/^<(think|thinking|reason)\b[^>]*>/i);
         if (!match) {
-          if (this.pending.length < 32) break;
+          // It matched search but not start-with. Check if it's a full tag yet.
+          const tagClosingBracket = this.pending.indexOf(">");
+          if (tagClosingBracket < 0 && this.pending.length < 64) {
+            // Partial tag like "<thinking", wait for more
+            break;
+          }
+          // Not a tag after all (e.g. "<3"), consume the bracket
           visible += this.consumeVisibleChar();
           continue;
         }
@@ -5286,7 +5316,12 @@ export async function forwardAugmentStream(
       const decoder = new TextDecoder();
       let buffer = "";
       const thinkingFilter = new ThinkingStreamFilter();
-      const thinkingBuffer: string[] = [];
+      let nativeThinking = "";
+      // Keep track of finished lines to avoid re-processing everything
+      const nativeLinesBuffer: string[] = [];
+      let tagLinesEmitted = 0;
+      let nativeLinesEmitted = 0;
+      
       let visibleText = "";
       let emittedVisibleText = false;
       let sawDone = false;
@@ -5296,6 +5331,7 @@ export async function forwardAugmentStream(
       let finishReason = "";
       let staleRejectedStreamText = false;
       let closed = false;
+      let nextNodeId = 2; // ID 1 reserved for text node
       const safeEnqueue = (value: JsonObject) => {
         if (closed) return;
         try {
@@ -5304,6 +5340,49 @@ export async function forwardAugmentStream(
           closed = true;
         }
       };
+
+      const emitNewThoughts = (isFinal = false) => {
+        // 1. Process tag thoughts (from thinkingFilter)
+        // thinkingFilter.thinking is already an array of completed thoughts
+        const currentTags = thinkingFilter.thinking.flatMap(t => 
+          t.split("\n").map(l => l.trim()).filter(Boolean)
+        );
+        const newTags = currentTags.slice(tagLinesEmitted);
+
+        // 2. Process native reasoning incrementally
+        if (nativeThinking.includes("\n") || (isFinal && nativeThinking.trim())) {
+          const parts = nativeThinking.split("\n");
+          // If not final, the last part might be incomplete
+          const complete = isFinal ? parts : parts.slice(0, -1);
+          for (const line of complete) {
+            const trimmed = line.trim();
+            if (trimmed) nativeLinesBuffer.push(trimmed);
+          }
+          // Keep only the incomplete part in nativeThinking
+          nativeThinking = isFinal ? "" : parts[parts.length - 1];
+        }
+
+        const newNative = nativeLinesBuffer.slice(nativeLinesEmitted);
+        const combined = [...newTags, ...newNative];
+
+        if (combined.length > 0) {
+          const nodes = thinkingNodes(combined).map((node) => ({
+            ...node,
+            id: nextNodeId++,
+          }));
+          safeEnqueue({ text: "", nodes, request_id: requestId });
+          tagLinesEmitted = currentTags.length;
+          nativeLinesEmitted = nativeLinesBuffer.length;
+        }
+      };
+      
+      const allCurrentThinking = () => {
+        const currentTags = thinkingFilter.thinking.flatMap(t => 
+          t.split("\n").map(l => l.trim()).filter(Boolean)
+        );
+        return [...currentTags, ...nativeLinesBuffer];
+      };
+
       const enqueueTerminalError = (message: string) => {
         safeEnqueue({
           text: message,
@@ -5614,19 +5693,25 @@ export async function forwardAugmentStream(
                 streamToolCalls.push(...parsed.toolCalls);
               }
               if (parsed.thinking?.length) {
-                thinkingBuffer.push(...parsed.thinking);
+                nativeThinking += parsed.thinking.join("");
+                emitNewThoughts(false);
               }
               if (parsed.content) {
                 if (parsed.contentFromDone && emittedVisibleText) continue;
+                // If content started, any pending native thinking should be flushed
+                emitNewThoughts(true);
                 upstreamChunks += 1;
                 upstreamContentChars += parsed.content.length;
                 const visible = thinkingFilter.push(parsed.content);
                 enqueueVisibleText(visible);
+                emitNewThoughts(false);
               }
             }
           }
           const flushed = thinkingFilter.flush();
           enqueueVisibleText(flushed.visible);
+          // Final flush of all remaining reasoning
+          emitNewThoughts(true);
           if (streamInterruptionReason) {
             logWarn(config, "openai:stream:upstream-interrupted", {
               requestId,
@@ -5638,7 +5723,7 @@ export async function forwardAugmentStream(
           }
           if (
             !sawDone && streamToolCalls.length === 0 &&
-            !visibleText.trim() && thinkingBuffer.length === 0 &&
+            !visibleText.trim() && !nativeThinking.trim() &&
             !flushed.visible.trim() && flushed.thinking.length === 0
           ) {
             logWarn(config, "openai:stream:ended-without-done-or-content", {
@@ -5767,7 +5852,7 @@ export async function forwardAugmentStream(
               fallbackPath,
             });
           }
-          const allThinking = [...thinkingBuffer, ...flushed.thinking].filter((
+          const allThinking = allCurrentThinking().filter((
             item,
           ) => item.trim());
           logInfo(config, "openai:stream:end", {
@@ -5780,16 +5865,15 @@ export async function forwardAugmentStream(
             toolFragments: streamToolCalls.length,
           });
           const responseNode = textResponseNode(visibleText, 1);
-          let nextNodeId = responseNode ? 2 : 1;
-          const thoughtNodes = hasMeaningfulVisibleText(visibleText)
-            ? []
-            : thinkingNodes(allThinking).map((node) => ({
-              ...node,
-              id: nextNodeId++,
-            }));
+          let currentFinalNodeId = 2; // ID 1 is always the text node
+          
+          const thoughtNodes = thinkingNodes(allThinking).map((node) => ({
+            ...node,
+            id: currentFinalNodeId++,
+          }));
           const persistedToolNodes = toolNodes.map((node) => ({
             ...node,
-            id: nextNodeId++,
+            id: currentFinalNodeId++,
           }));
           const finalNodes = [
             ...(responseNode ? [responseNode] : []),
@@ -5797,8 +5881,11 @@ export async function forwardAugmentStream(
             ...persistedToolNodes,
             tokenUsageNode(config, request, streamUsage ?? null),
           ];
+
           if (
-            !hasMeaningfulVisibleText(visibleText) && finalNodes.length === 0
+            !hasMeaningfulVisibleText(visibleText) && 
+            toolNodes.length === 0 && 
+            allThinking.length === 0
           ) {
             logWarn(config, "openai:stream:empty-keepalive", {
               requestId,
@@ -5807,29 +5894,34 @@ export async function forwardAugmentStream(
               upstreamChunks,
               upstreamContentChars,
             });
-            enqueueTerminalText("", {
+            safeEnqueue({
+              text: "",
               heartbeat: true,
               empty_upstream: true,
+              request_id: requestId,
+              done: true,
             });
+            finish();
             return;
           }
+          
+          // If we have any nodes (text, tools, or new thoughts), send them.
           if (finalNodes.length > 0) {
             safeEnqueue({ text: "", nodes: finalNodes, request_id: requestId });
           }
+          
           logInfo(config, "openai:stream:final", {
             requestId,
             visibleChars: visibleText.length,
             nodes: finalNodes.length,
+            thinking: allThinking.length,
           });
-          const finalText = emittedVisibleText ? "" : visibleText;
-          const finalTokenUsage = augmentTokenUsage(
-            config,
-            request,
-            streamUsage ?? null,
-          );
+          
           const finalUsage = openAIUsage(config, request, streamUsage ?? null);
+          const finalTokenUsage = augmentTokenUsage(config, request, streamUsage ?? null);
+          
           safeEnqueue({
-            text: finalText,
+            text: "", // Never repeat full text in the 'text' field if done=true to avoid UI overlap
             response_text: visibleText,
             completion: visibleText,
             token_usage: finalTokenUsage,
