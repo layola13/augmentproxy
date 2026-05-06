@@ -5061,6 +5061,8 @@ class ThinkingStreamFilter {
   private fencedCode = false;
   readonly thinking: string[] = [];
 
+  constructor(private onThinkingText?: (text: string) => void) {}
+
   private consumeVisibleChar(): string {
     const char = this.pending[0];
     if (this.pending.startsWith("```")) {
@@ -5088,16 +5090,11 @@ class ThinkingStreamFilter {
         }
         const open = this.pending.search(/<\/?(?:think|thinking|reason)\b/i);
         if (open < 0) {
-          // If no tag found, we can safely consume everything EXCEPT the last few chars
-          // in case they are a partial tag (e.g. "<thi")
           const lastOpenBracket = this.pending.lastIndexOf("<");
           let safeLen = this.pending.length;
           if (lastOpenBracket >= 0) {
-            // Check if from lastOpenBracket to end could be a partial tag
             const partial = this.pending.slice(lastOpenBracket);
-            if (/^<(?!\s)/.test(partial)) {
-              safeLen = lastOpenBracket;
-            }
+            if (/^<(?!\s)/.test(partial)) safeLen = lastOpenBracket;
           }
 
           if (safeLen > 0) {
@@ -5114,7 +5111,6 @@ class ThinkingStreamFilter {
           break;
         }
 
-        // Tag found at 'open'. Consume everything before it.
         for (let index = 0; index < open;) {
           if (this.pending.startsWith("```")) {
             visible += this.consumeVisibleChar();
@@ -5127,13 +5123,8 @@ class ThinkingStreamFilter {
 
         const match = this.pending.match(/^<(think|thinking|reason)\b[^>]*>/i);
         if (!match) {
-          // It matched search but not start-with. Check if it's a full tag yet.
           const tagClosingBracket = this.pending.indexOf(">");
-          if (tagClosingBracket < 0 && this.pending.length < 64) {
-            // Partial tag like "<thinking", wait for more
-            break;
-          }
-          // Not a tag after all (e.g. "<3"), consume the bracket
+          if (tagClosingBracket < 0 && this.pending.length < 64) break;
           visible += this.consumeVisibleChar();
           continue;
         }
@@ -5144,16 +5135,16 @@ class ThinkingStreamFilter {
         const close = this.pending.search(/<\/(?:think|thinking|reason)>/i);
         if (close < 0) {
           this.thinkingCurrent += this.pending;
+          this.onThinkingText?.(this.pending);
           this.pending = "";
           break;
         }
-        this.thinkingCurrent += this.pending.slice(0, close);
-        const closeMatch = this.pending.slice(close).match(
-          /^<\/(?:think|thinking|reason)>/i,
-        );
-        this.pending = this.pending.slice(
-          close + (closeMatch?.[0].length ?? 0),
-        );
+        const text = this.pending.slice(0, close);
+        this.thinkingCurrent += text;
+        this.onThinkingText?.(text);
+        this.pending = this.pending.slice(close);
+        const closeMatch = this.pending.match(/^<\/(think|thinking|reason)>/i);
+        this.pending = this.pending.slice(closeMatch?.[0].length ?? 0);
         const thought = this.thinkingCurrent.trim();
         if (thought) this.thinking.push(thought);
         this.thinkingCurrent = "";
@@ -5865,9 +5856,13 @@ export async function forwardAugmentStream(
             toolFragments: streamToolCalls.length,
           });
           const responseNode = textResponseNode(visibleText, 1);
-          let currentFinalNodeId = 2; // ID 1 is always the text node
           
-          const thoughtNodes = thinkingNodes(allThinking).map((node) => ({
+          // IMPORTANT: Only include thoughts that haven't been emitted yet during the stream.
+          // The CLI TUI prints every thinking node it receives, so re-sending them causes duplication.
+          const finalNewThoughts = allThinking.slice(tagLinesEmitted + nativeLinesEmitted);
+          
+          let currentFinalNodeId = nextNodeId; // Continue from where incremental emission left off
+          const thoughtNodes = thinkingNodes(finalNewThoughts).map((node) => ({
             ...node,
             id: currentFinalNodeId++,
           }));
