@@ -1,4 +1,5 @@
-import type { ProxyConfig, SwitchApi } from "./types.ts";
+import type { ChannelConfig, ProxyConfig, SwitchApi } from "./types.ts";
+import { parse as parseToml } from "jsr:@std/toml";
 
 function env(name: string, fallback = ""): string {
   return Deno.env.get(name)?.trim() || fallback;
@@ -41,6 +42,58 @@ function normalizeLogDir(value: string): string {
   return value;
 }
 
+function parseApiKeys(envVar: string, fileEnvVar: string): string[] {
+  const keys: string[] = [];
+  const envVal = env(envVar);
+  if (envVal) {
+    keys.push(...envVal.split(",").map(k => k.trim()).filter(Boolean));
+  }
+  const fileVal = env(fileEnvVar);
+  if (fileVal) {
+    try {
+      const text = Deno.readTextFileSync(fileVal);
+      const fileKeys = text.split(/\r?\n/)
+        .map(k => k.trim())
+        .filter(k => k && !k.startsWith("#"));
+      keys.push(...fileKeys);
+    } catch (e) {
+      console.warn(`[Config] Failed to read keys from ${fileVal}: ${(e as Error).message}`);
+    }
+  }
+  return [...new Set(keys)];
+}
+
+function loadTomlConfig(path: string): { activeChannel?: string; channels?: Record<string, ChannelConfig> } {
+  try {
+    const text = Deno.readTextFileSync(path);
+    const data = parseToml(text) as any;
+    const channels: Record<string, ChannelConfig> = {};
+    
+    if (data.model_providers && typeof data.model_providers === "object") {
+      for (const [id, provider] of Object.entries(data.model_providers)) {
+        if (provider && typeof provider === "object") {
+          const p = provider as any;
+          channels[id] = {
+            baseUrl: p.base_url || "",
+            apiKeys: Array.isArray(p.api_keys) ? p.api_keys : (p.api_key ? [p.api_key] : []),
+            model: p.model,
+          };
+        }
+      }
+    }
+    
+    return {
+      activeChannel: data.model_provider || data.active_channel,
+      channels,
+    };
+  } catch (e) {
+    if (!(e instanceof Deno.errors.NotFound)) {
+      console.warn(`[Config] Failed to load TOML config from ${path}: ${(e as Error).message}`);
+    }
+    return {};
+  }
+}
+
 const defaultHistorySummaryPrompt = [
   "Create a compact continuation summary for this agent conversation.",
   "Preserve the user's explicit instructions, current objective, important decisions, files changed or inspected, commands run, test results, unresolved errors, and the next concrete steps.",
@@ -52,24 +105,22 @@ export function loadConfig(): ProxyConfig {
   const switchApi = normalizeSwitchApi(
     env("SWITCH_API") || env("SWTICHAPI") || env("SWITCHAPI") || "OPENAI",
   );
-  const openaiApiKey = env("OPENAI_API_KEY");
+  
+  const tomlPath = env("PROXY_CONFIG_FILE", "config.toml");
+  const tomlData = loadTomlConfig(tomlPath);
+  
+  const openaiApiKeys = parseApiKeys("OPENAI_API_KEY", "OPENAI_API_KEYS_FILE");
   const codexApiKey = env("CODEX_API_KEY");
   const codexBaseUrl = env("CODEX_BASE_URL");
-  if (switchApi === "OPENAI" && !openaiApiKey) {
-    throw new Error("OPENAI_API_KEY is required");
-  }
-  if (switchApi === "CODEX") {
-    if (!codexBaseUrl) throw new Error("CODEX_BASE_URL is required when SWITCH_API=CODEX");
-    if (!codexApiKey) throw new Error("CODEX_API_KEY is required when SWITCH_API=CODEX");
-    if (!env("CODEX_MODEL")) throw new Error("CODEX_MODEL is required when SWITCH_API=CODEX");
-  }
 
-  return {
+  const config: ProxyConfig = {
     port: envNumber("PROXY_PORT", 8765),
     switchApi,
+    activeChannel: tomlData.activeChannel || env("ACTIVE_CHANNEL", "default"),
+    channels: tomlData.channels || {},
     openaiBaseUrl: normalizeBaseUrl(env("OPENAI_BASE_URL", "https://api.openai.com")),
     codexBaseUrl: codexBaseUrl ? normalizeBaseUrl(codexBaseUrl) : "",
-    openaiApiKey,
+    openaiApiKeys,
     codexApiKey,
     openaiModel: env("OPENAI_MODEL", "gpt-4o-mini"),
     codexModel: env("CODEX_MODEL"),
@@ -86,7 +137,7 @@ export function loadConfig(): ProxyConfig {
     requestLogDir: normalizeLogDir(env("AUGMENT_REQUEST_LOG_DIR", "logs")),
     indexingMode: env("AUGMENT_INDEXING_MODE", "complete").toLowerCase(),
     embedBaseUrl: normalizeEmbedBaseUrl(env("EMBED_BASE_URL", "http://127.0.0.1:11434")),
-    embedApiKey: env("EMBED_API_KEY"),
+    embedApiKeys: parseApiKeys("EMBED_API_KEY", "EMBED_API_KEYS_FILE"),
     embedModel: env("EMBED_MODEL", "mxbai-embed-large:latest"),
     embedDimensions: envNumber("EMBED_DIMENSIONS", 1024),
     qdrantUrl: normalizeBaseUrl(env("QDRANT_URL", "http://127.0.0.1:6333")),
@@ -95,6 +146,68 @@ export function loadConfig(): ProxyConfig {
     indexChunkOverlap: envNumber("INDEX_CHUNK_OVERLAP", 200),
     logLevel: env("LOG_LEVEL", "info").toLowerCase(),
   };
+
+  // Add default channel from env if not in TOML
+  if (!config.channels["default"] && config.openaiApiKeys.length > 0) {
+    config.channels["default"] = {
+      baseUrl: config.openaiBaseUrl,
+      apiKeys: config.openaiApiKeys,
+      model: config.openaiModel,
+    };
+  }
+
+  if (switchApi === "OPENAI" && Object.keys(config.channels).length === 0) {
+    throw new Error("No channels configured (OPENAI_API_KEY or PROXY_CONFIG_FILE)");
+  }
+  if (switchApi === "CODEX") {
+    if (!config.codexBaseUrl) throw new Error("CODEX_BASE_URL is required when SWITCH_API=CODEX");
+    if (!config.codexApiKey) throw new Error("CODEX_API_KEY is required when SWITCH_API=CODEX");
+    if (!env("CODEX_MODEL")) throw new Error("CODEX_MODEL is required when SWITCH_API=CODEX");
+  }
+
+  return config;
+}
+
+export function getCurrentChannel(config: ProxyConfig): ChannelConfig | null {
+  return config.channels[config.activeChannel] || config.channels["default"] || null;
+}
+
+let nextOpenaiKeyIndex = 0;
+export function getNextOpenaiApiKey(config: ProxyConfig): string {
+  const channel = getCurrentChannel(config);
+  if (channel && channel.apiKeys.length > 0) {
+    const key = channel.apiKeys[nextOpenaiKeyIndex % channel.apiKeys.length];
+    nextOpenaiKeyIndex++;
+    return key;
+  }
+  if (config.openaiApiKeys.length === 0) return "";
+  const key = config.openaiApiKeys[nextOpenaiKeyIndex % config.openaiApiKeys.length];
+  nextOpenaiKeyIndex++;
+  return key;
+}
+
+export function getOpenAIUrl(config: ProxyConfig): string {
+  const channel = getCurrentChannel(config);
+  return channel ? channel.baseUrl : config.openaiBaseUrl;
+}
+
+export function getOpenAIModel(config: ProxyConfig): string {
+  const channel = getCurrentChannel(config);
+  return (channel && channel.model) ? channel.model : config.openaiModel;
+}
+
+export function getOpenAIKeyCount(config: ProxyConfig): number {
+  const channel = getCurrentChannel(config);
+  if (channel) return channel.apiKeys.length;
+  return config.openaiApiKeys.length;
+}
+
+let nextEmbedKeyIndex = 0;
+export function getNextEmbedApiKey(config: ProxyConfig): string {
+  if (config.embedApiKeys.length === 0) return "";
+  const key = config.embedApiKeys[nextEmbedKeyIndex % config.embedApiKeys.length];
+  nextEmbedKeyIndex++;
+  return key;
 }
 
 async function loadDotEnvFile(path = ".env"): Promise<void> {

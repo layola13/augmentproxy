@@ -5,6 +5,7 @@ import type {
   RequestContext,
 } from "./types.ts";
 import { logInfo } from "./logger.ts";
+import { getNextEmbedApiKey } from "./config.ts";
 
 interface UploadBlob {
   blobName: string;
@@ -339,8 +340,9 @@ async function embedTexts(
 ): Promise<number[][]> {
   if (texts.length === 0) return [];
   const headers: HeadersInit = { "content-type": "application/json" };
-  if (config.embedApiKey) {
-    headers.authorization = `Bearer ${config.embedApiKey}`;
+  const embedApiKey = getNextEmbedApiKey(config);
+  if (embedApiKey) {
+    headers.authorization = `Bearer ${embedApiKey}`;
   }
   const response = await fetch(embedUrl(config), {
     method: "POST",

@@ -8,6 +8,7 @@ import type {
   ProxyConfig,
   RequestContext,
 } from "./types.ts";
+import { getNextOpenaiApiKey, getOpenAIKeyCount, getOpenAIModel, getOpenAIUrl } from "./config.ts";
 import { augmentError, jsonResponse } from "./http.ts";
 import { logError, logInfo, logWarn } from "./logger.ts";
 
@@ -4067,7 +4068,7 @@ function buildChatRequest(
     messages.push({ role: "user", content: continuationNudge });
   }
   const request: OpenAIChatRequest = {
-    model: config.openaiModel,
+    model: activeUpstreamModel(config),
     messages,
     stream,
   };
@@ -4349,7 +4350,7 @@ function openAIUsage(config: ProxyConfig, request: OpenAIUpstreamRequest, usage:
 
 function openAIHeaders(config: ProxyConfig, stream: boolean): Headers {
   const headers = new Headers();
-  const apiKey = config.switchApi === "CODEX" ? config.codexApiKey : config.openaiApiKey;
+  const apiKey = config.switchApi === "CODEX" ? config.codexApiKey : getNextOpenaiApiKey(config);
   headers.set("authorization", `Bearer ${apiKey}`);
   headers.set("content-type", "application/json");
   headers.set("accept", stream ? "text/event-stream" : "application/json");
@@ -4359,11 +4360,11 @@ function openAIHeaders(config: ProxyConfig, stream: boolean): Headers {
 
 function openAIUrl(config: ProxyConfig): string {
   if (config.switchApi === "CODEX") return `${config.codexBaseUrl}/responses`;
-  return `${config.openaiBaseUrl}/chat/completions`;
+  return `${getOpenAIUrl(config)}/chat/completions`;
 }
 
 function activeUpstreamModel(config: ProxyConfig): string {
-  return config.switchApi === "CODEX" ? config.codexModel : config.openaiModel;
+  return config.switchApi === "CODEX" ? config.codexModel : getOpenAIModel(config);
 }
 
 function normalizeResponsesUsage(usage: JsonValue): JsonValue {
@@ -4560,15 +4561,19 @@ function summarizeUpstreamFailure(
 }
 
 function shouldRetryUpstreamFailure(
+  config: ProxyConfig,
   status: number,
   raw: string,
   hasBody: boolean,
   attempt: number,
 ): boolean {
-  if (attempt >= 2) return false;
+  const keyCount = getOpenAIKeyCount(config);
+  // Allow up to 2 attempts per key, with a minimum of 2 total
+  const maxAttempts = Math.max(2, keyCount * 2);
+  if (attempt >= maxAttempts) return false;
   if (!raw.trim()) return true;
   if (!hasBody) return true;
-  return status === 408 || status === 409 || status === 425 || status === 429 ||
+  return status === 401 || status === 408 || status === 409 || status === 425 || status === 429 ||
     status === 500 || status === 502 || status === 503 || status === 504;
 }
 
@@ -4657,6 +4662,7 @@ export async function forwardAugmentJson(
     if (upstream.ok && raw.trim()) break;
 
     const retry = shouldRetryUpstreamFailure(
+      config,
       upstream.status,
       raw,
       false,
@@ -4675,7 +4681,9 @@ export async function forwardAugmentJson(
       body: raw.slice(0, 300),
     });
     if (!retry) break;
-    await delay(400);
+    // For 429 and 401, we rotate immediately with a small delay
+    const waitMs = (upstream.status === 429 || upstream.status === 401) ? 500 : 400;
+    await delay(waitMs);
   }
 
   if (!upstream) {
@@ -5450,23 +5458,30 @@ export async function forwardAugmentStream(
               await delay(200);
               continue;
             }
-            if (upstream.status === 429) {
-              logWarn(config, "openai:stream:rate-limited-retry", {
+            if (upstream.status === 429 || upstream.status === 401) {
+              const is429 = upstream.status === 429;
+              const retry = shouldRetryUpstreamFailure(
+                config,
+                upstream.status,
+                raw,
+                Boolean(upstream.body),
+                upstreamAttempts,
+              );
+              logWarn(config, is429 ? "openai:stream:rate-limited-retry" : "openai:stream:invalid-key-retry", {
                 requestId,
                 attempt: upstreamAttempts,
-                retryAfterMs: STREAM_RATE_LIMIT_RETRY_MS,
-                hasBody: Boolean(upstream.body),
-                bodyLen: raw.length,
-                contentType: upstream.headers.get("content-type") ?? "",
-                upstreamRequestId: upstream.headers.get("x-request-id") ??
-                  upstream.headers.get("request-id") ?? "",
+                willRetry: retry,
+                status: upstream.status,
+                retryAfterMs: is429 ? 1000 : 500,
                 body: raw.slice(0, 300),
               });
-              await delay(STREAM_RATE_LIMIT_RETRY_MS);
+              if (!retry) break;
+              await delay(is429 ? 1000 : 500);
               if (closed) return;
               continue;
             }
             const retry = shouldRetryUpstreamFailure(
+              config,
               upstream.status,
               raw,
               Boolean(upstream.body),
@@ -5511,10 +5526,11 @@ export async function forwardAugmentStream(
             return;
           }
 
-          if (!upstream) {
-            logWarn(config, "openai:stream:no-upstream-after-retries", {
+          if (!upstream || !upstream.body) {
+            logWarn(config, "openai:stream:no-upstream-body", {
               requestId,
               attempts: upstreamAttempts,
+              status: upstream?.status,
             });
             return;
           }

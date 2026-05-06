@@ -2,12 +2,20 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export type JsonObject = { [key: string]: JsonValue };
 export type SwitchApi = "OPENAI" | "CODEX";
 
+export interface ChannelConfig {
+  baseUrl: string;
+  apiKeys: string[];
+  model?: string;
+}
+
 export interface ProxyConfig {
   port: number;
   switchApi: SwitchApi;
+  activeChannel: string;
+  channels: Record<string, ChannelConfig>;
   openaiBaseUrl: string;
   codexBaseUrl: string;
-  openaiApiKey: string;
+  openaiApiKeys: string[];
   codexApiKey: string;
   openaiModel: string;
   codexModel: string;
@@ -24,7 +32,7 @@ export interface ProxyConfig {
   requestLogDir: string;
   indexingMode: string;
   embedBaseUrl: string;
-  embedApiKey: string;
+  embedApiKeys: string[];
   embedModel: string;
   embedDimensions: number;
   qdrantUrl: string;
