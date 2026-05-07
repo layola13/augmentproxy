@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../webgame"
+		},
+		{
+			"path": "../bevy-docs-wiki"
+		}
+	],
+	"settings": {}
+}

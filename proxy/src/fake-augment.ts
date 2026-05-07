@@ -205,60 +205,193 @@ function percent(part: number, total: number): string {
   return `${((part / total) * 100).toFixed(1)}%`;
 }
 
+const ANSI = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  cyan: "\x1b[36m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  magenta: "\x1b[35m",
+  gray: "\x1b[90m",
+};
+
+function color(value: string, code: string): string {
+  return `${code}${value}${ANSI.reset}`;
+}
+
+function visibleLength(value: string): number {
+  return value.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function padCell(
+  value: string,
+  width: number,
+  align: "left" | "right",
+): string {
+  const padding = " ".repeat(Math.max(0, width - visibleLength(value)));
+  return align === "right" ? `${padding}${value}` : `${value}${padding}`;
+}
+
+function truncateCell(value: string, width: number): string {
+  const plain = value.replace(/\x1b\[[0-9;]*m/g, "");
+  if (plain.length <= width) return value;
+  if (width <= 1) return "…";
+  return `${plain.slice(0, width - 1)}…`;
+}
+
+function tableBorder(widths: number[]): string {
+  return `+${widths.map((width) => "-".repeat(width + 2)).join("+")}+`;
+}
+
+function tableRow(
+  cells: string[],
+  widths: number[],
+  aligns: ("left" | "right")[],
+): string {
+  return `| ${
+    cells.map((cell, index) =>
+      padCell(truncateCell(cell, widths[index]), widths[index], aligns[index])
+    ).join(" | ")
+  } |`;
+}
+
 export function agentUsageStatsMarkdown(): string {
   const stats = getAgentUsageStats();
+  const sortedAgents = [...stats.agents].sort((left, right) =>
+    right.total_tokens - left.total_tokens
+  );
+  const widths = [28, 10, 10, 10, 10, 10, 10, 8];
+  const aligns: ("left" | "right")[] = [
+    "left",
+    "right",
+    "right",
+    "right",
+    "right",
+    "right",
+    "right",
+    "right",
+  ];
   const lines: string[] = [
-    "# Agent Token Usage",
+    color("Agent Token Usage", `${ANSI.bold}${ANSI.cyan}`),
+    color(`Generated: ${now()}`, ANSI.gray),
     "",
-    `Generated: ${now()}`,
-    "",
-    "## Totals",
-    "",
-    "| Metric | Tokens |",
-    "| --- | ---: |",
-    `| Non-cached input | ${tokenCount(stats.total_agent_input_tokens)} |`,
-    `| Cache read input | ${
-      tokenCount(stats.total_agent_cache_read_input_tokens)
-    } |`,
-    `| Cache creation input | ${
-      tokenCount(stats.total_agent_cache_creation_input_tokens)
-    } |`,
-    `| Total input | ${tokenCount(stats.total_agent_total_input_tokens)} |`,
-    `| Output | ${tokenCount(stats.total_agent_output_tokens)} |`,
-    `| Total | ${tokenCount(stats.total_agent_total_tokens)} |`,
-    `| Agents with usage | ${tokenCount(stats.agents.length)} |`,
+    color("Totals", ANSI.bold),
+    tableBorder([22, 14]),
+    tableRow(["Metric", "Tokens"], [22, 14], ["left", "right"]),
+    tableBorder([22, 14]),
+    tableRow(
+      [
+        "Non-cached input",
+        color(tokenCount(stats.total_agent_input_tokens), ANSI.green),
+      ],
+      [22, 14],
+      ["left", "right"],
+    ),
+    tableRow(
+      [
+        "Cache read input",
+        color(tokenCount(stats.total_agent_cache_read_input_tokens), ANSI.cyan),
+      ],
+      [22, 14],
+      ["left", "right"],
+    ),
+    tableRow(
+      [
+        "Cache creation input",
+        color(
+          tokenCount(stats.total_agent_cache_creation_input_tokens),
+          ANSI.yellow,
+        ),
+      ],
+      [22, 14],
+      ["left", "right"],
+    ),
+    tableRow(
+      [
+        "Total input",
+        color(tokenCount(stats.total_agent_total_input_tokens), ANSI.magenta),
+      ],
+      [22, 14],
+      ["left", "right"],
+    ),
+    tableRow(["Output", tokenCount(stats.total_agent_output_tokens)], [
+      22,
+      14,
+    ], ["left", "right"]),
+    tableRow(
+      [
+        "Total",
+        color(
+          tokenCount(stats.total_agent_total_tokens),
+          `${ANSI.bold}${ANSI.green}`,
+        ),
+      ],
+      [22, 14],
+      ["left", "right"],
+    ),
+    tableRow(["Agents with usage", tokenCount(stats.agents.length)], [
+      22,
+      14,
+    ], ["left", "right"]),
+    tableBorder([22, 14]),
     "",
   ];
 
   if (stats.agents.length === 0) {
-    lines.push("No agent token usage has been recorded in this proxy process.");
+    lines.push(
+      color(
+        "No agent token usage has been recorded in this proxy process.",
+        ANSI.dim,
+      ),
+    );
     return `${lines.join("\n")}\n`;
   }
 
   lines.push(
-    "## By Agent",
-    "",
-    "| Agent | Non-cached input | Cache read | Cache creation | Total input | Output | Total | Share |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    color("By Agent", ANSI.bold),
+    tableBorder(widths),
+    tableRow(
+      [
+        "Agent",
+        "Input",
+        "Cache R",
+        "Cache W",
+        "Tot In",
+        "Output",
+        "Total",
+        "Share",
+      ],
+      widths,
+      aligns,
+    ),
+    tableBorder(widths),
   );
 
-  for (
-    const agent of [...stats.agents].sort((left, right) =>
-      right.total_tokens - left.total_tokens
-    )
-  ) {
-    lines.push(
-      `| ${agent.name} (${agent.agent_id}) | ${
-        tokenCount(agent.input_tokens)
-      } | ${tokenCount(agent.cache_read_input_tokens)} | ${
-        tokenCount(agent.cache_creation_input_tokens)
-      } | ${tokenCount(agent.total_input_tokens)} | ${
-        tokenCount(agent.output_tokens)
-      } | ${tokenCount(agent.total_tokens)} | ${
-        percent(agent.total_tokens, stats.total_agent_total_tokens)
-      } |`,
-    );
+  for (const agent of sortedAgents) {
+    lines.push(tableRow(
+      [
+        `${agent.name} ${color(agent.agent_id, ANSI.gray)}`,
+        color(tokenCount(agent.input_tokens), ANSI.green),
+        color(tokenCount(agent.cache_read_input_tokens), ANSI.cyan),
+        color(tokenCount(agent.cache_creation_input_tokens), ANSI.yellow),
+        tokenCount(agent.total_input_tokens),
+        tokenCount(agent.output_tokens),
+        color(tokenCount(agent.total_tokens), `${ANSI.bold}${ANSI.green}`),
+        percent(agent.total_tokens, stats.total_agent_total_tokens),
+      ],
+      widths,
+      aligns,
+    ));
   }
+  lines.push(tableBorder(widths));
+  lines.push(
+    "",
+    color(
+      "Legend: Cache R = cache read input, Cache W = cache creation/write input.",
+      ANSI.dim,
+    ),
+  );
 
   return `${lines.join("\n")}\n`;
 }

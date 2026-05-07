@@ -218,12 +218,21 @@ Deno.test("agent usage stats track input cache split and markdown", async () => 
     requestContext("agents/usage-stats.md"),
   );
   const markdown = await response.text();
-  assertEquals(response.headers.get("content-type"), "text/markdown; charset=utf-8");
-  assertEquals(markdown.includes("# Agent Token Usage"), true);
-  assertEquals(markdown.includes("| Cache read input | 65 |"), true);
-  assertEquals(markdown.includes("| Cache creation input | 20 |"), true);
-  assertEquals(markdown.includes("| Total | 285 |"), true);
-  assertEquals(markdown.includes("cache-a (agent-cache-a)"), true);
+  assertEquals(
+    response.headers.get("content-type"),
+    "text/markdown; charset=utf-8",
+  );
+  assertEquals(markdown.includes("\x1b[36mAgent Token Usage\x1b[0m"), true);
+  assertEquals(
+    markdown.includes("+------------------------+----------------+"),
+    true,
+  );
+  assertEquals(markdown.includes("Cache read input"), true);
+  assertEquals(markdown.includes("Cache creation input"), true);
+  assertEquals(markdown.includes("Cache R"), true);
+  assertEquals(markdown.includes("Cache W"), true);
+  assertEquals(markdown.includes("agent-cache-a"), true);
+  assertEquals(markdown.includes("77.2%"), true);
 });
 
 Deno.test("forwardAugmentJson reports agent usage", async () => {

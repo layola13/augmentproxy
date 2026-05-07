@@ -708,7 +708,10 @@ Deno.test("agent usage command returns local stats without upstream fetch", asyn
     const body = await response.json() as JsonObject;
     assertEquals(fetchCalled, false);
     assertEquals(typeof body.text, "string");
-    assertEquals((body.text as string).includes("# Agent Token Usage"), true);
+    assertEquals(
+      (body.text as string).includes("\x1b[36mAgent Token Usage\x1b[0m"),
+      true,
+    );
   } finally {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
   }
@@ -734,7 +737,9 @@ Deno.test("agent usage stream command returns local stats without upstream fetch
     assertEquals(fetchCalled, false);
     assertEquals(typeof done.response_text, "string");
     assertEquals(
-      (done.response_text as string).includes("# Agent Token Usage"),
+      (done.response_text as string).includes(
+        "\x1b[36mAgent Token Usage\x1b[0m",
+      ),
       true,
     );
   } finally {
