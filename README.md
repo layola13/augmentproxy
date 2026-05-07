@@ -39,6 +39,59 @@
 ./run-augment-proxy.sh
 ```
 
+## Subagents
+
+当前客户端的 `/agents` 面板可能默认只显示两个内置只读/计划角色：
+
+```text
+explore
+plan
+```
+
+如果需要让主 agent 正确调用可写实现型子代理，需要在用户级 Augment 配置中显式启用并提供执行型 agent：
+
+```json
+// ~/.augment/feature-config.json
+{
+  "subagentModes": {
+    "explore": "auto",
+    "plan": "auto",
+    "code": "auto",
+    "validate": "auto",
+    "judge": "auto",
+    "research": "auto"
+  }
+}
+```
+
+同时提供用户级 agent 文件：
+
+```text
+~/.augment/agents/code.md
+~/.augment/agents/validate.md
+~/.augment/agents/judge.md
+```
+
+已验证：配置后 `code` agent 可用，主 agent 可以把创建文件、编辑文件、实现代码这类任务交给 `code` 子代理。
+
+角色边界必须保持清晰：
+
+- `explore`：只读探索，不写文件，不跑命令。
+- `plan`：只做计划，不写代码，不跑命令。
+- `code`：实现和写文件；建议禁用 `launch-process` 和 `remove-files`。
+- `validate`：运行测试、编译、验证；建议禁用 `save-file` 和 `remove-files`。
+- `judge`：裁决任务是否完成；只读，不写文件、不跑命令，基于用户需求、产物和 `validate` 结果判断是否还需要继续。
+
+推荐闭环：`code -> validate -> judge -> code/validate ...`。`validate` 先给出测试/编译证据，`judge` 再判断用户需求是否真正完成。如果缺少验证证据，`judge` 应返回 `NEEDS_VALIDATION`，而不是直接通过。
+
+不要把写入工具或命令工具强塞进只读子代理。只读子代理如果需要实现或验证，应回到主 agent，由主 agent 切换到 `code`、`validate` 或 `judge`。
+
+### Script Behavior
+
+- `start-proxy.sh` 只负责停止旧 proxy 并启动 `proxy/src/server.ts`，不会修改 `~/.augment/feature-config.json` 或 `~/.augment/agents/`。
+- `run-augment-proxy.sh` 只负责注入 `AUGMENT_API_URL`、`AUGMENT_API_TOKEN`、`AUGMENT_SESSION_AUTH` 并启动 `auggie`，会使用当前用户目录下已有的 subagent 配置。
+- 修改 `~/.augment/feature-config.json` 或 `~/.augment/agents/*.md` 后，需要重启 Auggie 会话，再用 `/agents` 确认 `code` / `validate` / `judge` 已出现。
+
 ## 上游伪装为 Codex
 
 代理转发到大模型上游时默认使用 Codex-like 标识，避免上游因为请求头或 prompt 中包含 Augment/Auggie 名称而卡住或限流：
