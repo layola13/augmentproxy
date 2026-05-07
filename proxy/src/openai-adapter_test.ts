@@ -1891,6 +1891,45 @@ Deno.test("codex stream upstream failed recovers with view tool", async () => {
   );
 });
 
+Deno.test("locked upstream stream recovers with view tool", async () => {
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  const lockedReader = body.getReader();
+  try {
+    await withFakeFetch(
+      () =>
+        new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext(workspaceContext()),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), true);
+        const final = objects.find((item) => item.done === true);
+        assertEquals(final?.stop_reason, "stop");
+        assertEquals(final?.stream_reader_error, true);
+        assertEquals(
+          String(final?.recovery_reason ?? "").includes("locked"),
+          true,
+        );
+        const input = firstToolInput(objects);
+        assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await lockedReader.cancel().catch(() => undefined);
+  }
+});
+
 Deno.test("empty upstream stream recovers with view tool", async () => {
   await withFakeFetch(
     () =>

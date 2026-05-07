@@ -5278,6 +5278,17 @@ function upstreamErrorReason(value: JsonValue | undefined): string | undefined {
   return rendered && rendered !== "{}" ? rendered : undefined;
 }
 
+function streamReadFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.trim() || "unknown stream read failure";
+}
+
+function isReadableStreamLockedError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes("readablestream") &&
+    (lower.includes("locked") || lower.includes("disturbed"));
+}
+
 function recoveryToolNodesForUpstreamInterruption(
   startingId = 1,
   fallbackPath?: string,
@@ -6325,6 +6336,17 @@ export async function forwardAugmentStream(
               const message = error instanceof Error
                 ? error.message
                 : String(error);
+              if (isReadableStreamLockedError(message)) {
+                logWarn(config, "openai:stream:fetch-stream-locked", {
+                  requestId,
+                  attempt: upstreamAttempts,
+                  error: message,
+                });
+                enqueueRecoveryAndFinish(message, {
+                  stream_reader_error: true,
+                });
+                return;
+              }
               const retry = upstreamAttempts < 2 && !closed;
               logError(config, "openai:stream:fetch-error", {
                 requestId,
@@ -6460,41 +6482,64 @@ export async function forwardAugmentStream(
             return;
           }
 
-          const reader = upstream.body.getReader();
-          while (!closed) {
-            const { value, done } = await reader.read();
-            if (done || closed) {
-              if (closed) await reader.cancel().catch(() => {});
-              break;
+          let reader: ReadableStreamDefaultReader<Uint8Array>;
+          try {
+            reader = upstream.body.getReader();
+          } catch (error) {
+            const reason = streamReadFailureReason(error);
+            logWarn(config, "openai:stream:reader-error", {
+              requestId,
+              attempt: upstreamAttempts,
+              reason,
+            });
+            enqueueRecoveryAndFinish(reason, { stream_reader_error: true });
+            return;
+          }
+          try {
+            while (!closed) {
+              const { value, done } = await reader.read();
+              if (done || closed) {
+                if (closed) await reader.cancel().catch(() => {});
+                break;
+              }
+              if (!value) continue;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split(/\r?\n/);
+              buffer = lines.pop() ?? "";
+              for (const line of lines) {
+                const parsed = parseOpenAIStreamLine(line);
+                if (parsed.done) sawDone = true;
+                if (parsed.usage !== undefined) streamUsage = parsed.usage;
+                if (parsed.finishReason) finishReason = parsed.finishReason;
+                if (parsed.interruptionReason) {
+                  streamInterruptionReason = parsed.interruptionReason;
+                }
+                if (parsed.toolCalls?.length) {
+                  streamToolCalls.push(...parsed.toolCalls);
+                }
+                if (parsed.thinking?.length) {
+                  lineBuffer.push(parsed.thinking.join(""));
+                  emitNewThoughts();
+                }
+                if (parsed.content) {
+                  if (parsed.contentFromDone && emittedVisibleText) continue;
+                  upstreamChunks += 1;
+                  upstreamContentChars += parsed.content.length;
+                  const visible = thinkingFilter.push(parsed.content);
+                  enqueueVisibleText(visible);
+                  emitNewThoughts();
+                }
+              }
             }
-            if (!value) continue;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split(/\r?\n/);
-            buffer = lines.pop() ?? "";
-            for (const line of lines) {
-              const parsed = parseOpenAIStreamLine(line);
-              if (parsed.done) sawDone = true;
-              if (parsed.usage !== undefined) streamUsage = parsed.usage;
-              if (parsed.finishReason) finishReason = parsed.finishReason;
-              if (parsed.interruptionReason) {
-                streamInterruptionReason = parsed.interruptionReason;
-              }
-              if (parsed.toolCalls?.length) {
-                streamToolCalls.push(...parsed.toolCalls);
-              }
-              if (parsed.thinking?.length) {
-                lineBuffer.push(parsed.thinking.join(""));
-                emitNewThoughts();
-              }
-              if (parsed.content) {
-                if (parsed.contentFromDone && emittedVisibleText) continue;
-                upstreamChunks += 1;
-                upstreamContentChars += parsed.content.length;
-                const visible = thinkingFilter.push(parsed.content);
-                enqueueVisibleText(visible);
-                emitNewThoughts();
-              }
-            }
+          } catch (error) {
+            const reason = streamReadFailureReason(error);
+            logWarn(config, "openai:stream:read-error", {
+              requestId,
+              attempt: upstreamAttempts,
+              reason,
+            });
+            enqueueRecoveryAndFinish(reason, { stream_read_error: true });
+            return;
           }
           const flushed = thinkingFilter.flush();
           enqueueVisibleText(flushed.visible);
