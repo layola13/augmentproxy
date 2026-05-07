@@ -152,6 +152,20 @@ QDRANT_URL=http://127.0.0.1:6333
 QDRANT_COLLECTION=augmentproxy_workspace
 ```
 
+Agent / subagent 会话不再依赖 Qdrant。即使 `AUGMENT_INDEXING_MODE=real`，
+来自 Augment CLI / Auggie 的 `/find-missing`、`/batch-upload`、
+`/checkpoint-blobs` 会快速返回，不做 embedding 和 Qdrant 写入，避免大量
+subagents 并发时因为索引探测超时导致 agent 失败。
+
+子代理 token 统计接口：
+
+```text
+GET /agents/usage-stats
+```
+
+真实 subagent 请求没有 `agent_id`，统计会按子会话 `conversation_id` 归集；
+fake cloud agent 仍按 `agent_id` 归集。
+
 ## Start Qdrant
 
 真实 indexing 需要先启动 Qdrant。使用 Docker Compose：

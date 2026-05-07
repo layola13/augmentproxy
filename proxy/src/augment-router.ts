@@ -2,6 +2,7 @@ import type { JsonObject, ProxyConfig, RequestContext } from "./types.ts";
 import { jsonResponse, textResponse } from "./http.ts";
 import {
   ensureFakeAgent,
+  agentUsageStatsMarkdown,
   fakeBatchUpload,
   fakeBillingSummary,
   fakeCheckpointBlobs,
@@ -16,6 +17,7 @@ import {
   fakeSettings,
   fakeToken,
   fakeWorkspace,
+  getAgentUsageStats,
 } from "./fake-augment.ts";
 import { handleCodebaseRetrieval } from "./codebase-retrieval.ts";
 import { recordRequest } from "./request-recorder.ts";
@@ -271,6 +273,20 @@ function shouldRecord(path: string): boolean {
     path.startsWith("indexed-commits/");
 }
 
+function isAugmentCli(ctx: RequestContext): boolean {
+  const userAgent = ctx.headers.get("user-agent")?.toLowerCase() ?? "";
+  return userAgent.includes("augment.cli") || userAgent.includes("auggie");
+}
+
+function fastIndexingResponse(path: string, ctx: RequestContext): JsonObject {
+  if (path === "find-missing") {
+    return fakeFindMissing(ctx, true);
+  }
+  if (path === "batch-upload") return fakeBatchUpload(ctx);
+  if (path === "checkpoint-blobs") return fakeCheckpointBlobs();
+  return fakeGeneric(path);
+}
+
 export async function routeAugment(
   config: ProxyConfig,
   ctx: RequestContext,
@@ -312,6 +328,18 @@ export async function routeAugment(
     path === "resolve-completions"
   ) {
     return jsonResponse({ ok: true });
+  }
+
+  if (path === "record-request-events" || path === "record-session-events") {
+    return jsonResponse({ ok: true });
+  }
+
+  if (
+    isAugmentCli(ctx) &&
+    (path === "find-missing" || path === "batch-upload" ||
+      path === "checkpoint-blobs")
+  ) {
+    return jsonResponse(fastIndexingResponse(path, ctx));
   }
 
   if (path === "find-missing") {
@@ -473,6 +501,16 @@ export async function routeAugment(
       tool_result_message: `Remote tool ${
         toolName || toolId
       } executed successfully`,
+    });
+  }
+
+  if (path === "agents/usage-stats") {
+    return jsonResponse(getAgentUsageStats());
+  }
+
+  if (path === "agents/usage-stats.md") {
+    return textResponse(agentUsageStatsMarkdown(), 200, {
+      "content-type": "text/markdown; charset=utf-8",
     });
   }
 

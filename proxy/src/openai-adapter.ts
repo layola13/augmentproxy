@@ -18,6 +18,11 @@ import {
 } from "./config.ts";
 import { augmentError, jsonResponse } from "./http.ts";
 import { logError, logInfo, logWarn } from "./logger.ts";
+import {
+  agentUsageTokenFields,
+  agentUsageStatsMarkdown,
+  reportAgentUsageForBody,
+} from "./fake-augment.ts";
 
 function objectBody(ctx: RequestContext): JsonObject {
   return ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
@@ -156,6 +161,14 @@ function compactSummaryText(ctx: RequestContext): string | undefined {
     "Continue from this summary. Do not re-read unrelated history unless needed. Prefer checking current files or running focused verification before editing.",
   );
   return lines.join("\n").trim();
+}
+
+function agentUsageCommandText(ctx: RequestContext): string | undefined {
+  const body = objectBody(ctx);
+  const current = currentNodeUserText(body.nodes) || text(body.message) ||
+    text(body.prompt) || text(body.instruction);
+  if (!current.includes("__AUGMENTPROXY_AGENT_USAGE__")) return undefined;
+  return agentUsageStatsMarkdown();
 }
 
 function nodeToolUse(node: JsonValue): JsonObject | undefined {
@@ -5033,6 +5046,35 @@ function estimateToolDefinitionTokens(request: OpenAIUpstreamRequest): number {
   return estimateJsonTokens(request.tools);
 }
 
+function objectField(value: JsonValue | undefined): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonObject
+    : {};
+}
+
+function cacheReadInputTokens(usage: JsonObject): number {
+  const inputDetails = objectField(usage.input_tokens_details);
+  const promptDetails = objectField(usage.prompt_tokens_details);
+  return numberField(usage.cache_read_input_tokens) ??
+    numberField(usage.cached_tokens) ??
+    numberField(inputDetails.cached_tokens) ??
+    numberField(promptDetails.cached_tokens) ??
+    numberField(inputDetails.cache_read_input_tokens) ??
+    numberField(promptDetails.cache_read_input_tokens) ??
+    0;
+}
+
+function cacheCreationInputTokens(usage: JsonObject): number {
+  const inputDetails = objectField(usage.input_tokens_details);
+  const promptDetails = objectField(usage.prompt_tokens_details);
+  return numberField(usage.cache_creation_input_tokens) ??
+    numberField(inputDetails.cache_creation_input_tokens) ??
+    numberField(promptDetails.cache_creation_input_tokens) ??
+    numberField(inputDetails.cache_write_input_tokens) ??
+    numberField(promptDetails.cache_write_input_tokens) ??
+    0;
+}
+
 function tokenUsageNode(
   config: ProxyConfig,
   request: OpenAIUpstreamRequest,
@@ -5053,15 +5095,16 @@ function augmentTokenUsage(
   const record = usage && typeof usage === "object" && !Array.isArray(usage)
     ? usage as JsonObject
     : {};
-  const inputDetails = record.input_tokens_details &&
-      typeof record.input_tokens_details === "object" &&
-      !Array.isArray(record.input_tokens_details)
-    ? record.input_tokens_details as JsonObject
-    : {};
   const promptTokens = numberField(record.prompt_tokens) ??
     numberField(record.input_tokens) ?? estimatePromptTokens(request);
   const completionTokens = numberField(record.completion_tokens) ??
     numberField(record.output_tokens) ?? 0;
+  const cacheReadTokens = cacheReadInputTokens(record);
+  const cacheCreationTokens = cacheCreationInputTokens(record);
+  const nonCachedPromptTokens = Math.max(
+    0,
+    promptTokens - cacheReadTokens - cacheCreationTokens,
+  );
   const systemPromptTokens = estimateSystemPromptTokens(request);
   const currentMessageTokens = estimateCurrentMessageTokens(request);
   const toolDefinitionsTokens = estimateToolDefinitionTokens(request);
@@ -5069,22 +5112,60 @@ function augmentTokenUsage(
   const assistantResponseTokens = estimateAssistantResponseTokens(record);
   const knownPromptTokens = systemPromptTokens + currentMessageTokens +
     toolDefinitionsTokens + toolResultTokens;
-  const chatHistoryTokens = Math.max(0, promptTokens - knownPromptTokens);
+  const chatHistoryTokens = Math.max(0, nonCachedPromptTokens - knownPromptTokens);
+  const agentUsage = agentUsageTokenFields();
+  const subAgentInputTokens = numberField(agentUsage.sub_agent_input_tokens) ?? 0;
+  const subAgentCacheReadInputTokens =
+    numberField(agentUsage.sub_agent_cache_read_input_tokens) ?? 0;
+  const subAgentCacheCreationInputTokens =
+    numberField(agentUsage.sub_agent_cache_creation_input_tokens) ?? 0;
+  const subAgentTotalInputTokens =
+    numberField(agentUsage.sub_agent_total_input_tokens) ?? subAgentInputTokens;
+  const subAgentOutputTokens =
+    numberField(agentUsage.sub_agent_output_tokens) ?? 0;
   return {
-    input_tokens: promptTokens,
-    output_tokens: completionTokens,
-    cache_read_input_tokens: numberField(record.cached_tokens) ??
-      numberField(inputDetails.cached_tokens) ?? 0,
-    cache_creation_input_tokens: 0,
+    input_tokens: nonCachedPromptTokens + subAgentInputTokens,
+    output_tokens: completionTokens + subAgentOutputTokens,
+    cache_read_input_tokens: cacheReadTokens + subAgentCacheReadInputTokens,
+    cache_creation_input_tokens: cacheCreationTokens +
+      subAgentCacheCreationInputTokens,
     system_prompt_tokens: systemPromptTokens,
-    chat_history_tokens: chatHistoryTokens,
+    chat_history_tokens: chatHistoryTokens + subAgentTotalInputTokens,
     current_message_tokens: currentMessageTokens,
     tool_definitions_tokens: toolDefinitionsTokens,
     tool_result_tokens: toolResultTokens,
-    assistant_response_tokens: assistantResponseTokens,
+    assistant_response_tokens: assistantResponseTokens + subAgentOutputTokens,
+    ...agentUsage,
     max_context_tokens: config.augmentModelContextTokens,
     max_output_tokens: config.augmentModelMaxOutputTokens,
   };
+}
+
+function reportAgentUsageFromUpstreamUsage(
+  body: JsonObject,
+  usage: JsonValue,
+): void {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return;
+  const record = usage as JsonObject;
+  const promptTokens = numberField(record.prompt_tokens) ??
+    numberField(record.input_tokens) ?? 0;
+  const cacheReadTokens = cacheReadInputTokens(record);
+  const cacheCreationTokens = cacheCreationInputTokens(record);
+  const input = Math.max(0, promptTokens - cacheReadTokens - cacheCreationTokens);
+  const output = numberField(record.completion_tokens) ??
+    numberField(record.output_tokens) ?? 0;
+  if (
+    input > 0 || output > 0 || cacheReadTokens > 0 ||
+    cacheCreationTokens > 0
+  ) {
+    reportAgentUsageForBody(
+      body,
+      input,
+      output,
+      cacheReadTokens,
+      cacheCreationTokens,
+    );
+  }
 }
 
 function openAIUsage(
@@ -5094,11 +5175,15 @@ function openAIUsage(
 ): JsonObject {
   const tokenUsage = augmentTokenUsage(config, request, usage);
   const promptTokens = numberField(tokenUsage.input_tokens) ?? 0;
+  const cacheReadTokens = numberField(tokenUsage.cache_read_input_tokens) ?? 0;
+  const cacheCreationTokens =
+    numberField(tokenUsage.cache_creation_input_tokens) ?? 0;
   const completionTokens = numberField(tokenUsage.output_tokens) ?? 0;
+  const totalPromptTokens = promptTokens + cacheReadTokens + cacheCreationTokens;
   return {
-    prompt_tokens: promptTokens,
+    prompt_tokens: totalPromptTokens,
     completion_tokens: completionTokens,
-    total_tokens: promptTokens + completionTokens,
+    total_tokens: totalPromptTokens + completionTokens,
   };
 }
 
@@ -5399,6 +5484,35 @@ export async function forwardAugmentJson(
   config: ProxyConfig,
   ctx: RequestContext,
 ): Promise<Response> {
+  const agentUsageCommand = agentUsageCommandText(ctx);
+  if (agentUsageCommand) {
+    const body = objectBody(ctx);
+    const request = buildOpenAIRequest(config, ctx, false);
+    const tokenUsage = augmentTokenUsage(config, request, null);
+    const usage = openAIUsage(config, request, null);
+    const responseNode = textResponseNode(agentUsageCommand, 1);
+    logInfo(config, "openai:json:agent-usage-local", {
+      requestId: ctx.requestId,
+      chars: agentUsageCommand.length,
+      model: body.model,
+    });
+    return jsonResponse({
+      text: agentUsageCommand,
+      response_text: agentUsageCommand,
+      completion: agentUsageCommand,
+      request_id: ctx.requestId,
+      requestId: ctx.requestId,
+      stop_reason: "stop",
+      token_usage: tokenUsage,
+      total_tokens: usage.total_tokens,
+      usage,
+      nodes: [
+        ...(responseNode ? [responseNode] : []),
+        tokenUsageNode(config, request, null),
+      ],
+    });
+  }
+
   const body = objectBody(ctx);
   const expertChannel = expertChannelForContext(config, ctx);
   const strictAllowedTools = hasToolDefinitions(ctx)
@@ -5552,6 +5666,9 @@ export async function forwardAugmentJson(
   const usage = isResponsesRequest(request)
     ? parseResponsesJson(data).usage
     : data.usage;
+
+  reportAgentUsageFromUpstreamUsage(body, usage);
+
   if (isResponsesRequest(request)) {
     const parsed = parseResponsesJson(data);
     content = parsed.content;
@@ -6071,6 +6188,15 @@ export async function forwardAugmentStream(
   config: ProxyConfig,
   ctx: RequestContext,
 ): Promise<Response> {
+  const agentUsageCommand = agentUsageCommandText(ctx);
+  if (agentUsageCommand) {
+    logInfo(config, "openai:stream:agent-usage-local", {
+      requestId: ctx.requestId,
+      chars: agentUsageCommand.length,
+    });
+    return compactStreamResponse(config, ctx, agentUsageCommand);
+  }
+
   const compactSummary = compactSummaryText(ctx);
   if (compactSummary) {
     logInfo(config, "openai:stream:compact-local", {
@@ -6737,9 +6863,21 @@ export async function forwardAugmentStream(
             ...persistedToolNodes,
             tokenUsageNode(config, request, streamUsage ?? null),
           ];
+          const finalUsage = openAIUsage(config, request, streamUsage ?? null);
+          const finalTokenUsage = augmentTokenUsage(
+            config,
+            request,
+            streamUsage ?? null,
+          );
+
+          reportAgentUsageFromUpstreamUsage(body, streamUsage ?? null);
+
+          const hasVisibleOutput = visibleText.trim().length > 0 ||
+            upstreamContentChars > 0 ||
+            emittedVisibleText;
 
           if (
-            !hasMeaningfulVisibleText(visibleText) &&
+            !hasVisibleOutput &&
             toolNodes.length === 0 &&
             allThinking.length === 0
           ) {
@@ -6772,13 +6910,6 @@ export async function forwardAugmentStream(
             nodes: finalNodes.length,
             thinking: allThinking.length,
           });
-
-          const finalUsage = openAIUsage(config, request, streamUsage ?? null);
-          const finalTokenUsage = augmentTokenUsage(
-            config,
-            request,
-            streamUsage ?? null,
-          );
 
           safeEnqueue({
             text: "", // Never repeat full text in the 'text' field if done=true to avoid UI overlap

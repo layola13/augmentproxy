@@ -476,6 +476,38 @@ The operation was aborted due to timeout
 
 restart proxy after pulling the latest code so the optimized lookup is active.
 
+For Augment CLI / Auggie agent sessions, the proxy now treats indexing as
+non-blocking bootstrap traffic even when `AUGMENT_INDEXING_MODE=real`:
+
+- `POST /find-missing` returns `unknown_memory_names: []`.
+- `POST /batch-upload` echoes uploaded `blob_names` without embedding.
+- `POST /checkpoint-blobs` returns a synthetic checkpoint id.
+- `record-request-events` and `record-session-events` are acknowledged
+  immediately.
+
+This prevents large subagent fan-out, for example 30 documentation agents, from
+blocking on Qdrant or embedding work. Real Qdrant indexing remains available for
+non-CLI indexing tests and explicit indexing workflows.
+
+## Agent Usage Stats
+
+The proxy exposes subagent token totals at:
+
+```text
+GET /agents/usage-stats
+```
+
+Usage attribution works in two cases:
+
+- Fake cloud agents that pass an explicit `agent_id`.
+- Real Augment subagents whose `chat-stream` / `chat` body has a child
+  `conversation_id` with `parent_conversation_id`, `root_conversation_id`, or
+  `# Sub-Agent Prompt` in `user_guidelines`.
+
+Streaming and non-streaming upstream usage fields are both counted. In real
+subagent mode the key is the child `conversation_id`, because Augment does not
+send `agent_id` on the actual model request.
+
 ## Hooks, MCP, And Commands
 
 This section summarizes the extension points found from `augment.mjs` and the official `auggie/` examples cloned in this workspace.

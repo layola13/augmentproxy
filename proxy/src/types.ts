@@ -88,3 +88,24 @@ export interface OpenAIResponsesRequest {
 }
 
 export type OpenAIUpstreamRequest = OpenAIChatRequest | OpenAIResponsesRequest;
+
+export interface AgentUsage {
+  agent_id: string;
+  name: string;
+  input_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  total_input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+}
+
+export interface AgentUsageSummary {
+  agents: AgentUsage[];
+  total_agent_input_tokens: number;
+  total_agent_cache_read_input_tokens: number;
+  total_agent_cache_creation_input_tokens: number;
+  total_agent_total_input_tokens: number;
+  total_agent_output_tokens: number;
+  total_agent_total_tokens: number;
+}

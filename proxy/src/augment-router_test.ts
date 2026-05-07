@@ -68,6 +68,16 @@ function requestContext(path: string, body: JsonObject): RequestContext {
   };
 }
 
+function cliRequestContext(path: string, body: JsonObject): RequestContext {
+  return {
+    ...requestContext(path, body),
+    headers: new Headers({
+      "content-type": "application/json",
+      "user-agent": "augment.cli/0.26.0 (commit test)/interactive",
+    }),
+  };
+}
+
 Deno.test({
   name: "reset fake agents state",
   fn() {
@@ -123,6 +133,99 @@ Deno.test("check-tool-safety returns a concrete safety response", async () => {
   const body = await response.json() as JsonObject;
   assertEquals(body.tool_id, 26);
   assertEquals(body.is_safe, true);
+});
+
+Deno.test("cli find-missing bypasses real indexing and qdrant", async () => {
+  const config = {
+    ...testConfig(),
+    indexingMode: "real",
+    qdrantUrl: "http://127.0.0.1:1",
+  };
+  const response = await routeAugment(
+    config,
+    cliRequestContext("find-missing", {
+      model: "",
+      mem_object_names: ["blob-a", "blob-b"],
+    }),
+  );
+  const body = await response.json() as JsonObject;
+  assertEquals(body.unknown_memory_names, []);
+  assertEquals(body.nonindexed_blob_names, []);
+});
+
+Deno.test("cli batch-upload bypasses real indexing and embeddings", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  (globalThis as any).fetch = () => {
+    fetchCalls += 1;
+    throw new Error("qdrant or embedding should not be called");
+  };
+  try {
+    const config = {
+      ...testConfig(),
+      indexingMode: "real",
+      embedBaseUrl: "http://127.0.0.1:1/v1",
+      qdrantUrl: "http://127.0.0.1:1",
+    };
+    const response = await routeAugment(
+      config,
+      cliRequestContext("batch-upload", {
+        blobs: [
+          {
+            blob_name: "blob-a",
+            path: "/home/vscode/projects/example/a.ts",
+            content: "const a = 1;",
+          },
+        ],
+      }),
+    );
+    const body = await response.json() as JsonObject;
+    assertEquals(body.blob_names, ["blob-a"]);
+    assertEquals(fetchCalls, 0);
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+});
+
+Deno.test("cli checkpoint-blobs bypasses real qdrant delete", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  (globalThis as any).fetch = () => {
+    fetchCalls += 1;
+    throw new Error("qdrant should not be called");
+  };
+  try {
+    const config = {
+      ...testConfig(),
+      indexingMode: "real",
+      qdrantUrl: "http://127.0.0.1:1",
+    };
+    const response = await routeAugment(
+      config,
+      cliRequestContext("checkpoint-blobs", {
+        blobs: {
+          added_blobs: ["blob-a"],
+          deleted_blobs: ["blob-b"],
+        },
+      }),
+    );
+    const body = await response.json() as JsonObject;
+    assertEquals(typeof body.new_checkpoint_id, "string");
+    assertEquals(fetchCalls, 0);
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+});
+
+Deno.test("record request events returns fast success", async () => {
+  const response = await routeAugment(
+    { ...testConfig(), requestLogDir: "/definitely/not/used" },
+    requestContext("record-request-events", {
+      events: [{ event: { tool_use_data: { tool_name: "sub-agent-docs" } } }],
+    }),
+  );
+  const body = await response.json() as JsonObject;
+  assertEquals(body.ok, true);
 });
 
 Deno.test("run-remote-tool returns spawn-agent result", async () => {

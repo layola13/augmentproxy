@@ -625,6 +625,125 @@ Deno.test("codex switch uses responses endpoint and CODEX credentials/model", as
   );
 });
 
+Deno.test("OpenAI JSON token_usage includes prompt cache details", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "cached ok" } }],
+        usage: {
+          prompt_tokens: 20,
+          completion_tokens: 3,
+          prompt_tokens_details: { cached_tokens: 12 },
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({ ...workspaceContext(), message: "hello" }),
+      );
+      const body = await response.json() as JsonObject;
+      const usage = body.token_usage as JsonObject;
+      assertEquals(usage.input_tokens, 8);
+      assertEquals(usage.output_tokens, 3);
+      assertEquals(usage.cache_read_input_tokens, 12);
+      assertEquals(usage.cache_creation_input_tokens, 0);
+    },
+  );
+});
+
+Deno.test("Responses JSON token_usage includes input cache details", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "cached codex ok" }],
+        }],
+        usage: {
+          input_tokens: 30,
+          output_tokens: 4,
+          total_tokens: 34,
+          input_tokens_details: {
+            cached_tokens: 18,
+            cache_creation_input_tokens: 5,
+          },
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext({ ...workspaceContext(), message: "hello" }),
+      );
+      const body = await response.json() as JsonObject;
+      const usage = body.token_usage as JsonObject;
+      assertEquals(usage.input_tokens, 7);
+      assertEquals(usage.output_tokens, 4);
+      assertEquals(usage.cache_read_input_tokens, 18);
+      assertEquals(usage.cache_creation_input_tokens, 5);
+    },
+  );
+});
+
+Deno.test("agent usage command returns local stats without upstream fetch", async () => {
+  let fetchCalled = false;
+  const originalFetch = globalThis.fetch;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch =
+    (() => {
+      fetchCalled = true;
+      return Promise.resolve(new Response("{}"));
+    }) as typeof fetch;
+  try {
+    const response = await forwardAugmentJson(
+      testConfig(),
+      testContext({
+        ...workspaceContext(),
+        message: "__AUGMENTPROXY_AGENT_USAGE__",
+      }),
+    );
+    const body = await response.json() as JsonObject;
+    assertEquals(fetchCalled, false);
+    assertEquals(typeof body.text, "string");
+    assertEquals((body.text as string).includes("# Agent Token Usage"), true);
+  } finally {
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+  }
+});
+
+Deno.test("agent usage stream command returns local stats without upstream fetch", async () => {
+  let fetchCalled = false;
+  const originalFetch = globalThis.fetch;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch =
+    (() => {
+      fetchCalled = true;
+      return Promise.resolve(new Response("{}"));
+    }) as typeof fetch;
+  try {
+    const response = await forwardAugmentStream(
+      testConfig(),
+      testContext({
+        ...workspaceContext(),
+        message: "__AUGMENTPROXY_AGENT_USAGE__",
+      }),
+    );
+    const objects = await collectStreamObjects(response);
+    const done = objects.find((item) => item.done === true) as JsonObject;
+    assertEquals(fetchCalled, false);
+    assertEquals(typeof done.response_text, "string");
+    assertEquals(
+      (done.response_text as string).includes("# Agent Token Usage"),
+      true,
+    );
+  } finally {
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+  }
+});
+
 Deno.test("askexpert context uses configured expert OpenAI provider", async () => {
   await withCaptureFetch(
     new Response(
@@ -1105,6 +1224,91 @@ Deno.test("codex continuation with tool results requires next tool call", async 
         true,
       );
       assertEquals(inputText.includes("Next Steps"), false);
+    },
+  );
+});
+
+Deno.test("OpenAI stream token_usage includes prompt cache details", async () => {
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({ choices: [{ delta: { content: "cached" } }] })
+        }`,
+        `data: ${
+          JSON.stringify({
+            choices: [{ delta: {}, finish_reason: "stop" }],
+            usage: {
+              prompt_tokens: 25,
+              completion_tokens: 6,
+              prompt_tokens_details: { cached_tokens: 11 },
+            },
+          })
+        }`,
+        "data: [DONE]",
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({ ...workspaceContext(), message: "hello" }),
+      );
+      const objects = await collectStreamObjects(response);
+      const done = objects.find((item) => item.done === true) as JsonObject;
+      const usage = done.token_usage as JsonObject;
+      assertEquals(usage.input_tokens, 14);
+      assertEquals(usage.output_tokens, 6);
+      assertEquals(usage.cache_read_input_tokens, 11);
+      assertEquals(usage.cache_creation_input_tokens, 0);
+    },
+  );
+});
+
+Deno.test("Responses stream token_usage includes input cache details", async () => {
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({
+            type: "response.output_text.delta",
+            delta: "cached",
+          })
+        }`,
+        `data: ${
+          JSON.stringify({
+            type: "response.completed",
+            response: {
+              id: "resp-stream",
+              usage: {
+                input_tokens: 40,
+                output_tokens: 7,
+                total_tokens: 47,
+                input_tokens_details: {
+                  cached_tokens: 21,
+                  cache_creation_input_tokens: 8,
+                },
+              },
+            },
+          })
+        }`,
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async () => {
+      const response = await forwardAugmentStream(
+        codexConfig(),
+        testContext({ ...workspaceContext(), message: "hello" }),
+      );
+      const objects = await collectStreamObjects(response);
+      const done = objects.find((item) => item.done === true) as JsonObject;
+      const usage = done.token_usage as JsonObject;
+      assertEquals(usage.input_tokens, 11);
+      assertEquals(usage.output_tokens, 7);
+      assertEquals(usage.cache_read_input_tokens, 21);
+      assertEquals(usage.cache_creation_input_tokens, 8);
     },
   );
 });
