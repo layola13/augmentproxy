@@ -128,7 +128,9 @@ function remoteToolCatalog(): Array<{
   ];
 }
 
-function remoteToolSafety(toolId: number): { is_safe: boolean; reason: string } {
+function remoteToolSafety(
+  toolId: number,
+): { is_safe: boolean; reason: string } {
   return toolId === 26
     ? { is_safe: true, reason: "spawn-agent is allowed in the local proxy" }
     : { is_safe: true, reason: "allowed" };
@@ -168,11 +170,32 @@ function inferSpawnAgentMode(
       ? agentDefinition.instructions
       : "",
   ].join("\n").toLowerCase();
-  const has = (...signals: string[]) => signals.some((signal) => haystack.includes(signal));
-  if (has("validate", "verify", "verification", "compile", "test ", "run tests", "terminal")) {
+  const has = (...signals: string[]) =>
+    signals.some((signal) => haystack.includes(signal));
+  if (
+    has(
+      "validate",
+      "verify",
+      "verification",
+      "compile",
+      "test ",
+      "run tests",
+      "terminal",
+    )
+  ) {
     return "validate";
   }
-  if (has("implement", "implementation", "edit file", "create file", "write code", "save-file", "refactor")) {
+  if (
+    has(
+      "implement",
+      "implementation",
+      "edit file",
+      "create file",
+      "write code",
+      "save-file",
+      "refactor",
+    )
+  ) {
     return "code";
   }
   if (has("plan", "planning", "decompose", "break down")) {
@@ -299,14 +322,18 @@ export async function routeAugment(
 
   if (path === "agents/list-remote-tools") {
     const body = bodyObject(ctx);
-    const toolIdList = body.tool_id_list && typeof body.tool_id_list === "object" && !Array.isArray(body.tool_id_list)
-      ? body.tool_id_list as Record<string, unknown>
-      : {};
+    const toolIdList =
+      body.tool_id_list && typeof body.tool_id_list === "object" &&
+        !Array.isArray(body.tool_id_list)
+        ? body.tool_id_list as Record<string, unknown>
+        : {};
     const requestedIds = Array.isArray(toolIdList.tool_ids)
       ? toolIdList.tool_ids.filter((id): id is number => typeof id === "number")
       : [];
     const requestedTools = requestedIds
-      .map((toolId) => remoteToolCatalog().find((tool) => tool.tool_id === toolId))
+      .map((toolId) =>
+        remoteToolCatalog().find((tool) => tool.tool_id === toolId)
+      )
       .filter((tool): tool is NonNullable<typeof tool> => Boolean(tool));
     await recordRequest(config, ctx, "mock-list-remote-tools-recorded");
     return jsonResponse({
@@ -376,26 +403,37 @@ export async function routeAugment(
           agent_definition: agentDefinition,
         },
       });
+      const toolOutput = {
+        agent_id: agent.agent_id,
+        tool_input_json: toolInputJson,
+        workspace_folder: (() => {
+          return typeof parsed.workspace_folder === "string"
+            ? parsed.workspace_folder
+            : "";
+        })(),
+      };
+      const resultMessage = `Spawned agent ${agent.agent_id} in mode ${mode}` +
+        (workspaceFolder ? ` for ${workspaceFolder}` : "");
       return jsonResponse({
-        status: "success",
+        status: 1,
+        status_text: "success",
         tool_id: 26,
         tool_name: "spawn-agent",
-        tool_output: {
-          agent_id: agent.agent_id,
-          tool_input_json: toolInputJson,
-          workspace_folder: (() => {
-            return typeof parsed.workspace_folder === "string" ? parsed.workspace_folder : "";
-          })(),
-        },
+        tool_output: toolOutput,
+        tool_result_message: resultMessage,
       });
     }
     return jsonResponse({
-      status: "success",
+      status: 1,
+      status_text: "success",
       tool_id: toolId,
       tool_name: toolName,
       tool_output: {
         tool_input_json: toolInputJson,
       },
+      tool_result_message: `Remote tool ${
+        toolName || toolId
+      } executed successfully`,
     });
   }
 

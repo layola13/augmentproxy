@@ -137,14 +137,35 @@ Deno.test("run-remote-tool returns spawn-agent result", async () => {
     }),
   );
   const body = await response.json() as JsonObject;
-  assertEquals(body.status, "success");
+  assertEquals(body.status, 1);
+  assertEquals(body.status_text, "success");
   assertEquals(body.tool_id, 26);
   assertEquals(body.tool_name, "spawn-agent");
+  assertEquals(typeof body.tool_result_message, "string");
   assertEquals(
     (body.tool_output as JsonObject).workspace_folder,
     "/home/vscode/projects/webgame",
   );
   assertEquals(typeof (body.tool_output as JsonObject).agent_id, "string");
+});
+
+Deno.test("run-remote-tool generic success uses numeric status enum", async () => {
+  const response = await routeAugment(
+    testConfig(),
+    requestContext("agents/run-remote-tool", {
+      tool_name: "github-api",
+      tool_id: 8,
+      tool_input_json: JSON.stringify({
+        query: "test",
+      }),
+    }),
+  );
+  const body = await response.json() as JsonObject;
+  assertEquals(body.status, 1);
+  assertEquals(body.status_text, "success");
+  assertEquals(body.tool_id, 8);
+  assertEquals(body.tool_name, "github-api");
+  assertEquals(typeof body.tool_result_message, "string");
 });
 
 Deno.test("spawn-agent registers agent for later cloud-agent calls", async () => {
@@ -187,7 +208,10 @@ Deno.test("spawn-agent registers agent for later cloud-agent calls", async () =>
   assertEquals(agent.agent_id, agentId);
   assertEquals(agent.agent_name, "Game Builder");
   assertEquals(Array.isArray(agent.capabilities), true);
-  assertEquals(Array.isArray(messagesBody.messages) ? messagesBody.messages.length : -1, 1);
+  assertEquals(
+    Array.isArray(messagesBody.messages) ? messagesBody.messages.length : -1,
+    1,
+  );
 });
 
 Deno.test("spawn-agent preserves inferred mode and session metadata", async () => {
@@ -224,8 +248,14 @@ Deno.test("spawn-agent preserves inferred mode and session metadata", async () =
 
   assertEquals(sessionConfig.mode, "code");
   assertEquals(sessionConfig.workspace_folder, "/home/vscode/projects/webgame");
-  assertEquals(sessionConfig.information_request, "Implement the missing files and save the changes");
-  assertEquals((sessionConfig.agent_definition as JsonObject).name, "Code Worker");
+  assertEquals(
+    sessionConfig.information_request,
+    "Implement the missing files and save the changes",
+  );
+  assertEquals(
+    (sessionConfig.agent_definition as JsonObject).name,
+    "Code Worker",
+  );
   assertEquals((capabilities[0] as JsonObject).mode, "code");
 });
 
@@ -278,5 +308,8 @@ Deno.test("cloud agent send-message reuses created agent state", async () => {
 
   assertEquals(sentAgent.agent_id, agentId);
   assertEquals(sentAgent.capabilities, createdAgent.capabilities);
-  assertEquals(Array.isArray(messagesBody.messages) ? messagesBody.messages.length : -1, 1);
+  assertEquals(
+    Array.isArray(messagesBody.messages) ? messagesBody.messages.length : -1,
+    1,
+  );
 });

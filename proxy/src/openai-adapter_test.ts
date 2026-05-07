@@ -105,6 +105,23 @@ function toolDefinitions(): JsonObject[] {
   }];
 }
 
+function launchProcessToolDefinition(): JsonObject {
+  return {
+    name: "launch-process",
+    description: "Run a terminal command",
+    input_schema: {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        cwd: { type: "string" },
+        wait: { type: "boolean" },
+        max_wait_seconds: { type: "number" },
+      },
+      required: ["command"],
+    },
+  };
+}
+
 function subAgentExplorePlanDefinitions(): JsonObject[] {
   return [{
     name: "sub-agent-explore",
@@ -131,6 +148,31 @@ function subAgentExplorePlanDefinitions(): JsonObject[] {
       required: ["action"],
     },
   }];
+}
+
+function subAgentAllDefinitions(): JsonObject[] {
+  const schema = {
+    type: "object",
+    properties: {
+      action: { type: "string" },
+      name: { type: "string" },
+      instruction: { type: "string" },
+    },
+    required: ["action"],
+  };
+  return [
+    ...subAgentExplorePlanDefinitions(),
+    {
+      name: "sub-agent-code",
+      description: "Writable implementation sub-agent",
+      input_schema: schema,
+    },
+    {
+      name: "sub-agent-validate",
+      description: "Validation sub-agent",
+      input_schema: schema,
+    },
+  ];
 }
 
 function readOnlyActualClientDefinitions(): JsonObject[] {
@@ -340,7 +382,9 @@ async function withFakeFetch(
 
 async function withCaptureFetch(
   response: Response,
-  run: (requests: { url: string; headers: Headers; body: JsonObject }[]) => Promise<void>,
+  run: (
+    requests: { url: string; headers: Headers; body: JsonObject }[],
+  ) => Promise<void>,
 ): Promise<void> {
   const requests: { url: string; headers: Headers; body: JsonObject }[] = [];
   const originalFetch = globalThis.fetch;
@@ -478,7 +522,9 @@ function responseTextContains(
 ): boolean {
   const scan = (value: JsonObject | JsonObject[]): boolean => {
     if (Array.isArray(value)) return value.some((item) => scan(item));
-    if (typeof value.text === "string" && value.text.includes(needle)) return true;
+    if (typeof value.text === "string" && value.text.includes(needle)) {
+      return true;
+    }
     if (
       typeof value.response_text === "string" &&
       value.response_text.includes(needle)
@@ -486,7 +532,10 @@ function responseTextContains(
     const nodes = Array.isArray(value.nodes) ? value.nodes : [];
     for (const node of nodes) {
       if (!node || typeof node !== "object" || Array.isArray(node)) continue;
-      if (typeof (node as JsonObject).content === "string" && ((node as JsonObject).content as string).includes(needle)) {
+      if (
+        typeof (node as JsonObject).content === "string" &&
+        ((node as JsonObject).content as string).includes(needle)
+      ) {
         return true;
       }
     }
@@ -543,7 +592,10 @@ Deno.test("codex switch uses responses endpoint and CODEX credentials/model", as
       assertEquals(body.text, "codex ok");
       assertEquals(requests.length, 1);
       assertEquals(requests[0].url, "https://codex.example.test/v1/responses");
-      assertEquals(requests[0].headers.get("authorization"), "Bearer codex-key");
+      assertEquals(
+        requests[0].headers.get("authorization"),
+        "Bearer codex-key",
+      );
       assertEquals(requests[0].body.model, "codex-model");
       assertEquals(Array.isArray(requests[0].body.input), true);
       assertEquals(typeof requests[0].body.instructions, "string");
@@ -576,10 +628,15 @@ Deno.test("codex instructions do not mandate Next Steps final answers", async ()
         }),
       );
       const instructions = String(requests[0].body.instructions ?? "");
-      assertEquals(instructions.includes("Final-answer format is mandatory"), false);
+      assertEquals(
+        instructions.includes("Final-answer format is mandatory"),
+        false,
+      );
       assertEquals(instructions.includes("Do not omit this section"), false);
       assertEquals(
-        instructions.includes("While concrete tool work remains, use tools instead of appending follow-up suggestions"),
+        instructions.includes(
+          "While concrete tool work remains, use tools instead of appending follow-up suggestions",
+        ),
         true,
       );
       assertEquals(instructions.includes("Next Steps"), false);
@@ -587,7 +644,7 @@ Deno.test("codex instructions do not mandate Next Steps final answers", async ()
   );
 });
 
-Deno.test("openai injects missing code and validate sub-agent tools", async () => {
+Deno.test("openai does not inject missing code and validate sub-agent tools", async () => {
   await withCaptureFetch(
     new Response(
       JSON.stringify({
@@ -608,13 +665,13 @@ Deno.test("openai injects missing code and validate sub-agent tools", async () =
       const names = toolNamesFromOpenAIRequestBody(requests[0].body);
       assertEquals(names.includes("sub-agent-explore"), true);
       assertEquals(names.includes("sub-agent-plan"), true);
-      assertEquals(names.includes("sub-agent-code"), true);
-      assertEquals(names.includes("sub-agent-validate"), true);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
     },
   );
 });
 
-Deno.test("codex injects missing code and validate sub-agent tools", async () => {
+Deno.test("codex does not inject missing code and validate sub-agent tools", async () => {
   await withCaptureFetch(
     new Response(
       JSON.stringify({
@@ -640,13 +697,13 @@ Deno.test("codex injects missing code and validate sub-agent tools", async () =>
       const names = toolNamesFromResponsesRequestBody(requests[0].body);
       assertEquals(names.includes("sub-agent-explore"), true);
       assertEquals(names.includes("sub-agent-plan"), true);
-      assertEquals(names.includes("sub-agent-code"), true);
-      assertEquals(names.includes("sub-agent-validate"), true);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
     },
   );
 });
 
-Deno.test("codex instructions enforce strict sub-agent role routing", async () => {
+Deno.test("codex instructions only mention sub-agent roles exposed by client", async () => {
   await withCaptureFetch(
     new Response(
       JSON.stringify({
@@ -670,9 +727,22 @@ Deno.test("codex instructions enforce strict sub-agent role routing", async () =
         }),
       );
       const instructions = String(requests[0].body.instructions ?? "");
-      assertEquals(instructions.includes("use sub-agent-explore only for reading"), true);
-      assertEquals(instructions.includes("use sub-agent-code"), true);
-      assertEquals(instructions.includes("use sub-agent-validate"), true);
+      assertEquals(
+        instructions.includes("sub-agent-explore is read-only"),
+        true,
+      );
+      assertEquals(
+        instructions.includes("sub-agent-plan is planning-only"),
+        true,
+      );
+      assertEquals(
+        instructions.includes("sub-agent-code is the writable"),
+        false,
+      );
+      assertEquals(
+        instructions.includes("sub-agent-validate is the validation"),
+        false,
+      );
     },
   );
 });
@@ -696,13 +766,44 @@ Deno.test("openai does not inject synthetic save-file into read-only sub-agent t
       );
       const names = toolNamesFromOpenAIRequestBody(requests[0].body);
       assertEquals(names.includes("save-file"), false);
-      assertEquals(names.includes("sub-agent-code"), true);
-      assertEquals(names.includes("sub-agent-validate"), true);
+      assertEquals(names.includes("sub-agent-explore"), true);
+      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
     },
   );
 });
 
-Deno.test("openai prunes terminal tools and injects code/validate for actual read-only client session", async () => {
+Deno.test("openai prunes writable sub-agent roles from read-only sessions", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentAllDefinitions(),
+          user_guidelines:
+            "Read-only investigation sub-agent. Do NOT modify any files. Do NOT run any commands or launch any processes.",
+          message: "inspect the project",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("sub-agent-explore"), true);
+      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
+    },
+  );
+});
+
+Deno.test("openai prunes terminal tools without injecting code/validate for actual read-only client session", async () => {
   await withCaptureFetch(
     new Response(
       JSON.stringify({
@@ -727,8 +828,8 @@ Deno.test("openai prunes terminal tools and injects code/validate for actual rea
       assertEquals(names.includes("read-process"), false);
       assertEquals(names.includes("write-process"), false);
       assertEquals(names.includes("kill-process"), false);
-      assertEquals(names.includes("sub-agent-code"), true);
-      assertEquals(names.includes("sub-agent-validate"), true);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
       assertEquals(names.includes("view"), true);
       assertEquals(names.includes("codebase-retrieval"), true);
     },
@@ -846,17 +947,27 @@ Deno.test("openai history keeps Auggie tool results after previous assistant too
       );
       assertEquals(readAssistant >= 0, true);
       assertEquals(messages[readAssistant + 1].role, "tool");
-      assertEquals(messages[readAssistant + 1].tool_call_id, "call_read_previous");
+      assertEquals(
+        messages[readAssistant + 1].tool_call_id,
+        "call_read_previous",
+      );
       const compileAssistant = messages.findIndex((message) =>
         message.role === "assistant" &&
-        JSON.stringify(message.tool_calls ?? "").includes("call_compile_previous")
+        JSON.stringify(message.tool_calls ?? "").includes(
+          "call_compile_previous",
+        )
       );
       assertEquals(compileAssistant >= 0, true);
       assertEquals(messages[compileAssistant + 1].role, "tool");
-      assertEquals(messages[compileAssistant + 1].tool_call_id, "call_compile_previous");
+      assertEquals(
+        messages[compileAssistant + 1].tool_call_id,
+        "call_compile_previous",
+      );
       const messageText = JSON.stringify(messages);
       assertEquals(
-        messageText.includes("Previous tool results were recorded without a matching assistant tool call"),
+        messageText.includes(
+          "Previous tool results were recorded without a matching assistant tool call",
+        ),
         false,
       );
     },
@@ -901,7 +1012,10 @@ Deno.test("codex continuation with tool results requires next tool call", async 
       assertEquals(requests[0].body.tool_choice, "required");
       const inputText = JSON.stringify(requests[0].body.input);
       assertEquals(inputText.includes("CODEX tool-continuation control"), true);
-      assertEquals(inputText.includes("Do not include follow-up suggestions"), true);
+      assertEquals(
+        inputText.includes("Do not include follow-up suggestions"),
+        true,
+      );
       assertEquals(inputText.includes("Next Steps"), false);
     },
   );
@@ -970,7 +1084,10 @@ Deno.test("openai request strips historical stale tool rejection text", async ()
         }),
       );
       const messagesText = JSON.stringify(requests[0].body.messages);
-      assertEquals(messagesText.includes("Let me write the fix script first."), true);
+      assertEquals(
+        messagesText.includes("Let me write the fix script first."),
+        true,
+      );
       assertEquals(messagesText.includes("Tool call rejected"), false);
       assertEquals(messagesText.includes("outside the allowed scope"), false);
     },
@@ -1050,7 +1167,7 @@ Deno.test("codex json function_call emits Augment tool node", async () => {
   );
 });
 
-Deno.test("codex json rewrites misused explore sub-agent to code", async () => {
+Deno.test("codex json does not rewrite explore sub-agent to unavailable code role", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -1063,7 +1180,8 @@ Deno.test("codex json rewrites misused explore sub-agent to code", async () => {
             arguments: JSON.stringify({
               action: "run",
               name: "worker1",
-              instruction: "Create the missing files, edit the module, and save the implementation.",
+              instruction:
+                "Create the missing files, edit the module, and save the implementation.",
             }),
           }],
           usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
@@ -1073,11 +1191,14 @@ Deno.test("codex json rewrites misused explore sub-agent to code", async () => {
     async () => {
       const response = await forwardAugmentJson(
         codexConfig(),
-        testContext(workspaceContext()),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentExplorePlanDefinitions(),
+        }),
       );
       const body = await response.json() as JsonObject;
-      assertEquals(hasToolName(body, "sub-agent-code"), true);
-      assertEquals(hasToolName(body, "sub-agent-explore"), false);
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      assertEquals(hasToolName(body, "sub-agent-explore"), true);
       const input = firstToolInput(body);
       assertEquals(input.action, "run");
       assertEquals(input.name, "worker1");
@@ -1085,7 +1206,7 @@ Deno.test("codex json rewrites misused explore sub-agent to code", async () => {
   );
 });
 
-Deno.test("codex json rewrites misused plan sub-agent to validate", async () => {
+Deno.test("codex json does not rewrite plan sub-agent to unavailable validate role", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -1098,7 +1219,8 @@ Deno.test("codex json rewrites misused plan sub-agent to validate", async () => 
             arguments: JSON.stringify({
               action: "run",
               name: "validator1",
-              instruction: "Run tests, compile the project, and verify the failure is resolved.",
+              instruction:
+                "Run tests, compile the project, and verify the failure is resolved.",
             }),
           }],
           usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
@@ -1108,14 +1230,89 @@ Deno.test("codex json rewrites misused plan sub-agent to validate", async () => 
     async () => {
       const response = await forwardAugmentJson(
         codexConfig(),
-        testContext(workspaceContext()),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentExplorePlanDefinitions(),
+        }),
       );
       const body = await response.json() as JsonObject;
-      assertEquals(hasToolName(body, "sub-agent-validate"), true);
-      assertEquals(hasToolName(body, "sub-agent-plan"), false);
+      assertEquals(hasToolName(body, "sub-agent-validate"), false);
+      assertEquals(hasToolName(body, "sub-agent-plan"), true);
       const input = firstToolInput(body);
       assertEquals(input.action, "run");
       assertEquals(input.name, "validator1");
+    },
+  );
+});
+
+Deno.test("codex json sub-agent run without name gets normalized default name", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-tool",
+          output: [{
+            type: "function_call",
+            call_id: "call_subagent_code_missing_name",
+            name: "sub-agent-code",
+            arguments: JSON.stringify({
+              instruction: "Edit the router and save the fix.",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentAllDefinitions(),
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-code"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.action, "run");
+      assertEquals(input.name, "code_worker");
+    },
+  );
+});
+
+Deno.test("codex json sub-agent run sanitizes invalid names", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-tool",
+          output: [{
+            type: "function_call",
+            call_id: "call_subagent_validate_bad_name",
+            name: "sub-agent-validate",
+            arguments: JSON.stringify({
+              action: "run",
+              name: "validator 1/test",
+              instruction: "Run tests and verify the fix.",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentAllDefinitions(),
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-validate"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.action, "run");
+      assertEquals(input.name, "validator_1_test");
     },
   );
 });
@@ -1133,7 +1330,8 @@ Deno.test("codex json keeps genuine explore sub-agent calls unchanged", async ()
             arguments: JSON.stringify({
               action: "run",
               name: "explorer1",
-              instruction: "Read the router and summarize how tool definitions are forwarded.",
+              instruction:
+                "Read the router and summarize how tool definitions are forwarded.",
             }),
           }],
           usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
@@ -1143,7 +1341,10 @@ Deno.test("codex json keeps genuine explore sub-agent calls unchanged", async ()
     async () => {
       const response = await forwardAugmentJson(
         codexConfig(),
-        testContext(workspaceContext()),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentExplorePlanDefinitions(),
+        }),
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "sub-agent-explore"), true);
@@ -1220,7 +1421,7 @@ Deno.test("codex json invalid save-file recovers with view tool", async () => {
   );
 });
 
-Deno.test("codex json unavailable save-file in read-only child switches to sub-agent-code", async () => {
+Deno.test("codex json unavailable save-file in read-only child falls back to view when code role is absent", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -1249,14 +1450,16 @@ Deno.test("codex json unavailable save-file in read-only child switches to sub-a
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "save-file"), false);
-      assertEquals(hasToolName(body, "sub-agent-code"), true);
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      assertEquals(hasToolName(body, "view"), true);
       const input = firstToolInput(body);
-      assertEquals(input.action, "run");
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy/src");
+      assertEquals(input.type, "directory");
     },
   );
 });
 
-Deno.test("codex json unavailable launch-process in read-only child switches to sub-agent-validate", async () => {
+Deno.test("codex json unavailable launch-process in read-only child falls back to view when validate role is absent", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -1287,14 +1490,16 @@ Deno.test("codex json unavailable launch-process in read-only child switches to 
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "launch-process"), false);
-      assertEquals(hasToolName(body, "sub-agent-validate"), true);
+      assertEquals(hasToolName(body, "sub-agent-validate"), false);
+      assertEquals(hasToolName(body, "view"), true);
       const input = firstToolInput(body);
-      assertEquals(input.action, "run");
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
     },
   );
 });
 
-Deno.test("codex json actual read-only client launch-process is rerouted to sub-agent-validate", async () => {
+Deno.test("codex json actual read-only client launch-process falls back to view without synthetic validate role", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -1328,9 +1533,11 @@ Deno.test("codex json actual read-only client launch-process is rerouted to sub-
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "launch-process"), false);
-      assertEquals(hasToolName(body, "sub-agent-validate"), true);
+      assertEquals(hasToolName(body, "sub-agent-validate"), false);
+      assertEquals(hasToolName(body, "view"), true);
       const input = firstToolInput(body);
-      assertEquals(input.action, "run");
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
     },
   );
 });
@@ -1564,7 +1771,10 @@ Deno.test("empty upstream stream recovers with view tool", async () => {
       const objects = await collectStreamObjects(response);
       assertEquals(hasToolName(objects, "view"), true);
       const final = objects.find((item) => item.done === true);
-      assertEquals(final?.recovery_reason, "stream ended without done marker or content");
+      assertEquals(
+        final?.recovery_reason,
+        "stream ended without done marker or content",
+      );
       assertEquals(final?.stop_reason, "stop");
     },
   );
@@ -1776,7 +1986,10 @@ Deno.test("historical relative str-replace is normalized before upstream replay"
           }),
         );
         const messagesText = JSON.stringify(requests[0].body.messages);
-        assertEquals(messagesText.includes("\"path\":\"src/haxe/state/State.hx\""), false);
+        assertEquals(
+          messagesText.includes('"path":"src/haxe/state/State.hx"'),
+          false,
+        );
         assertEquals(messagesText.includes(path), true);
         assertEquals(messagesText.includes("Tool call rejected"), false);
       },
@@ -1831,7 +2044,9 @@ Deno.test("str-replace does not repair missing path to generated sibling", async
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -2168,9 +2383,13 @@ Deno.test("stream keeps separate tool call ids across multiple deltas", async ()
         for (const chunk of chunks) {
           const nodes = Array.isArray(chunk.nodes) ? chunk.nodes : [];
           for (const node of nodes) {
-            if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+            if (!node || typeof node !== "object" || Array.isArray(node)) {
+              continue;
+            }
             const toolUse = (node as JsonObject).tool_use;
-            if (!toolUse || typeof toolUse !== "object" || Array.isArray(toolUse)) {
+            if (
+              !toolUse || typeof toolUse !== "object" || Array.isArray(toolUse)
+            ) {
               continue;
             }
             const id = (toolUse as JsonObject).tool_use_id;
@@ -2693,7 +2912,9 @@ Deno.test("save-file with generated _new sibling path is rejected", async () => 
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -2731,7 +2952,9 @@ Deno.test("save-file with generated date sibling path is rejected", async () => 
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -2831,7 +3054,9 @@ Deno.test("save-file with directory path is rejected", async () => {
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -2867,7 +3092,9 @@ Deno.test("save-file with missing extension directory-like path is rejected", as
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -2904,7 +3131,9 @@ Deno.test("save-file allows known extensionless filenames", async () => {
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -3124,7 +3353,7 @@ Deno.test("forwardAugmentStream generically repairs nested directory paths", asy
         headers: { "content-type": "text/event-stream" },
       }),
       async () => {
-        // Agent mistakenly sends /path/to/project/test.ts 
+        // Agent mistakenly sends /path/to/project/test.ts
         // instead of /path/to/project/project/test.ts
         const context = testContext({
           path: "/agents/chat",
@@ -3132,15 +3361,23 @@ Deno.test("forwardAugmentStream generically repairs nested directory paths", asy
             messages: [{ role: "user", content: "read file" }],
             tool_definitions: [{
               name: "view",
-              input_schema: { type: "object", properties: { path: { type: "string" } } }
+              input_schema: {
+                type: "object",
+                properties: { path: { type: "string" } },
+              },
             }],
             // This fallbackPath tells the proxy where the 'root' is
             request_nodes: [{
-              id: 1, type: 4, ide_state_node: {
-                workspace_folders: [{ repository_root: baseDir, folder_root: baseDir }]
-              }
-            }]
-          }
+              id: 1,
+              type: 4,
+              ide_state_node: {
+                workspace_folders: [{
+                  repository_root: baseDir,
+                  folder_root: baseDir,
+                }],
+              },
+            }],
+          },
         });
 
         // We trigger a 'view' call that uses the repaired path
@@ -3409,11 +3646,16 @@ Deno.test("stream save-file with directory path is rejected", async () => {
         const objects = await collectStreamObjects(response);
         assertEquals(hasToolName(objects, "save-file"), false);
         assertEquals(hasToolName(objects, "view"), true);
-        assertEquals(responseTextContains(objects, "Tool call rejected"), false);
+        assertEquals(
+          responseTextContains(objects, "Tool call rejected"),
+          false,
+        );
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -3447,7 +3689,9 @@ Deno.test("stream save-file with missing extension directory-like path is reject
       },
     );
   } finally {
-    await Deno.remove(directoryPath, { recursive: true }).catch(() => undefined);
+    await Deno.remove(directoryPath, { recursive: true }).catch(() =>
+      undefined
+    );
   }
 });
 
@@ -3638,7 +3882,7 @@ Deno.test("launch-process expands mkdir brace paths to explicit directories", as
           name: "launch-process",
           arguments: JSON.stringify({
             command:
-              "mkdir -p /home/vscode/projects/rust-wiki/docs/{compiler,library,tools} && echo \"Directory created\"",
+              'mkdir -p /home/vscode/projects/rust-wiki/docs/{compiler,library,tools} && echo "Directory created"',
             cwd: "/home/vscode/projects",
           }),
         },
@@ -3653,7 +3897,7 @@ Deno.test("launch-process expands mkdir brace paths to explicit directories", as
       const input = firstToolInput(body);
       assertEquals(
         input.command,
-        "mkdir -p /home/vscode/projects/rust-wiki/docs/compiler /home/vscode/projects/rust-wiki/docs/library /home/vscode/projects/rust-wiki/docs/tools && echo \"Directory created\"",
+        'mkdir -p /home/vscode/projects/rust-wiki/docs/compiler /home/vscode/projects/rust-wiki/docs/library /home/vscode/projects/rust-wiki/docs/tools && echo "Directory created"',
       );
     },
   );
@@ -3702,7 +3946,7 @@ Deno.test("launch-process expands mkdir brace paths even when closing brace is m
           name: "launch-process",
           arguments: JSON.stringify({
             command:
-              "mkdir -p /home/vscode/projects/bevy_haxe/src/haxe/{ecs,math,utils && echo \"created\"",
+              'mkdir -p /home/vscode/projects/bevy_haxe/src/haxe/{ecs,math,utils && echo "created"',
             cwd: "/home/vscode/projects",
           }),
         },
@@ -3717,7 +3961,7 @@ Deno.test("launch-process expands mkdir brace paths even when closing brace is m
       const input = firstToolInput(body);
       assertEquals(
         input.command,
-        "mkdir -p /home/vscode/projects/bevy_haxe/src/haxe/ecs /home/vscode/projects/bevy_haxe/src/haxe/math /home/vscode/projects/bevy_haxe/src/haxe/utils && echo \"created\"",
+        'mkdir -p /home/vscode/projects/bevy_haxe/src/haxe/ecs /home/vscode/projects/bevy_haxe/src/haxe/math /home/vscode/projects/bevy_haxe/src/haxe/utils && echo "created"',
       );
     },
   );
@@ -3731,7 +3975,8 @@ Deno.test("repeated failed launch-process recovers by reading diagnostic file", 
   const path = `${root}/src/haxe/state/NextState.hx`;
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(path, "class NextState {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   try {
     await withFakeOpenAIMessage(
       {
@@ -3811,7 +4056,8 @@ Deno.test("successful recovery view suppresses repeated auto-recovery loop", asy
   const path = `${root}/src/haxe/state/NextState.hx`;
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(path, "class NextState {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   try {
     await withFakeOpenAIMessage(
       {
@@ -3885,7 +4131,8 @@ Deno.test("successful recovery view suppresses repeated auto-recovery loop", asy
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_recovery_view",
-                  content: `Here's the result of running \`cat -n\` on ${path}:\n     1\tclass NextState {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${path}:\n     1\tclass NextState {}\n`,
                 },
               }],
             }],
@@ -3914,7 +4161,8 @@ Deno.test("stream successful recovery view suppresses repeated auto-recovery loo
   const path = `${root}/src/haxe/state/NextState.hx`;
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(path, "class NextState {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   try {
     await withFakeOpenAIStreamToolCall(
       {
@@ -3986,7 +4234,8 @@ Deno.test("stream successful recovery view suppresses repeated auto-recovery loo
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_recovery_view_stream",
-                  content: `Here's the result of running \`cat -n\` on ${path}:\n     1\tclass NextState {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${path}:\n     1\tclass NextState {}\n`,
                 },
               }],
             }, {
@@ -4049,7 +4298,8 @@ Deno.test("stream successful repeated grep advances to definition file read", as
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
   await Deno.writeTextFile(statePath, "interface States {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   const grepCommand =
     "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true";
   try {
@@ -4123,7 +4373,8 @@ Deno.test("stream successful repeated grep advances to definition file read", as
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_recovery_view_stream",
-                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
                 },
               }],
             }, {
@@ -4217,7 +4468,8 @@ Deno.test("stream successful definition view advances to edit directive", async 
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
   await Deno.writeTextFile(statePath, "interface States {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   const grepCommand =
     "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true";
   try {
@@ -4291,7 +4543,8 @@ Deno.test("stream successful definition view advances to edit directive", async 
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_recovery_view_stream",
-                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
                 },
               }],
             }, {
@@ -4345,7 +4598,8 @@ Deno.test("stream successful definition view advances to edit directive", async 
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_definition_view_stream",
-                  content: `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
                 },
               }],
             }, {
@@ -4388,7 +4642,10 @@ Deno.test("stream successful definition view advances to edit directive", async 
         assertEquals(hasToolName(objects, "launch-process"), true);
         const input = firstToolInput(objects);
         assertEquals(String(input.command).includes("printf"), true);
-        assertEquals(String(input.command).includes("str-replace-editor"), true);
+        assertEquals(
+          String(input.command).includes("str-replace-editor"),
+          true,
+        );
         assertEquals(String(input.command).includes("grep -RIn"), false);
         assertEquals(String(input.command).includes("haxe -p src"), false);
       },
@@ -4408,7 +4665,8 @@ Deno.test("stream current definition result advances to edit directive without a
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
   await Deno.writeTextFile(statePath, "interface States {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   const grepCommand =
     "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true";
   const ideContext = ideWorkspaceContext(root);
@@ -4440,7 +4698,8 @@ Deno.test("stream current definition result advances to edit directive without a
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_definition_view_current_stream",
-                  content: `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
                 },
               },
             ],
@@ -4495,7 +4754,8 @@ Deno.test("stream current definition result advances to edit directive without a
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_recovery_view_stream",
-                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
                 },
               }],
               response_nodes: [{
@@ -4551,7 +4811,10 @@ Deno.test("stream current definition result advances to edit directive without a
         assertEquals(hasToolName(objects, "launch-process"), true);
         const input = firstToolInput(objects);
         assertEquals(String(input.command).includes("printf"), true);
-        assertEquals(String(input.command).includes("str-replace-editor"), true);
+        assertEquals(
+          String(input.command).includes("str-replace-editor"),
+          true,
+        );
         assertEquals(String(input.command).includes("grep -RIn"), false);
         assertEquals(String(input.command).includes("haxe -p src"), false);
       },
@@ -4571,7 +4834,8 @@ Deno.test("stream repeated compile recovery does not restart after long idle his
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
   await Deno.writeTextFile(statePath, "interface States {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   const compileFailure = [
     "Here are the results from executing the command.",
     "<return-code>",
@@ -4601,10 +4865,12 @@ Deno.test("stream repeated compile recovery does not restart after long idle his
     let content = compileFailure;
     let isError = true;
     if (toolUse.tool_name === "view" && path === nextStatePath) {
-      content = `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`;
+      content =
+        `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`;
       isError = false;
     } else if (toolUse.tool_name === "view" && path === statePath) {
-      content = `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`;
+      content =
+        `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`;
       isError = false;
     } else if (String(input.command ?? "").includes("grep -RIn")) {
       content = [
@@ -4642,7 +4908,8 @@ Deno.test("stream repeated compile recovery does not restart after long idle his
     };
   };
   const history: JsonObject[] = [];
-  let nodes: JsonObject[] = (ideWorkspaceContext(root).nodes as JsonObject[]) ?? [];
+  let nodes: JsonObject[] = (ideWorkspaceContext(root).nodes as JsonObject[]) ??
+    [];
   const counts = new Map<string, number>();
   try {
     for (let round = 0; round < 80; round += 1) {
@@ -4668,14 +4935,20 @@ Deno.test("stream repeated compile recovery does not restart after long idle his
               ...ideWorkspaceContext(root),
               chat_history: history,
               nodes,
-              tool_definitions: toolDefinitions(),
+              tool_definitions: [
+                ...toolDefinitions(),
+                launchProcessToolDefinition(),
+              ],
             }),
           );
           const objects = await collectStreamObjects(response);
           const responseNodes = objects.flatMap((object) =>
             Array.isArray(object.nodes) ? object.nodes as JsonObject[] : []
           ).filter((node) =>
-            Boolean(node && typeof node === "object" && !Array.isArray(node) && node.tool_use)
+            Boolean(
+              node && typeof node === "object" && !Array.isArray(node) &&
+                node.tool_use,
+            )
           );
           for (const node of responseNodes) {
             const key = classify(node);
@@ -4713,7 +4986,8 @@ Deno.test("stream exhausted repeated failure emits continuation tool instead of 
   await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
   await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
   await Deno.writeTextFile(statePath, "interface States {}\n");
-  const command = "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
   const compileFailure = [
     "Here are the results from executing the command.",
     "<return-code>",
@@ -4787,7 +5061,8 @@ Deno.test("stream exhausted repeated failure emits continuation tool instead of 
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_recovery_view",
-                  content: `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
                 },
               }],
             }, {
@@ -4842,7 +5117,8 @@ Deno.test("stream exhausted repeated failure emits continuation tool instead of 
                 type: 1,
                 tool_result_node: {
                   tool_use_id: "call_definition_view",
-                  content: `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
+                  content:
+                    `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
                 },
               }],
             }, {
@@ -4882,10 +5158,18 @@ Deno.test("stream exhausted repeated failure emits continuation tool instead of 
           }),
         );
         const objects = await collectStreamObjects(response);
-        assertEquals(responseTextContains(objects, "Repeated failed tool call suppressed"), false);
+        assertEquals(
+          responseTextContains(objects, "Repeated failed tool call suppressed"),
+          false,
+        );
         assertEquals(hasToolName(objects, "launch-process"), true);
         const input = firstToolInput(objects);
-        assertEquals(String(input.command).includes("repeated failed tool call was suppressed"), true);
+        assertEquals(
+          String(input.command).includes(
+            "repeated failed tool call was suppressed",
+          ),
+          true,
+        );
         assertEquals(String(input.command).includes("haxe -p src"), false);
         assertEquals(String(input.command).includes("grep -RIn"), false);
       },
@@ -4900,8 +5184,7 @@ Deno.test("repeated failed launch-process without diagnostic path recovers by re
     dir: "/home/vscode/projects/augmentproxy/proxy",
     prefix: "openai-adapter-failed-launch-workspace-",
   });
-  const command =
-    "cat > /tmp/fix_state.py << 'PYEOF'\nprint('`bad`')\nPYEOF";
+  const command = "cat > /tmp/fix_state.py << 'PYEOF'\nprint('`bad`')\nPYEOF";
   try {
     await withFakeOpenAIMessage(
       {
@@ -5334,7 +5617,10 @@ Deno.test("forwardAugmentStream emits thinking nodes in real-time and uses 'summ
 
       // Should have reasoning emitted during stream and preserved in final nodes
       assertEquals(thinkingNodes.length >= 1, true);
-      assertEquals((thinkingNodes[0].thinking as JsonObject)?.summary, "Thinking step 1");
+      assertEquals(
+        (thinkingNodes[0].thinking as JsonObject)?.summary,
+        "Thinking step 1",
+      );
     },
   );
 });
@@ -5347,7 +5633,8 @@ Deno.test("thinking nodes split multi-line reasoning and include both fields", a
           choices: [{
             message: {
               role: "assistant",
-              content: "<think>Step 1: Analysis\nStep 2: Execution\nStep 3: Verification</think>Done.",
+              content:
+                "<think>Step 1: Analysis\nStep 2: Execution\nStep 3: Verification</think>Done.",
             },
             finish_reason: "stop",
           }],
@@ -5358,18 +5645,18 @@ Deno.test("thinking nodes split multi-line reasoning and include both fields", a
       const response = await forwardAugmentJson(testConfig(), testContext({}));
       const body = await response.json();
       const thinkingNodes = body.nodes.filter((n: any) => n.type === 8);
-      
+
       // Should have split into 3 distinct nodes
       assertEquals(thinkingNodes.length, 3);
-      
+
       // Check node 1
       assertEquals(thinkingNodes[0].thinking.summary, "Step 1: Analysis");
       assertEquals(thinkingNodes[0].thinking.content, "Step 1: Analysis");
-      
+
       // Check node 2
       assertEquals(thinkingNodes[1].thinking.summary, "Step 2: Execution");
       assertEquals(thinkingNodes[1].thinking.content, "Step 2: Execution");
-      
+
       // Verify IDs are incrementing
       assertEquals(thinkingNodes[1].id, thinkingNodes[0].id + 1);
     },
@@ -5381,27 +5668,38 @@ Deno.test("forwardAugmentStream line-buffers native reasoning", async () => {
     () =>
       new Response(
         [
-          `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "Think" }, index: 0 }] })}`,
-          `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "ing...\n" }, index: 0 }] })}`,
+          `data: ${
+            JSON.stringify({
+              choices: [{ delta: { reasoning_content: "Think" }, index: 0 }],
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              choices: [{ delta: { reasoning_content: "ing...\n" }, index: 0 }],
+            })
+          }`,
           "data: [DONE]",
           "",
         ].join("\n\n"),
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ),
     async () => {
-      const response = await forwardAugmentStream(testConfig(), testContext({}));
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({}),
+      );
       const objects = await collectStreamObjects(response);
-      
+
       // The first "Think" chunk should NOT have emitted a node because there was no newline
       const firstData = objects[0];
       const initialNodes = (firstData.nodes || []) as any[];
-      assertEquals(initialNodes.filter(n => n.type === 8).length, 0);
+      assertEquals(initialNodes.filter((n) => n.type === 8).length, 0);
 
       // The second chunk with \n should trigger the emission
       const thinkingNodes = objects
         .flatMap((obj) => (obj.nodes || []) as JsonObject[])
         .filter((node) => node.type === 8);
-      
+
       assertEquals(thinkingNodes.length >= 1, true);
       assertEquals((thinkingNodes[0].thinking as any).summary, "Thinking...");
     },
@@ -5413,18 +5711,42 @@ Deno.test("forwardAugmentStream avoids duplication on mixed reasoning", async ()
     () =>
       new Response(
         [
-          `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "Native Line 1\n" }, index: 0 }] })}`,
-          `data: ${JSON.stringify({ choices: [{ delta: { content: "<think>Tag Thought 1\n" }, index: 0 }] })}`,
-          `data: ${JSON.stringify({ choices: [{ delta: { content: "More tag content</think>Final answer" }, index: 0 }] })}`,
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: { reasoning_content: "Native Line 1\n" },
+                index: 0,
+              }],
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: { content: "<think>Tag Thought 1\n" },
+                index: 0,
+              }],
+            })
+          }`,
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: { content: "More tag content</think>Final answer" },
+                index: 0,
+              }],
+            })
+          }`,
           "data: [DONE]",
           "",
         ].join("\n\n"),
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ),
     async () => {
-      const response = await forwardAugmentStream(testConfig(), testContext({}));
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({}),
+      );
       const objects = await collectStreamObjects(response);
-      
+
       // Each unique thinking line should be emitted exactly once across the stream.
       // We check that in EACH chunk's nodes, we only see genuinely NEW lines.
       const allEmittedLines: string[] = [];
@@ -5436,7 +5758,7 @@ Deno.test("forwardAugmentStream avoids duplication on mixed reasoning", async ()
           }
         }
       }
-      
+
       // Every thought line we sent should appear exactly once in the entire sequence of chunks
       const counts = allEmittedLines.reduce((acc, line) => {
         acc[line] = (acc[line] || 0) + 1;
@@ -5464,17 +5786,24 @@ Deno.test("forwardAugmentStream ensures no text repetition on done", async () =>
     () =>
       new Response(
         [
-          `data: ${JSON.stringify({ choices: [{ delta: { content: "Hello" }, index: 0 }] })}`,
+          `data: ${
+            JSON.stringify({
+              choices: [{ delta: { content: "Hello" }, index: 0 }],
+            })
+          }`,
           "data: [DONE]",
           "",
         ].join("\n\n"),
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ),
     async () => {
-      const response = await forwardAugmentStream(testConfig(), testContext({}));
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({}),
+      );
       const objects = await collectStreamObjects(response);
-      
-      const donePacket = objects.find(obj => obj.done === true);
+
+      const donePacket = objects.find((obj) => obj.done === true);
       assertEquals(donePacket?.text, ""); // Should be empty because it was already streamed
       assertEquals(donePacket?.response_text, "Hello"); // Should be complete for state sync
     },
@@ -5486,24 +5815,32 @@ Deno.test("forwardAugmentStream emits thinking even without content", async () =
     () =>
       new Response(
         [
-          `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "Thinking only\n" }, index: 0 }] })}`,
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: { reasoning_content: "Thinking only\n" },
+                index: 0,
+              }],
+            })
+          }`,
           "data: [DONE]",
           "",
         ].join("\n\n"),
         { status: 200, headers: { "content-type": "text/event-stream" } },
       ),
     async () => {
-      const response = await forwardAugmentStream(testConfig(), testContext({}));
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({}),
+      );
       const objects = await collectStreamObjects(response);
-      
+
       const thinkingNodes = objects
         .flatMap((obj) => (obj.nodes || []) as JsonObject[])
         .filter((node) => node.type === 8);
-      
+
       assertEquals(thinkingNodes.length >= 1, true);
       assertEquals((thinkingNodes[0].thinking as any).summary, "Thinking only");
     },
   );
 });
-
-
