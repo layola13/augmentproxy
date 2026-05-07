@@ -19,8 +19,8 @@ import {
 import { augmentError, jsonResponse } from "./http.ts";
 import { logError, logInfo, logWarn } from "./logger.ts";
 import {
-  agentUsageTokenFields,
   agentUsageStatsMarkdown,
+  agentUsageTokenFields,
   reportAgentUsageForBody,
 } from "./fake-augment.ts";
 
@@ -1018,6 +1018,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     '- launch-process: requires command. Prefer simple commands and set cwd only when known. Valid example: {"command":"pwd && ls -la","cwd":"<known-directory>"}.',
     '- save-file: only creates new files. Requires path and file_content. The path must include a concrete filename, preferably with an extension. Valid example: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Invalid: {"path":"<existing-file>","file_content":"..."}, {"path":"<dir>/utils","file_content":"..."}.',
     "- str-replace-editor: only use after reading the exact target file with view, and provide the complete required schema fields.",
+    "- apply_patch: patch file headers must use absolute paths under /home/<current-user>/... or paths already discovered from the target project. Do not patch relative to the proxy/client workspace when the task names another target project.",
   );
   if (toolSummaries.length > 0) {
     lines.push("Available tool schemas from this client:");
@@ -1406,15 +1407,137 @@ function thinkingNodes(thinking: string[], startingId = 1000): JsonObject[] {
 
 function workspaceFallbackPath(ctx: RequestContext): string | undefined {
   const body = objectBody(ctx);
+  const explicitTaskPath = explicitWorkspacePathFromTask(body);
+  if (explicitTaskPath) return explicitTaskPath;
   if (typeof body.path === "string" && body.path) {
-    const extracted = firstAbsolutePathFromText(body.path);
+    const cleaned = cleanExtractedPath(body.path);
+    const extracted = firstAbsolutePathFromText(cleaned);
     if (extracted) return extracted;
-    return body.path;
+    return cleaned;
   }
   const idePath = currentIdeWorkspacePath(body);
   if (idePath) return idePath;
   const discovered = collectWorkspacePaths(body);
   return discovered[0];
+}
+
+function explicitWorkspacePathFromTask(body: JsonObject): string | undefined {
+  const guidelineText = [
+    text(body.user_guidelines),
+    text(body.workspace_guidelines),
+    text(body.system_prompt),
+    text(body.system_prompt_append),
+  ].join("\n").toLowerCase();
+  const isExecutionAgent = guidelineText.includes("sub-agent") ||
+    guidelineText.includes("code implementation") ||
+    guidelineText.includes("documentation");
+  if (!isExecutionAgent) return undefined;
+
+  const candidates: { path: string; score: number; index: number }[] = [];
+  let index = 0;
+  for (const taskText of currentTaskTexts(body)) {
+    for (const candidate of taskPathCandidates(taskText)) {
+      const fallback = fallbackRootForTaskPath(candidate.path);
+      if (!fallback || !isPathWithinAllowedHome(fallback)) continue;
+      candidates.push({
+        path: fallback,
+        score: candidate.score,
+        index,
+      });
+    }
+    index += 1;
+  }
+  candidates.sort((a, b) => b.score - a.score || a.index - b.index);
+  return candidates[0]?.path;
+}
+
+function currentTaskTexts(body: JsonObject): string[] {
+  const output: string[] = [];
+  for (const key of ["message", "prompt", "instruction"]) {
+    const value = body[key];
+    if (typeof value === "string" && value.trim()) output.push(value);
+  }
+  const nodeTextValue = currentNodeUserText(body.nodes);
+  if (nodeTextValue) output.push(nodeTextValue);
+  for (const item of asArray(body.chat_history).slice(-2)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    const requestMessage = text(record.request_message).trim();
+    if (requestMessage) output.push(requestMessage);
+    const requestText = asArray(record.request_nodes).map(nodeText).filter(
+      Boolean,
+    ).join("\n").trim();
+    if (requestText) output.push(requestText);
+  }
+  return output;
+}
+
+function taskPathCandidates(
+  value: string,
+): { path: string; score: number }[] {
+  const output: { path: string; score: number }[] = [];
+  const pattern = /(?:~\/|\/home\/)[^\s"'`<>，。！？；;(){}[\]]+/g;
+  for (const match of value.matchAll(pattern)) {
+    const raw = match[0];
+    const path = cleanExtractedPath(raw);
+    if (!path) continue;
+    const before = value.slice(Math.max(0, match.index - 80), match.index)
+      .toLowerCase();
+    const after = value.slice(
+      match.index + raw.length,
+      match.index + raw.length + 40,
+    )
+      .toLowerCase();
+    let score = 10;
+    if (
+      /(?:create|write|save|generate|output|target|destination|under|into|at|to|edit|modify)\b/i
+        .test(before) ||
+      /(?:创建|写入|保存|生成|输出|目标|目录下|到|放到|修改|编辑)/.test(before)
+    ) score += 50;
+    if (
+      /(?:analy[sz]e|extract from|reference|from|source|read|search|grep)\b/i
+        .test(before) ||
+      /(?:分析|参考|读取|源码|搜索|检索|从)$/.test(before)
+    ) score -= 20;
+    if (/(?:docs?|wiki|documentation|文档|系统wiki)/i.test(before + after)) {
+      score += 10;
+    }
+    if (hasFileExtension(path)) score += 5;
+    if (pathExists(path)) score += 5;
+    else {
+      const parent = pathDirname(path);
+      if (parent && directoryExists(parent)) score += 3;
+    }
+    output.push({ path, score });
+  }
+  return output;
+}
+
+function fallbackRootForTaskPath(path: string): string | undefined {
+  const cleaned = canonicalizePath(cleanExtractedPath(path));
+  if (!cleaned) return undefined;
+  if (directoryExists(cleaned)) return cleaned;
+  if (hasFileExtension(cleaned) || isFilePath(cleaned)) {
+    const projectRoot = projectRootFromPath(cleaned);
+    if (projectRoot) return projectRoot;
+    return pathDirname(cleaned);
+  }
+  return cleaned;
+}
+
+function projectRootFromPath(path: string): string | undefined {
+  const normalized = canonicalizePath(path);
+  const home = allowedHomePrefix();
+  if (home) {
+    const prefix = `${canonicalizePath(home)}/projects/`;
+    if (normalized.startsWith(prefix)) {
+      const rest = normalized.slice(prefix.length).split("/").filter(Boolean);
+      if (rest[0]) return `${prefix}${rest[0]}`;
+    }
+  }
+  const markerRoot = workspaceFolderFromPath(normalized);
+  if (markerRoot) return markerRoot;
+  return undefined;
 }
 
 function currentIdeWorkspacePath(body: JsonObject): string | undefined {
@@ -1834,6 +1957,9 @@ function normalizeToolArguments(
   if (toolName === "launch-process") {
     normalizeLaunchProcessArguments(args);
   }
+  if (toolName === "apply_patch") {
+    normalizeApplyPatchArguments(args, fallbackPath);
+  }
   if (
     toolName === "read-process" || toolName === "write-process" ||
     toolName === "kill-process"
@@ -1869,7 +1995,7 @@ function normalizeToolArguments(
     toolName === "codebase-retrieval" &&
     typeof args.workspace_folder !== "string"
   ) {
-    const workspaceFolder = workspaceFolderFromPath(fallbackPath);
+    const workspaceFolder = retrievalWorkspaceFolderFromPath(fallbackPath);
     if (workspaceFolder) args.workspace_folder = workspaceFolder;
   }
   if (toolName === "add_tasks" || toolName === "update_tasks") {
@@ -1980,6 +2106,38 @@ function normalizeLaunchProcessArguments(args: JsonObject): void {
     command = `set -o pipefail; ${command}`;
   }
   args.command = command;
+}
+
+function normalizeApplyPatchArguments(
+  args: JsonObject,
+  fallbackPath?: string,
+): void {
+  const raw = typeof args.input === "string"
+    ? args.input
+    : typeof args.patch === "string"
+    ? args.patch
+    : undefined;
+  if (!raw) return;
+  const normalized = rewritePatchRelativePaths(raw, fallbackPath);
+  args.input = normalized;
+  if (typeof args.patch === "string") args.patch = normalized;
+}
+
+function rewritePatchRelativePaths(
+  patch: string,
+  fallbackPath?: string,
+): string {
+  const root = fallbackPath
+    ? retrievalWorkspaceFolderFromPath(fallbackPath)
+    : undefined;
+  if (!root) return patch;
+  return patch.split(/\r?\n/).map((line) => {
+    const match = line.match(/^(\*\*\* (?:Add|Update|Delete) File:\s+)(.+)$/);
+    if (!match) return line;
+    const rawPath = cleanExtractedPath(match[2]);
+    if (!rawPath || isAbsolutePath(rawPath)) return line;
+    return `${match[1]}${canonicalizePath(joinPath(root, rawPath))}`;
+  }).join("\n");
 }
 
 function expandSimpleMkdirBraceCommand(command: string): string {
@@ -2742,6 +2900,7 @@ function cleanExtractedPath(path: string): string {
   cleaned = decodePathUri(cleaned);
   cleaned = cleaned.replace(/^["'`]+|["'`]+$/g, "");
   cleaned = cleaned.replace(/["'`}\])]+$/g, "");
+  cleaned = expandHomePath(cleaned);
   cleaned = cleaned.replace(
     /\s+-\s+(?:read|view)\s+(?:file|directory)\s*$/i,
     "",
@@ -2751,7 +2910,15 @@ function cleanExtractedPath(path: string): string {
     "",
   );
   cleaned = stripPathLineSuffix(cleaned);
+  cleaned = cleaned.replace(/[.,，。]+$/g, "");
   return cleaned.trim();
+}
+
+function expandHomePath(path: string): string {
+  if (path !== "~" && !path.startsWith("~/")) return path;
+  const home = allowedHomePrefix();
+  if (!home) return path;
+  return path === "~" ? home : `${home}/${path.slice(2)}`;
 }
 
 function firstAbsolutePathFromText(value: string): string | undefined {
@@ -3004,6 +3171,23 @@ function workspaceFolderFromPath(path?: string): string | undefined {
     candidate = parent;
   }
   return directoryExists(candidate) ? candidate : undefined;
+}
+
+function retrievalWorkspaceFolderFromPath(path?: string): string | undefined {
+  if (!path) return undefined;
+  const normalized = canonicalizePath(cleanExtractedPath(path));
+  if (!normalized || !isPathWithinAllowedHome(normalized)) return undefined;
+  const projectRoot = projectRootFromPath(normalized);
+  if (projectRoot && directoryExists(projectRoot)) return projectRoot;
+  const markerRoot = workspaceFolderFromPath(normalized);
+  if (
+    markerRoot && isPathWithinAllowedHome(markerRoot) &&
+    canonicalizePath(markerRoot) !== canonicalizePath(allowedHomePrefix() ?? "")
+  ) return markerRoot;
+  if (directoryExists(normalized)) return normalized;
+  const dir = pathDirname(normalized);
+  if (dir && directoryExists(dir) && isPathWithinAllowedHome(dir)) return dir;
+  return undefined;
 }
 
 function extensionCompletionMatch(
@@ -5112,9 +5296,13 @@ function augmentTokenUsage(
   const assistantResponseTokens = estimateAssistantResponseTokens(record);
   const knownPromptTokens = systemPromptTokens + currentMessageTokens +
     toolDefinitionsTokens + toolResultTokens;
-  const chatHistoryTokens = Math.max(0, nonCachedPromptTokens - knownPromptTokens);
+  const chatHistoryTokens = Math.max(
+    0,
+    nonCachedPromptTokens - knownPromptTokens,
+  );
   const agentUsage = agentUsageTokenFields();
-  const subAgentInputTokens = numberField(agentUsage.sub_agent_input_tokens) ?? 0;
+  const subAgentInputTokens = numberField(agentUsage.sub_agent_input_tokens) ??
+    0;
   const subAgentCacheReadInputTokens =
     numberField(agentUsage.sub_agent_cache_read_input_tokens) ?? 0;
   const subAgentCacheCreationInputTokens =
@@ -5151,7 +5339,10 @@ function reportAgentUsageFromUpstreamUsage(
     numberField(record.input_tokens) ?? 0;
   const cacheReadTokens = cacheReadInputTokens(record);
   const cacheCreationTokens = cacheCreationInputTokens(record);
-  const input = Math.max(0, promptTokens - cacheReadTokens - cacheCreationTokens);
+  const input = Math.max(
+    0,
+    promptTokens - cacheReadTokens - cacheCreationTokens,
+  );
   const output = numberField(record.completion_tokens) ??
     numberField(record.output_tokens) ?? 0;
   if (
@@ -5179,7 +5370,8 @@ function openAIUsage(
   const cacheCreationTokens =
     numberField(tokenUsage.cache_creation_input_tokens) ?? 0;
   const completionTokens = numberField(tokenUsage.output_tokens) ?? 0;
-  const totalPromptTokens = promptTokens + cacheReadTokens + cacheCreationTokens;
+  const totalPromptTokens = promptTokens + cacheReadTokens +
+    cacheCreationTokens;
   return {
     prompt_tokens: totalPromptTokens,
     completion_tokens: completionTokens,

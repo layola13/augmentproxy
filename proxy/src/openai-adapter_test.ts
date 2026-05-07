@@ -693,11 +693,10 @@ Deno.test("Responses JSON token_usage includes input cache details", async () =>
 Deno.test("agent usage command returns local stats without upstream fetch", async () => {
   let fetchCalled = false;
   const originalFetch = globalThis.fetch;
-  (globalThis as unknown as { fetch: typeof fetch }).fetch =
-    (() => {
-      fetchCalled = true;
-      return Promise.resolve(new Response("{}"));
-    }) as typeof fetch;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = (() => {
+    fetchCalled = true;
+    return Promise.resolve(new Response("{}"));
+  }) as typeof fetch;
   try {
     const response = await forwardAugmentJson(
       testConfig(),
@@ -718,11 +717,10 @@ Deno.test("agent usage command returns local stats without upstream fetch", asyn
 Deno.test("agent usage stream command returns local stats without upstream fetch", async () => {
   let fetchCalled = false;
   const originalFetch = globalThis.fetch;
-  (globalThis as unknown as { fetch: typeof fetch }).fetch =
-    (() => {
-      fetchCalled = true;
-      return Promise.resolve(new Response("{}"));
-    }) as typeof fetch;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch = (() => {
+    fetchCalled = true;
+    return Promise.resolve(new Response("{}"));
+  }) as typeof fetch;
   try {
     const response = await forwardAugmentStream(
       testConfig(),
@@ -3253,6 +3251,168 @@ Deno.test("save-file with relative path is repaired via workspace fallback", asy
     );
   } finally {
     await Deno.remove(path).catch(() => undefined);
+  }
+});
+
+Deno.test("sub-agent explicit target path overrides client workspace fallback", async () => {
+  const clientWorkspace = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-client-workspace-",
+  });
+  const targetRoot = await Deno.makeTempDir({
+    dir: "/home/vscode/projects",
+    prefix: "auggile_decompile-",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_save_task_target",
+          type: "function",
+          function: {
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: "src/tools/advanced-tools.ts",
+              file_content: "export const ok = true;\n",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            path: clientWorkspace,
+            user_guidelines:
+              "You are a code implementation sub-agent. Use the available file tools to create and edit files needed for the assigned implementation task.",
+            message:
+              `Create advanced tools at ${targetRoot}/src/tools/advanced-tools.ts. Reference /home/vscode/projects/augmentproxy/augment.mjs for schemas.`,
+            tool_definitions: [
+              ...toolDefinitions(),
+              {
+                name: "save-file",
+                input_schema: { type: "object", properties: {} },
+              },
+            ],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(input.path, `${targetRoot}/src/tools/advanced-tools.ts`);
+      },
+    );
+  } finally {
+    await Deno.remove(clientWorkspace, { recursive: true }).catch(() =>
+      undefined
+    );
+    await Deno.remove(targetRoot, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("sub-agent apply_patch relative file headers use explicit target path", async () => {
+  const clientWorkspace = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-client-workspace-",
+  });
+  const targetRoot = await Deno.makeTempDir({
+    dir: "/home/vscode/projects",
+    prefix: "auggile_decompile-",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_patch_task_target",
+          type: "function",
+          function: {
+            name: "apply_patch",
+            arguments: JSON.stringify({
+              input: [
+                "*** Begin Patch",
+                "*** Add File: src/tools/advanced-tools.ts",
+                "+export const ok = true;",
+                "*** End Patch",
+              ].join("\n"),
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            path: clientWorkspace,
+            user_guidelines:
+              "You are a code implementation sub-agent. Use the available file tools to create and edit files needed for the assigned implementation task.",
+            message:
+              `Create advanced tools at ${targetRoot}/src/tools/advanced-tools.ts. Reference /home/vscode/projects/augmentproxy/augment.mjs for schemas.`,
+            tool_definitions: [{
+              name: "apply_patch",
+              input_schema: { type: "object", properties: {} },
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(
+          String(input.input).includes(
+            `*** Add File: ${targetRoot}/src/tools/advanced-tools.ts`,
+          ),
+          true,
+        );
+      },
+    );
+  } finally {
+    await Deno.remove(clientWorkspace, { recursive: true }).catch(() =>
+      undefined
+    );
+    await Deno.remove(targetRoot, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("sub-agent tilde target path becomes codebase-retrieval workspace", async () => {
+  const targetRoot = await Deno.makeTempDir({
+    dir: "/home/vscode/projects",
+    prefix: "auggile_decompile-",
+  });
+  const tildeTargetRoot = `~/projects/${targetRoot.split("/").pop()}`;
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_retrieval_target",
+          type: "function",
+          function: {
+            name: "codebase-retrieval",
+            arguments: JSON.stringify({}),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            path: "/home/vscode/projects/augmentproxy",
+            user_guidelines:
+              "You are a code implementation sub-agent. Use the available file tools to create and edit files needed for the assigned implementation task.",
+            message:
+              `Create the project structure in ${tildeTargetRoot}/. Use codebase retrieval if needed.`,
+            tool_definitions: [{
+              name: "codebase-retrieval",
+              input_schema: { type: "object", properties: {} },
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(input.workspace_folder, targetRoot);
+      },
+    );
+  } finally {
+    await Deno.remove(targetRoot, { recursive: true }).catch(() => undefined);
   }
 });
 
