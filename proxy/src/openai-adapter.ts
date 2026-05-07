@@ -889,9 +889,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
   const workspacePath = typeof body.path === "string" && body.path
     ? body.path
     : undefined;
-  const toolDefinitions = Array.isArray(body.tool_definitions)
-    ? body.tool_definitions
-    : [];
+  const toolDefinitions = effectiveToolDefinitions(ctx);
   const toolSummaries = toolDefinitions
     .filter((item): item is JsonObject =>
       !!item && typeof item === "object" && !Array.isArray(item) &&
@@ -914,6 +912,11 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- For view-range-untruncated and search-untruncated, reference_id must come from the truncation footer text 'Reference ID: ...'. Never use a tool_use_id like call_function_* as reference_id.",
     "- If str-replace-editor reports old_str not found or no changes, do not repeat the same edit call. Re-read the file and regenerate fresh old_str/new_str from current content.",
     "- For launch-process checks that may legitimately return no matches (for example grep probes), append `|| true` to avoid unnecessary hard-failure retries.",
+    "- Sub-agent role routing is strict: use sub-agent-explore only for reading, retrieval, and codebase investigation. Never use it for file creation, file edits, save-file, mkdir, terminal commands, compilation, or tests.",
+    "- Use sub-agent-plan only for planning and decomposition. Never use it for file creation, file edits, save-file, mkdir, terminal commands, compilation, or tests.",
+    "- If the task requires creating files, editing files, saving files, refactoring code, or preparing code patches, use sub-agent-code.",
+    "- If the task requires compiling, testing, running commands, validation, or reproduction steps in the terminal, use sub-agent-validate.",
+    "- If an explore or plan sub-agent discovers that implementation or validation is needed, switch immediately to sub-agent-code or sub-agent-validate instead of continuing with the wrong role.",
     "- For project evaluation, inspect the workspace root/directory first, then read specific files discovered from listings, then synthesize a final answer.",
     "- Final answers must be concise. While concrete tool work remains, use tools instead of appending follow-up suggestions.",
     "- If you already have a directory listing result, do not call view on the same root directory again in later turns. Move forward by reading specific files or using codebase-retrieval with a concrete information_request.",
@@ -992,43 +995,232 @@ function parseToolSchema(tool: JsonObject): JsonObject {
   return { type: "object", properties: {} };
 }
 
-function buildOpenAITools(ctx: RequestContext): JsonObject[] {
+function effectiveToolDefinitions(ctx: RequestContext): JsonObject[] {
   const body = objectBody(ctx);
   const toolDefinitions = Array.isArray(body.tool_definitions)
     ? body.tool_definitions
     : [];
+  const readOnlyMode = readOnlySubAgentMode(ctx);
+  let base = toolDefinitions.filter((item): item is JsonObject =>
+    Boolean(item) && typeof item === "object" && !Array.isArray(item)
+  );
+  if (readOnlyMode) {
+    const allowedReadOnlyTools = new Set([
+      "view",
+      "view-session",
+      "view-range-untruncated",
+      "search-untruncated",
+      "codebase-retrieval",
+      "github-api",
+      "web-fetch",
+      "view_tasklist",
+      "reorganize_tasklist",
+      "update_tasks",
+      "add_tasks",
+      "sub-agent-explore",
+      "sub-agent-plan",
+      "sub-agent-code",
+      "sub-agent-validate",
+    ]);
+    base = base.filter((tool) => {
+      const name = typeof tool.name === "string"
+        ? normalizeToolName(tool.name)
+        : "";
+      return allowedReadOnlyTools.has(name);
+    });
+  }
+  const injected = injectMissingSubAgentToolDefinitions(base);
+  if (!readOnlyMode) return injected;
+
+  const byName = new Map<string, JsonObject>();
+  for (const tool of injected) {
+    const name = typeof tool.name === "string" ? tool.name : "";
+    if (name) byName.set(name, tool);
+  }
+  const output = [...injected];
+  if (!byName.has("sub-agent-code")) {
+    output.push(makeSyntheticSubAgentToolDefinition(
+      "sub-agent-code",
+      "code",
+      "Escalation path from a read-only sub-agent to a writable implementation sub-agent. Use this immediately when file creation or file edits are required.",
+    ));
+  }
+  if (!byName.has("sub-agent-validate")) {
+    output.push(makeSyntheticSubAgentToolDefinition(
+      "sub-agent-validate",
+      "validate",
+      "Escalation path from a read-only sub-agent to a validation sub-agent. Use this immediately when terminal commands, tests, or compilation are required.",
+    ));
+  }
+  return output;
+}
+
+function availableToolNames(ctx: RequestContext): Set<string> {
+  const names = new Set<string>();
+  for (const tool of effectiveToolDefinitions(ctx)) {
+    const name = typeof tool.name === "string" ? normalizeToolName(tool.name) : "";
+    if (name) names.add(name);
+  }
+  return names;
+}
+
+function readOnlySubAgentMode(ctx: RequestContext): boolean {
+  const body = objectBody(ctx);
+  const guidelineText = [
+    text(body.user_guidelines),
+    text(body.workspace_guidelines),
+    text(body.system_prompt),
+    text(body.system_prompt_append),
+  ].join("\n").toLowerCase();
+  return (
+    guidelineText.includes("do not modify any files") ||
+    guidelineText.includes("do not run any commands") ||
+    guidelineText.includes("read-only investigation sub-agent") ||
+    guidelineText.includes("planning sub-agent")
+  );
+}
+
+function unavailableToolRecovery(
+  toolName: string,
+  availableTools: Set<string>,
+  argumentsJson: string,
+): { toolName: string; input: JsonObject } | undefined {
+  if (availableTools.has(toolName)) return undefined;
+  let args: JsonObject = {};
+  try {
+    const parsed = JSON.parse(argumentsJson || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      args = parsed as JsonObject;
+    }
+  } catch {
+    // Ignore malformed arguments here; invalidToolReason will report separately.
+  }
+  if (
+    (toolName === "save-file" || toolName === "str-replace-editor") &&
+    availableTools.has("sub-agent-code")
+  ) {
+    const path = typeof args.path === "string" ? args.path.trim() : "";
+    const instruction = path
+      ? `Edit or create the file at ${path}. Read the current file first if it exists, then apply the required code change and persist it with the tools available in this agent.`
+      : "Continue the implementation using the writable tools available in this agent. Read the target file first if it exists, then apply the code change.";
+    return {
+      toolName: "sub-agent-code",
+      input: { action: "run", name: "code_recovery", instruction },
+    };
+  }
+  if (
+    (toolName === "launch-process" || toolName === "read-process" ||
+      toolName === "write-process" || toolName === "kill-process") &&
+    availableTools.has("sub-agent-validate")
+  ) {
+    return {
+      toolName: "sub-agent-validate",
+      input: {
+        action: "run",
+        name: "validate_recovery",
+        instruction:
+          "Continue by running the necessary terminal or validation steps with the tools available in this agent. Inspect the latest failure, run the exact command needed, and keep going until the validation result is clear.",
+      },
+    };
+  }
+  return undefined;
+}
+
+function injectMissingSubAgentToolDefinitions(
+  toolDefinitions: JsonObject[],
+): JsonObject[] {
+  const byName = new Map<string, JsonObject>();
+  for (const tool of toolDefinitions) {
+    const name = typeof tool.name === "string" ? tool.name : "";
+    if (name) byName.set(name, tool);
+  }
+  const hasExplore = byName.has("sub-agent-explore");
+  const hasPlan = byName.has("sub-agent-plan");
+  const hasCode = byName.has("sub-agent-code");
+  const hasValidate = byName.has("sub-agent-validate");
+  if ((hasCode && hasValidate)) {
+    return toolDefinitions;
+  }
+
+  if (!hasExplore && !hasPlan && !hasCode && !hasValidate) {
+    return toolDefinitions;
+  }
+
+  const injected = [...toolDefinitions];
+  if (!hasCode) {
+    injected.push(makeSyntheticSubAgentToolDefinition(
+      "sub-agent-code",
+      "code",
+      "Implements features and writes production code. Use this role for file creation, file edits, save-file, refactors, mkdir/setup work, and other write tasks. Do not use this role for destructive file removal.",
+    ));
+  }
+  if (!hasValidate) {
+    injected.push(makeSyntheticSubAgentToolDefinition(
+      "sub-agent-validate",
+      "validate",
+      "Tests implementations and validates correctness. Use this role for compilation, test runs, terminal commands, verification, and reproduction steps. Do not use this role for save-file edits.",
+    ));
+  }
+  return injected;
+}
+
+function makeSyntheticSubAgentToolDefinition(
+  toolName: string,
+  roleName: string,
+  roleDescription: string,
+): JsonObject {
+  return {
+    name: toolName,
+    description: [
+      "Run a single synchronous sub-agent in the same workspace. Inputs: instruction (string), name (string). Returns the sub-agent's last message and minimal edit metadata. This tool only returns when the sub-agent completed its work.",
+      "",
+      "**IMPORTANT: This tool can be run in parallel.** Multiple sub-agents can execute simultaneously with different names and instructions. Use parallel execution when you have multiple independent tasks that can be completed concurrently.",
+      "",
+      "Available actions:",
+      "• **run** - Execute a sub-agent with the given instruction (waits for completion)",
+      "• **output** - Show the response and file changes (if any) made by a completed sub-agent",
+      "",
+      `**Configuration:**\n- Name: ${roleName}\n- Description: ${roleDescription}`,
+    ].join("\n"),
+    input_schema_json: JSON.stringify({
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["run", "output"],
+          description:
+            "Action to perform:\n'run' - execute a sub-agent with the given instruction\n'output' - show the response and file changes (if any) made by a completed sub-agent",
+        },
+        name: {
+          type: "string",
+          description:
+            "Name of the sub-agent. Names must be unique and contain no spaces.\nFor 'run': provide a name for the new agent (required).\nFor 'output': provide the name of a completed agent to review (required).",
+        },
+        instruction: {
+          type: "string",
+          description:
+            "Detailed instruction for the sub-agent (required for 'run' action only).\nThe instruction should be clear and complete - the sub-agent will work independently to complete it.",
+        },
+      },
+      required: ["action"],
+    }),
+    tool_safety: 2,
+  };
+}
+
+function buildOpenAITools(ctx: RequestContext): JsonObject[] {
+  const toolDefinitions = effectiveToolDefinitions(ctx);
   const tools: JsonObject[] = [];
-  let hasSaveFile = false;
   for (const item of toolDefinitions) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const tool = item as JsonObject;
     if (typeof tool.name !== "string" || !tool.name) continue;
-    if (tool.name === "save-file") hasSaveFile = true;
     tools.push({
       type: "function",
       function: {
         name: tool.name,
         description: toolDescriptionForModel(tool),
         parameters: parseToolSchema(tool),
-      },
-    });
-  }
-
-  // Inject save-file if missing, as sub-agents often need it to persist results
-  if (!hasSaveFile) {
-    tools.push({
-      type: "function",
-      function: {
-        name: "save-file",
-        description: "Save a new file to the workspace. Use this to persist generated content or create new source files.",
-        parameters: {
-          type: "object",
-          properties: {
-            path: { type: "string", description: "Absolute path to the new file." },
-            file_content: { type: "string", description: "Complete content of the file." },
-          },
-          required: ["path", "file_content"],
-        },
       },
     });
   }
@@ -1070,6 +1262,14 @@ function toolDescriptionForModel(tool: JsonObject): string {
       'Example arguments: {"path":"<dir>/Example.hx","file_content":"complete file contents"}. Only use for new files. For existing files, use str-replace-editor. Never omit file_content. Never use a directory path as path.',
     "sub-agent":
       'Example arguments: {"action":"run","name":"reviewer","instruction":"Inspect the failing tests and report concise findings."}. To retrieve a completed agent result, use {"action":"output","name":"reviewer"}.',
+    "sub-agent-explore":
+      'Use only for read-only investigation. Example arguments: {"action":"run","name":"explore_types","instruction":"Read the routing and adapter files and summarize how tool schemas are forwarded. Do not edit files or run terminal commands."}.',
+    "sub-agent-plan":
+      'Use only for planning. Example arguments: {"action":"run","name":"plan_refactor","instruction":"Produce a concise implementation plan for the next code changes. Do not edit files or run terminal commands."}.',
+    "sub-agent-code":
+      'Use for implementation and file edits. Example arguments: {"action":"run","name":"code_fix_router","instruction":"Create or edit the required files to implement the fix. Use write/edit tools as needed. Do not stop at a plan."}.',
+    "sub-agent-validate":
+      'Use for compilation, tests, and command execution. Example arguments: {"action":"run","name":"validate_state_build","instruction":"Run the relevant compile and test commands, inspect failures, and report the exact blocker."}.',
   };
   const example = examples[name] ??
     "Arguments must be a valid JSON object matching the schema.";
@@ -2146,6 +2346,11 @@ function repairMisusedToolCall(
   toolName: string,
   argumentsJson: string,
 ): { name: string; argumentsJson: string } {
+  const rewrittenSubAgent = rewriteMisusedSubAgentToolCall(
+    toolName,
+    argumentsJson,
+  );
+  if (rewrittenSubAgent) return rewrittenSubAgent;
   if (toolName !== "view-range-untruncated") {
     return { name: toolName, argumentsJson };
   }
@@ -2171,6 +2376,86 @@ function repairMisusedToolCall(
     // Keep original tool call when arguments are not parseable.
   }
   return { name: toolName, argumentsJson };
+}
+
+function rewriteMisusedSubAgentToolCall(
+  toolName: string,
+  argumentsJson: string,
+): { name: string; argumentsJson: string } | undefined {
+  if (toolName !== "sub-agent-explore" && toolName !== "sub-agent-plan") {
+    return undefined;
+  }
+  let args: JsonObject;
+  try {
+    const parsed = JSON.parse(argumentsJson || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    args = parsed as JsonObject;
+  } catch {
+    return undefined;
+  }
+  if (text(args.action).toLowerCase() !== "run") return undefined;
+  const instruction = text(args.instruction).trim();
+  if (!instruction) return undefined;
+  const lower = instruction.toLowerCase();
+  const writeSignals = [
+    "save file",
+    "save-file",
+    "write file",
+    "create file",
+    "create files",
+    "edit file",
+    "edit files",
+    "modify file",
+    "modify files",
+    "update file",
+    "update files",
+    "rewrite file",
+    "rewrite files",
+    "patch file",
+    "patch files",
+    "implement",
+    "implementation",
+    "refactor",
+    "mkdir",
+    "create directory",
+    "create folder",
+    "write code",
+    "code change",
+    "production code",
+  ];
+  const validateSignals = [
+    "run tests",
+    "run test",
+    "test ",
+    "compile",
+    "build",
+    "validate",
+    "verification",
+    "verify",
+    "reproduce",
+    "launch-process",
+    "terminal",
+    "command",
+    "execute",
+    "haxe -p",
+    "deno test",
+    "npm test",
+    "pnpm test",
+    "cargo test",
+  ];
+  if (containsAnySignal(lower, writeSignals)) {
+    return { name: "sub-agent-code", argumentsJson };
+  }
+  if (containsAnySignal(lower, validateSignals)) {
+    return { name: "sub-agent-validate", argumentsJson };
+  }
+  return undefined;
+}
+
+function containsAnySignal(textValue: string, signals: string[]): boolean {
+  return signals.some((signal) => textValue.includes(signal));
 }
 
 function repairArgumentsJson(argumentsJson: string): string {
@@ -2708,7 +2993,11 @@ function repairViewPath(path: string, fallbackPath?: string): string {
 function invalidToolReason(
   toolName: string,
   argumentsJson: string,
+  allowedTools?: Set<string>,
 ): string | undefined {
+  if (allowedTools && !allowedTools.has(toolName)) {
+    return `Tool ${toolName} is not available in this session. Use only the tools exposed in the current request.`;
+  }
   try {
     const args = JSON.parse(argumentsJson || "{}") as JsonObject;
     if ((toolName === "view") && typeof args.path !== "string") {
@@ -2881,9 +3170,15 @@ function toolCallsToNodes(
   fallbackPath?: string,
   launchCommandFallback?: string,
   readFilePaths?: Set<string>,
+  allowedTools?: Set<string>,
 ): JsonObject[] {
   const parsedCalls = coalesceSaveFileToolCalls(
-    validParsedToolCalls(toolCalls, fallbackPath, launchCommandFallback),
+    validParsedToolCalls(
+      toolCalls,
+      fallbackPath,
+      launchCommandFallback,
+      allowedTools,
+    ),
   );
   const nodes: JsonObject[] = [];
   let id = startingId;
@@ -2937,13 +3232,18 @@ function validParsedToolCalls(
   toolCalls: JsonValue,
   fallbackPath?: string,
   launchCommandFallback?: string,
+  allowedTools?: Set<string>,
 ): ParsedToolCall[] {
   if (!Array.isArray(toolCalls)) return [];
   const parsedCalls: ParsedToolCall[] = [];
   for (const call of toolCalls) {
     const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
     if (!parsed) continue;
-    const invalidReason = invalidToolReason(parsed.name, parsed.argumentsJson);
+    const invalidReason = invalidToolReason(
+      parsed.name,
+      parsed.argumentsJson,
+      allowedTools,
+    );
     if (invalidReason) continue;
     parsedCalls.push(parsed);
   }
@@ -3388,6 +3688,7 @@ function filterRepeatedFailedToolCalls(
   recentFailures: Map<string, RecentFailedToolCall>,
   fallbackPath?: string,
   launchCommandFallback?: string,
+  allowedTools?: Set<string>,
 ): { valid: JsonObject[]; repeated: JsonObject[]; recoveryNodes: JsonObject[] } {
   const valid: JsonObject[] = [];
   const repeated: JsonObject[] = [];
@@ -3443,6 +3744,7 @@ function filterRepeatedFailedToolCalls(
       failure,
       fallbackPath,
       recoveryNodes.length + 1,
+      allowedTools,
     );
     if (!recovery) continue;
     const recoveryKey = JSON.stringify((recovery.tool_use as JsonObject | undefined)?.input_json ?? "");
@@ -3656,8 +3958,14 @@ function recoveryToolNodeForRepeatedFailure(
   failure: RecentFailedToolCall,
   fallbackPath: string | undefined,
   id: number,
+  allowedTools?: Set<string>,
 ): JsonObject | undefined {
-  const recovery = recoveryToolForRepeatedFailure(parsed, failure, fallbackPath);
+  const recovery = recoveryToolForRepeatedFailure(
+    parsed,
+    failure,
+    fallbackPath,
+    allowedTools,
+  );
   if (!recovery) return undefined;
   return {
     id,
@@ -3676,7 +3984,16 @@ function recoveryToolForRepeatedFailure(
   parsed: ParsedToolCall,
   failure: RecentFailedToolCall,
   fallbackPath?: string,
+  allowedTools?: Set<string>,
 ): { toolName: string; input: JsonObject } | undefined {
+  if (allowedTools) {
+    const unavailable = unavailableToolRecovery(
+      parsed.name,
+      allowedTools,
+      parsed.argumentsJson,
+    );
+    if (unavailable) return unavailable;
+  }
   if (
     parsed.name === "read-process" ||
     parsed.name === "write-process" ||
@@ -3856,13 +4173,18 @@ function invalidToolCallSummaries(
   toolCalls: JsonValue,
   fallbackPath?: string,
   launchCommandFallback?: string,
+  allowedTools?: Set<string>,
 ): JsonObject[] {
   if (!Array.isArray(toolCalls)) return [];
   const output: JsonObject[] = [];
   for (const call of toolCalls) {
     const parsed = parseToolCall(call, fallbackPath, launchCommandFallback);
     if (!parsed) continue;
-    const reason = invalidToolReason(parsed.name, parsed.argumentsJson);
+    const reason = invalidToolReason(
+      parsed.name,
+      parsed.argumentsJson,
+      allowedTools,
+    );
     if (reason) {
       output.push({
         id: parsed.id,
@@ -3906,12 +4228,17 @@ function recoveryToolNodesForInvalidToolCalls(
   invalidToolCalls: JsonObject[],
   startingId = 1,
   fallbackPath?: string,
+  allowedTools?: Set<string>,
 ): JsonObject[] {
   const nodes: JsonObject[] = [];
   const seenRecoveries = new Set<string>();
   let id = startingId;
   for (const call of invalidToolCalls) {
-    const recovery = recoveryToolForInvalidToolCall(call, fallbackPath);
+    const recovery = recoveryToolForInvalidToolCall(
+      call,
+      fallbackPath,
+      allowedTools,
+    );
     if (!recovery) continue;
     const recoveryKey = `${recovery.toolName}:${JSON.stringify(recovery.input)}`;
     if (seenRecoveries.has(recoveryKey)) continue;
@@ -3936,9 +4263,18 @@ function recoveryToolNodesForInvalidToolCalls(
 function recoveryToolForInvalidToolCall(
   call: JsonObject,
   fallbackPath?: string,
+  allowedTools?: Set<string>,
 ): { toolName: string; input: JsonObject } | undefined {
   const name = typeof call.name === "string" ? call.name : "";
   const reason = typeof call.reason === "string" ? call.reason : "";
+  if (allowedTools) {
+    const unavailable = unavailableToolRecovery(
+      name,
+      allowedTools,
+      typeof call.arguments === "string" ? call.arguments : "{}",
+    );
+    if (unavailable) return unavailable;
+  }
   if (
     name === "read-process" ||
     name === "write-process" ||
@@ -3955,6 +4291,7 @@ function recoveryToolForInvalidToolCall(
 function recoveryToolNodesForStaleRejectedText(
   startingId = 1,
   fallbackPath?: string,
+  allowedTools?: Set<string>,
 ): JsonObject[] {
   return recoveryToolNodesForInvalidToolCalls(
     [{
@@ -3965,6 +4302,7 @@ function recoveryToolNodesForStaleRejectedText(
     }],
     startingId,
     fallbackPath,
+    allowedTools,
   );
 }
 
@@ -4727,6 +5065,9 @@ export async function forwardAugmentJson(
   ctx: RequestContext,
 ): Promise<Response> {
   const body = objectBody(ctx);
+  const strictAllowedTools = readOnlySubAgentMode(ctx)
+    ? availableToolNames(ctx)
+    : undefined;
   const continuationNudge = continuationControlNudge(ctx);
   const forceToolChoiceRequired = Boolean(continuationNudge);
   const request = buildOpenAIRequest(
@@ -4872,7 +5213,13 @@ export async function forwardAugmentJson(
     content = parsed.content;
     reasoningFallback = parsed.thinking.join("\n\n").trim();
     if (parsed.thinking.length > 0) nodes = [...thinkingNodes(parsed.thinking), ...nodes];
-    const repeatedFilter = filterRepeatedFailedToolCalls(parsed.toolCalls, recentFailures, fallbackPath);
+    const repeatedFilter = filterRepeatedFailedToolCalls(
+      parsed.toolCalls,
+      recentFailures,
+      fallbackPath,
+      undefined,
+      strictAllowedTools,
+    );
     const candidateToolCalls = repeatedFilter.valid;
     if (
       repeatedFilter.repeated.length > 0 &&
@@ -4880,16 +5227,27 @@ export async function forwardAugmentJson(
     ) {
       content = appendRepeatedToolCallHint(content, repeatedFilter.repeated, fallbackPath);
     }
-    const invalidToolCalls = invalidToolCallSummaries(candidateToolCalls, fallbackPath);
+    const invalidToolCalls = invalidToolCallSummaries(
+      candidateToolCalls,
+      fallbackPath,
+      undefined,
+      strictAllowedTools,
+    );
     const validToolNodes = toolCallsToNodes(
       candidateToolCalls,
       1,
       fallbackPath,
       undefined,
       readFilePaths,
+      strictAllowedTools,
     );
     const recoveryToolNodes = validToolNodes.length === 0
-      ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1, fallbackPath)
+      ? recoveryToolNodesForInvalidToolCalls(
+        invalidToolCalls,
+        1,
+        fallbackPath,
+        strictAllowedTools,
+      )
       : [];
     invalidToolCallsForHint = recoveryToolNodes.length > 0 ? [] : invalidToolCalls;
     nodes = [
@@ -4917,6 +5275,8 @@ export async function forwardAugmentJson(
             : [],
           recentFailures,
           fallbackPath,
+          undefined,
+          strictAllowedTools,
         );
         if (
           repeatedFilter.repeated.length > 0 &&
@@ -4927,6 +5287,8 @@ export async function forwardAugmentJson(
         const invalidToolCalls = invalidToolCallSummaries(
           repeatedFilter.valid,
           fallbackPath,
+          undefined,
+          strictAllowedTools,
         );
         const validToolNodes = toolCallsToNodes(
           repeatedFilter.valid,
@@ -4934,9 +5296,15 @@ export async function forwardAugmentJson(
           fallbackPath,
           undefined,
           readFilePaths,
+          strictAllowedTools,
         );
         const recoveryToolNodes = validToolNodes.length === 0
-          ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1, fallbackPath)
+          ? recoveryToolNodesForInvalidToolCalls(
+            invalidToolCalls,
+            1,
+            fallbackPath,
+            strictAllowedTools,
+          )
           : [];
         invalidToolCallsForHint = recoveryToolNodes.length > 0 ? [] : invalidToolCalls;
         nodes = [
@@ -5360,6 +5728,9 @@ export async function forwardAugmentStream(
   const requestId = ctx.requestId;
   const fallbackPath = workspaceFallbackPath(ctx);
   const readFilePaths = collectReadFilePaths(ctx, fallbackPath);
+  const strictAllowedTools = readOnlySubAgentMode(ctx)
+    ? availableToolNames(ctx)
+    : undefined;
   const streamToolCalls: JsonObject[] = [];
 
   const stream = new ReadableStream<Uint8Array>({
@@ -5792,6 +6163,7 @@ export async function forwardAugmentStream(
             recentFailedToolCalls(ctx, fallbackPath),
             fallbackPath,
             launchCommandFallback,
+            strictAllowedTools,
           );
           if (streamToolCalls.length > 0) {
             logInfo(config, "openai:stream:tool-calls", {
@@ -5815,6 +6187,7 @@ export async function forwardAugmentStream(
             repeatedFilter.valid,
             fallbackPath,
             launchCommandFallback,
+            strictAllowedTools,
           );
           if (invalidToolCalls.length > 0) {
             logWarn(config, "openai:stream:invalid-tool-calls-filtered", {
@@ -5829,7 +6202,11 @@ export async function forwardAugmentStream(
               launchCommandFallback,
             );
             return parsed &&
-              !invalidToolReason(parsed.name, parsed.argumentsJson);
+              !invalidToolReason(
+                parsed.name,
+                parsed.argumentsJson,
+                strictAllowedTools,
+              );
           });
           const validToolNodes = toolCallsToNodes(
             nonInvalidToolCalls,
@@ -5837,9 +6214,15 @@ export async function forwardAugmentStream(
             fallbackPath,
             launchCommandFallback,
             readFilePaths,
+            strictAllowedTools,
           );
           const recoveryToolNodes = validToolNodes.length === 0
-            ? recoveryToolNodesForInvalidToolCalls(invalidToolCalls, 1, fallbackPath)
+            ? recoveryToolNodesForInvalidToolCalls(
+              invalidToolCalls,
+              1,
+              fallbackPath,
+              strictAllowedTools,
+            )
             : [];
           if (recoveryToolNodes.length > 0) {
             logWarn(config, "openai:stream:invalid-tool-recovery-nodes", {
@@ -5898,7 +6281,11 @@ export async function forwardAugmentStream(
             (staleRejectedStreamText || hasToolCallRejectedText(visibleText))
           ) {
             visibleText = stripToolCallRejectedTail(visibleText);
-            toolNodes = recoveryToolNodesForStaleRejectedText(1, fallbackPath);
+            toolNodes = recoveryToolNodesForStaleRejectedText(
+              1,
+              fallbackPath,
+              strictAllowedTools,
+            );
             logWarn(config, "openai:stream:stale-rejection-recovery-node", {
               requestId,
               fallbackPath,

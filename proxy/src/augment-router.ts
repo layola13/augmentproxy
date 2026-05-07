@@ -1,6 +1,7 @@
-import type { ProxyConfig, RequestContext } from "./types.ts";
+import type { JsonObject, ProxyConfig, RequestContext } from "./types.ts";
 import { jsonResponse, textResponse } from "./http.ts";
 import {
+  ensureFakeAgent,
   fakeBatchUpload,
   fakeBillingSummary,
   fakeCheckpointBlobs,
@@ -28,9 +29,156 @@ import {
   indexCheckpoint,
   indexFindMissing,
 } from "./indexer.ts";
+import { logInfo } from "./logger.ts";
 
 function normalized(path: string): string {
   return path.replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function bodyObject(ctx: RequestContext): Record<string, unknown> {
+  return ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
+    ? ctx.body as Record<string, unknown>
+    : {};
+}
+
+function jsonField<T>(value: unknown, fallback: T): T {
+  return value === undefined ? fallback : value as T;
+}
+
+function remoteToolCatalog(): Array<{
+  tool_id: number;
+  tool_name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  tool_safety: number;
+}> {
+  const tool = (
+    tool_id: number,
+    tool_name: string,
+    description: string,
+    input_schema: Record<string, unknown>,
+    tool_safety = 1,
+  ) => ({
+    tool_id,
+    tool_name,
+    description,
+    input_schema,
+    tool_safety,
+  });
+  return [
+    tool(0, "unknown", "Unknown tool", { type: "object", properties: {} }, 0),
+    tool(1, "web-search", "Search the web", {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    }, 1),
+    tool(8, "github-api", "GitHub API access", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(12, "linear", "Linear issue tracker", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(13, "jira", "Jira issue tracker", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(14, "confluence", "Confluence docs", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(15, "notion", "Notion docs", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(16, "supabase", "Supabase access", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(17, "glean", "Glean search", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(18, "github-app-readonly-api", "GitHub App readonly API", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(19, "github-app-post-comment", "GitHub App post comment", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(20, "github-app-pr-description", "GitHub App PR description", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(21, "context-canvas", "Context canvas", {
+      type: "object",
+      properties: {},
+    }, 1),
+    tool(26, "spawn-agent", "Spawn a remote agent", {
+      type: "object",
+      properties: {
+        information_request: { type: "string" },
+        workspace_folder: { type: "string" },
+        agent_definition: { type: "string" },
+      },
+      additionalProperties: true,
+    }, 2),
+  ];
+}
+
+function remoteToolSafety(toolId: number): { is_safe: boolean; reason: string } {
+  return toolId === 26
+    ? { is_safe: true, reason: "spawn-agent is allowed in the local proxy" }
+    : { is_safe: true, reason: "allowed" };
+}
+
+function remoteToolAvailability(_toolId: number): number {
+  // `1` means immediately available/configured in the current client build.
+  return 1;
+}
+
+function parseAgentDefinition(raw: unknown): JsonObject {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as JsonObject;
+  }
+  if (typeof raw !== "string") return {};
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as JsonObject
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function inferSpawnAgentMode(
+  informationRequest: string,
+  agentDefinition: JsonObject,
+): "explore" | "plan" | "code" | "validate" {
+  const haystack = [
+    informationRequest,
+    typeof agentDefinition.name === "string" ? agentDefinition.name : "",
+    typeof agentDefinition.description === "string"
+      ? agentDefinition.description
+      : "",
+    typeof agentDefinition.instructions === "string"
+      ? agentDefinition.instructions
+      : "",
+  ].join("\n").toLowerCase();
+  const has = (...signals: string[]) => signals.some((signal) => haystack.includes(signal));
+  if (has("validate", "verify", "verification", "compile", "test ", "run tests", "terminal")) {
+    return "validate";
+  }
+  if (has("implement", "implementation", "edit file", "create file", "write code", "save-file", "refactor")) {
+    return "code";
+  }
+  if (has("plan", "planning", "decompose", "break down")) {
+    return "plan";
+  }
+  return "explore";
 }
 
 function isStreamChat(path: string): boolean {
@@ -150,13 +298,105 @@ export async function routeAugment(
   }
 
   if (path === "agents/list-remote-tools") {
+    const body = bodyObject(ctx);
+    const toolIdList = body.tool_id_list && typeof body.tool_id_list === "object" && !Array.isArray(body.tool_id_list)
+      ? body.tool_id_list as Record<string, unknown>
+      : {};
+    const requestedIds = Array.isArray(toolIdList.tool_ids)
+      ? toolIdList.tool_ids.filter((id): id is number => typeof id === "number")
+      : [];
+    const requestedTools = requestedIds
+      .map((toolId) => remoteToolCatalog().find((tool) => tool.tool_id === toolId))
+      .filter((tool): tool is NonNullable<typeof tool> => Boolean(tool));
     await recordRequest(config, ctx, "mock-list-remote-tools-recorded");
-    return jsonResponse({ tools: [] });
+    return jsonResponse({
+      tools: requestedTools.map((tool) => ({
+        remote_tool_id: tool.tool_id,
+        availability_status: remoteToolAvailability(tool.tool_id),
+        tool_safety: tool.tool_safety,
+        oauth_url: "",
+        tool_definition: {
+          name: tool.tool_name,
+          description: tool.description,
+          input_schema_json: JSON.stringify(tool.input_schema),
+          tool_safety: tool.tool_safety,
+        },
+        tool_id: tool.tool_id,
+        tool_name: tool.tool_name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+      })),
+    });
   }
 
   if (path === "agents/check-tool-safety") {
+    const body = bodyObject(ctx);
+    const toolId = typeof body.tool_id === "number" ? body.tool_id : -1;
     await recordRequest(config, ctx, "mock-check-tool-safety-recorded");
-    return jsonResponse({ is_safe: true });
+    return jsonResponse({ tool_id: toolId, ...remoteToolSafety(toolId) });
+  }
+
+  if (path === "agents/run-remote-tool") {
+    const body = bodyObject(ctx);
+    const toolId = typeof body.tool_id === "number" ? body.tool_id : -1;
+    const toolName = typeof body.tool_name === "string" ? body.tool_name : "";
+    const toolInputJson = typeof body.tool_input_json === "string"
+      ? body.tool_input_json
+      : JSON.stringify(jsonField(body.tool_input_json, {}));
+    await recordRequest(config, ctx, "mock-run-remote-tool-recorded");
+    if (toolId === 26 || toolName === "spawn-agent") {
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = JSON.parse(toolInputJson) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
+      const informationRequest = typeof parsed.information_request === "string"
+        ? parsed.information_request
+        : "";
+      const workspaceFolder = typeof parsed.workspace_folder === "string"
+        ? parsed.workspace_folder
+        : "";
+      const agentDefinition = parseAgentDefinition(parsed.agent_definition);
+      const mode = inferSpawnAgentMode(informationRequest, agentDefinition);
+      const agent = ensureFakeAgent({
+        agent_name: typeof agentDefinition.name === "string"
+          ? agentDefinition.name
+          : "Local Proxy Agent",
+        capabilities: [{
+          tool_id: 26,
+          tool_name: "spawn-agent",
+          workspace_folder: workspaceFolder,
+          mode,
+        }],
+        session_config: {
+          mode,
+          information_request: informationRequest,
+          workspace_folder: workspaceFolder,
+          agent_definition: agentDefinition,
+        },
+      });
+      return jsonResponse({
+        status: "success",
+        tool_id: 26,
+        tool_name: "spawn-agent",
+        tool_output: {
+          agent_id: agent.agent_id,
+          tool_input_json: toolInputJson,
+          workspace_folder: (() => {
+            return typeof parsed.workspace_folder === "string" ? parsed.workspace_folder : "";
+          })(),
+        },
+      });
+    }
+    return jsonResponse({
+      status: "success",
+      tool_id: toolId,
+      tool_name: toolName,
+      tool_output: {
+        tool_input_json: toolInputJson,
+      },
+    });
   }
 
   if (path === "agents/codebase-retrieval") {

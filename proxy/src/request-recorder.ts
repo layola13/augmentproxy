@@ -88,7 +88,7 @@ export async function recordRequest(
 
     // Use a size threshold to avoid processing massive requests
     // JSON.stringify on a 5MB string is slow, but redact on a 5MB object is SLOWER.
-    let bodyPreview: JsonValue = undefined;
+    let bodyPreview: JsonValue = null;
     if (ctx.body !== undefined) {
       // If the raw body string is too large, don't even try to redact it
       const bodyStr = JSON.stringify(ctx.body);

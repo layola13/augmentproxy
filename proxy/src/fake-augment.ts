@@ -26,6 +26,10 @@ function now(): string {
   return new Date().toISOString();
 }
 
+function jsonArray(value: unknown, fallback: JsonValue[] = []): JsonValue[] {
+  return Array.isArray(value) ? value as JsonValue[] : fallback;
+}
+
 function historySummaryParams(config: ProxyConfig): string {
   return JSON.stringify({
     prompt: config.augmentHistorySummaryPrompt,
@@ -177,40 +181,83 @@ function serializeAgent(agent: AgentRecord): JsonObject {
   };
 }
 
+function createAgentRecord(input: {
+  agent_id?: string;
+  agent_name?: string;
+  capabilities?: JsonValue[];
+  tags?: JsonValue[];
+  session_config?: JsonObject;
+} = {}): AgentRecord {
+  const timestamp = now();
+  return {
+    agent_id: input.agent_id ?? `agent_${crypto.randomUUID()}`,
+    agent_name: input.agent_name ?? "Local Proxy Agent",
+    status: "ACTIVE",
+    capabilities: input.capabilities ?? [],
+    created_at: timestamp,
+    updated_at: timestamp,
+    tags: input.tags ?? [],
+    messages: [],
+    session_config: input.session_config ?? {},
+  };
+}
+
+export function ensureFakeAgent(input: {
+  agent_id?: string;
+  agent_name?: string;
+  capabilities?: JsonValue[];
+  tags?: JsonValue[];
+  session_config?: JsonObject;
+} = {}): AgentRecord {
+  const id = input.agent_id;
+  if (id) {
+    const existing = agents.get(id);
+    if (existing) {
+      if (input.agent_name) existing.agent_name = input.agent_name;
+      if (input.capabilities) existing.capabilities = input.capabilities;
+      if (input.tags) existing.tags = input.tags;
+      if (input.session_config) existing.session_config = input.session_config;
+      existing.updated_at = now();
+      agents.set(id, existing);
+      return existing;
+    }
+  }
+  const agent = createAgentRecord(input);
+  agents.set(agent.agent_id, agent);
+  return agent;
+}
+
+export function resetFakeAgentsForTest(): void {
+  agents.clear();
+}
+
 export function fakeCloudAgent(ctx: RequestContext): JsonObject {
   const body = bodyObject(ctx);
   const timestamp = now();
 
   if (ctx.path.endsWith("/create")) {
-    const id = `agent_${crypto.randomUUID()}`;
-    const agent: AgentRecord = {
-      agent_id: id,
+    const sessionConfig = body.session_config && typeof body.session_config === "object" && !Array.isArray(body.session_config)
+      ? body.session_config as JsonObject
+      : {};
+    const agent = ensureFakeAgent({
       agent_name: stringField(body.agent_name, "Local Proxy Agent"),
-      status: "ACTIVE",
-      capabilities: [],
-      created_at: timestamp,
-      updated_at: timestamp,
-      tags: [],
-      messages: [],
-      session_config: {},
-    };
-    agents.set(id, agent);
+      capabilities: jsonArray(body.capabilities),
+      session_config: {
+        ...sessionConfig,
+      },
+    });
     return { agent: serializeAgent(agent) };
   }
 
   if (ctx.path.endsWith("/send-message")) {
     const id = stringField(body.agent_id, "default");
-    const agent = agents.get(id) ?? {
+    const agent = ensureFakeAgent({
       agent_id: id,
-      agent_name: "Local Proxy Agent",
-      status: "ACTIVE",
-      capabilities: [],
-      created_at: timestamp,
-      updated_at: timestamp,
-      tags: [],
-      messages: [],
-      session_config: {},
-    };
+      ...(Array.isArray(body.capabilities) ? { capabilities: body.capabilities } : {}),
+    });
+    if (Array.isArray(body.capabilities)) {
+      agent.capabilities = body.capabilities;
+    }
     agent.messages.push({
       id: `msg_${crypto.randomUUID()}`,
       role: "user",

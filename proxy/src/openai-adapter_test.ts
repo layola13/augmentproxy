@@ -105,6 +105,110 @@ function toolDefinitions(): JsonObject[] {
   }];
 }
 
+function subAgentExplorePlanDefinitions(): JsonObject[] {
+  return [{
+    name: "sub-agent-explore",
+    description: "Read-only investigation sub-agent",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string" },
+        name: { type: "string" },
+        instruction: { type: "string" },
+      },
+      required: ["action"],
+    },
+  }, {
+    name: "sub-agent-plan",
+    description: "Planning sub-agent",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: { type: "string" },
+        name: { type: "string" },
+        instruction: { type: "string" },
+      },
+      required: ["action"],
+    },
+  }];
+}
+
+function readOnlyActualClientDefinitions(): JsonObject[] {
+  return [{
+    name: "kill-process",
+    description: "Kill a process",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "read-process",
+    description: "Read a process",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "write-process",
+    description: "Write a process",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "list-processes",
+    description: "List processes",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "web-fetch",
+    description: "Fetch a URL",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "codebase-retrieval",
+    description: "Code search",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "view",
+    description: "Read a file or directory",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "view-session",
+    description: "Read session",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "view-range-untruncated",
+    description: "Read file range",
+    input_schema: { type: "object", properties: {} },
+  }, {
+    name: "search-untruncated",
+    description: "Search file",
+    input_schema: { type: "object", properties: {} },
+  }];
+}
+
+function readOnlySubAgentContext(): JsonObject {
+  return {
+    ...workspaceContext(),
+    tool_definitions: subAgentExplorePlanDefinitions(),
+    user_guidelines:
+      "Read-only investigation sub-agent. Do NOT modify any files. Do NOT run any commands or launch any processes.",
+  };
+}
+
+function toolNamesFromOpenAIRequestBody(body: JsonObject): string[] {
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  const names: string[] = [];
+  for (const item of tools) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const fn = (item as JsonObject).function;
+    if (!fn || typeof fn !== "object" || Array.isArray(fn)) continue;
+    const name = (fn as JsonObject).name;
+    if (typeof name === "string" && name) names.push(name);
+  }
+  return names;
+}
+
+function toolNamesFromResponsesRequestBody(body: JsonObject): string[] {
+  const tools = Array.isArray(body.tools) ? body.tools : [];
+  return tools
+    .filter((item): item is JsonObject =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item) &&
+      typeof (item as JsonObject).name === "string"
+    )
+    .map((item) => String(item.name));
+}
+
 function historyAfterToolResult(content = "Read file result\n"): JsonObject[] {
   return [{
     response_nodes: [{
@@ -483,6 +587,154 @@ Deno.test("codex instructions do not mandate Next Steps final answers", async ()
   );
 });
 
+Deno.test("openai injects missing code and validate sub-agent tools", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentExplorePlanDefinitions(),
+          message: "implement the fix and run tests",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("sub-agent-explore"), true);
+      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-code"), true);
+      assertEquals(names.includes("sub-agent-validate"), true);
+    },
+  );
+});
+
+Deno.test("codex injects missing code and validate sub-agent tools", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentExplorePlanDefinitions(),
+          message: "implement the fix and run tests",
+        }),
+      );
+      const names = toolNamesFromResponsesRequestBody(requests[0].body);
+      assertEquals(names.includes("sub-agent-explore"), true);
+      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-code"), true);
+      assertEquals(names.includes("sub-agent-validate"), true);
+    },
+  );
+});
+
+Deno.test("codex instructions enforce strict sub-agent role routing", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: subAgentExplorePlanDefinitions(),
+          message: "fix the file and validate the build",
+        }),
+      );
+      const instructions = String(requests[0].body.instructions ?? "");
+      assertEquals(instructions.includes("use sub-agent-explore only for reading"), true);
+      assertEquals(instructions.includes("use sub-agent-code"), true);
+      assertEquals(instructions.includes("use sub-agent-validate"), true);
+    },
+  );
+});
+
+Deno.test("openai does not inject synthetic save-file into read-only sub-agent tool list", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...readOnlySubAgentContext(),
+          message: "inspect the project",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("save-file"), false);
+      assertEquals(names.includes("sub-agent-code"), true);
+      assertEquals(names.includes("sub-agent-validate"), true);
+    },
+  );
+});
+
+Deno.test("openai prunes terminal tools and injects code/validate for actual read-only client session", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: readOnlyActualClientDefinitions(),
+          user_guidelines:
+            "Read-only investigation sub-agent. Do NOT modify any files. Do NOT run any commands or launch any processes.",
+          message: "inspect the project",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("launch-process"), false);
+      assertEquals(names.includes("read-process"), false);
+      assertEquals(names.includes("write-process"), false);
+      assertEquals(names.includes("kill-process"), false);
+      assertEquals(names.includes("sub-agent-code"), true);
+      assertEquals(names.includes("sub-agent-validate"), true);
+      assertEquals(names.includes("view"), true);
+      assertEquals(names.includes("codebase-retrieval"), true);
+    },
+  );
+});
+
 Deno.test("openai continuation with recent history tool result requires next tool call", async () => {
   await withCaptureFetch(
     new Response(
@@ -798,6 +1050,109 @@ Deno.test("codex json function_call emits Augment tool node", async () => {
   );
 });
 
+Deno.test("codex json rewrites misused explore sub-agent to code", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-tool",
+          output: [{
+            type: "function_call",
+            call_id: "call_subagent_explore_code",
+            name: "sub-agent-explore",
+            arguments: JSON.stringify({
+              action: "run",
+              name: "worker1",
+              instruction: "Create the missing files, edit the module, and save the implementation.",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-code"), true);
+      assertEquals(hasToolName(body, "sub-agent-explore"), false);
+      const input = firstToolInput(body);
+      assertEquals(input.action, "run");
+      assertEquals(input.name, "worker1");
+    },
+  );
+});
+
+Deno.test("codex json rewrites misused plan sub-agent to validate", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-tool",
+          output: [{
+            type: "function_call",
+            call_id: "call_subagent_plan_validate",
+            name: "sub-agent-plan",
+            arguments: JSON.stringify({
+              action: "run",
+              name: "validator1",
+              instruction: "Run tests, compile the project, and verify the failure is resolved.",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-validate"), true);
+      assertEquals(hasToolName(body, "sub-agent-plan"), false);
+      const input = firstToolInput(body);
+      assertEquals(input.action, "run");
+      assertEquals(input.name, "validator1");
+    },
+  );
+});
+
+Deno.test("codex json keeps genuine explore sub-agent calls unchanged", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-tool",
+          output: [{
+            type: "function_call",
+            call_id: "call_subagent_explore_readonly",
+            name: "sub-agent-explore",
+            arguments: JSON.stringify({
+              action: "run",
+              name: "explorer1",
+              instruction: "Read the router and summarize how tool definitions are forwarded.",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext(workspaceContext()),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-explore"), true);
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      assertEquals(hasToolName(body, "sub-agent-validate"), false);
+    },
+  );
+});
+
 Deno.test("openai json invalid save-file recovers with view tool", async () => {
   await withFakeOpenAIMessage(
     {
@@ -861,6 +1216,121 @@ Deno.test("codex json invalid save-file recovers with view tool", async () => {
       const input = firstToolInput(body);
       assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
       assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("codex json unavailable save-file in read-only child switches to sub-agent-code", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-readonly-save",
+          output: [{
+            type: "function_call",
+            call_id: "call_codex_readonly_save",
+            name: "save-file",
+            arguments: JSON.stringify({
+              path: "/home/vscode/projects/augmentproxy/proxy/src/fix.ts",
+              file_content: "export const fix = true;\n",
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...readOnlySubAgentContext(),
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "save-file"), false);
+      assertEquals(hasToolName(body, "sub-agent-code"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.action, "run");
+    },
+  );
+});
+
+Deno.test("codex json unavailable launch-process in read-only child switches to sub-agent-validate", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-readonly-launch",
+          output: [{
+            type: "function_call",
+            call_id: "call_codex_readonly_launch",
+            name: "launch-process",
+            arguments: JSON.stringify({
+              command: "npm test",
+              cwd: "/home/vscode/projects/augmentproxy",
+              wait: true,
+              max_wait_seconds: 60,
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...readOnlySubAgentContext(),
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "launch-process"), false);
+      assertEquals(hasToolName(body, "sub-agent-validate"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.action, "run");
+    },
+  );
+});
+
+Deno.test("codex json actual read-only client launch-process is rerouted to sub-agent-validate", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        JSON.stringify({
+          id: "resp-readonly-launch-actual",
+          output: [{
+            type: "function_call",
+            call_id: "call_codex_readonly_launch_actual",
+            name: "launch-process",
+            arguments: JSON.stringify({
+              command: "npm test",
+              cwd: "/home/vscode/projects/augmentproxy",
+              wait: true,
+              max_wait_seconds: 60,
+            }),
+          }],
+          usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const response = await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: readOnlyActualClientDefinitions(),
+          user_guidelines:
+            "Read-only investigation sub-agent. Do NOT modify any files. Do NOT run any commands or launch any processes.",
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "launch-process"), false);
+      assertEquals(hasToolName(body, "sub-agent-validate"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.action, "run");
     },
   );
 });
@@ -5035,8 +5505,5 @@ Deno.test("forwardAugmentStream emits thinking even without content", async () =
     },
   );
 });
-
-
-
 
 
