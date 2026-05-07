@@ -59,6 +59,8 @@ plan
     "code": "auto",
     "validate": "auto",
     "judge": "auto",
+    "askexpert": "auto",
+    "docs": "auto",
     "research": "auto"
   }
 }
@@ -70,6 +72,8 @@ plan
 ~/.augment/agents/code.md
 ~/.augment/agents/validate.md
 ~/.augment/agents/judge.md
+~/.augment/agents/askexpert.md
+~/.augment/agents/docs.md
 ```
 
 已验证：配置后 `code` agent 可用，主 agent 可以把创建文件、编辑文件、实现代码这类任务交给 `code` 子代理。
@@ -81,16 +85,30 @@ plan
 - `code`：实现和写文件；建议禁用 `launch-process` 和 `remove-files`。
 - `validate`：运行测试、编译、验证；建议禁用 `save-file` 和 `remove-files`。
 - `judge`：裁决任务是否完成；只读，不写文件、不跑命令，基于用户需求、产物和 `validate` 结果判断是否还需要继续。
+- `askexpert`：专家诊断；只读，不写文件、不跑命令。用于 `code` / `validate` 多次失败、死循环或无法定位根因时，请求独立专家模型给出根因和下一步指令。
+- `docs`：读取、搜索、分析系统后编写 Markdown 文档或系统 wiki；只写 `README.md`、`docs/**/*.md`、`wiki/**/*.md` 等文档文件，不改源码、不跑命令。
 
-推荐闭环：`code -> validate -> judge -> code/validate ...`。`validate` 先给出测试/编译证据，`judge` 再判断用户需求是否真正完成。如果缺少验证证据，`judge` 应返回 `NEEDS_VALIDATION`，而不是直接通过。
+推荐实现闭环：`code -> validate -> judge -> code/validate ...`。推荐文档闭环：`explore -> docs -> validate -> judge`，或者由 `docs` 自行先读代码再写 wiki。如果多轮仍失败，插入 `askexpert -> code/validate/docs -> judge`。`validate` 先给出测试/编译/文档一致性证据，`judge` 再判断用户需求是否真正完成。如果缺少验证证据，`judge` 应返回 `NEEDS_VALIDATION`，而不是直接通过。
 
-不要把写入工具或命令工具强塞进只读子代理。只读子代理如果需要实现或验证，应回到主 agent，由主 agent 切换到 `code`、`validate` 或 `judge`。
+`askexpert` 使用 `proxy/config.toml` 中的独立专家 provider，不混用主模型 key：
+
+```toml
+model_provider = "difu"
+expert_provider = "expert"
+
+[model_providers.expert]
+base_url = "https://api.openai.com/v1"
+api_keys = ["sk-expert-***"]
+model = "gpt-5.3-codex"
+```
+
+不要把写入工具或命令工具强塞进只读子代理。只读子代理如果需要实现、验证或写文档，应回到主 agent，由主 agent 切换到 `code`、`validate`、`docs` 或 `judge`。
 
 ### Script Behavior
 
 - `start-proxy.sh` 只负责停止旧 proxy 并启动 `proxy/src/server.ts`，不会修改 `~/.augment/feature-config.json` 或 `~/.augment/agents/`。
 - `run-augment-proxy.sh` 只负责注入 `AUGMENT_API_URL`、`AUGMENT_API_TOKEN`、`AUGMENT_SESSION_AUTH` 并启动 `auggie`，会使用当前用户目录下已有的 subagent 配置。
-- 修改 `~/.augment/feature-config.json` 或 `~/.augment/agents/*.md` 后，需要重启 Auggie 会话，再用 `/agents` 确认 `code` / `validate` / `judge` 已出现。
+- 修改 `~/.augment/feature-config.json` 或 `~/.augment/agents/*.md` 后，需要重启 Auggie 会话，再用 `/agents` 确认 `code` / `validate` / `judge` / `askexpert` / `docs` 已出现。
 
 ## 上游伪装为 Codex
 

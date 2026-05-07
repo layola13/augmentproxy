@@ -1,6 +1,7 @@
 # Example Proxy Configuration in TOML
 # You can specify the active channel here
 model_provider = "difu"
+expert_provider = "expert"
 
 [model_providers.difu]
 base_url = "https://df.dawnloadai.com:9888/v1"
@@ -23,3 +24,10 @@ api_keys = [
     "tp-ss8w8aykyfk830llqc48le6sn1sypitf80b5g8b1wqe8swfl"
 ]
 model = "mimo-v2.5-pro"
+
+[model_providers.expert]
+base_url = "https://api.openai.com/v1"
+api_keys = [
+    "sk-expert-***"
+]
+model = "gpt-5.3-codex"

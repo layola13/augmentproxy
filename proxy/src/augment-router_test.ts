@@ -17,6 +17,7 @@ function testConfig(): ProxyConfig {
     port: 0,
     switchApi: "OPENAI",
     activeChannel: "default",
+    expertChannel: "",
     channels: {
       default: {
         baseUrl: "https://example.test/v1",
@@ -257,6 +258,79 @@ Deno.test("spawn-agent preserves inferred mode and session metadata", async () =
     "Code Worker",
   );
   assertEquals((capabilities[0] as JsonObject).mode, "code");
+});
+
+Deno.test("spawn-agent preserves askexpert mode", async () => {
+  resetFakeAgentsForTest();
+  const spawnResponse = await routeAugment(
+    testConfig(),
+    requestContext("agents/run-remote-tool", {
+      tool_name: "spawn-agent",
+      tool_id: 26,
+      tool_input_json: JSON.stringify({
+        information_request: "Ask expert to diagnose why code agents loop",
+        workspace_folder: "/home/vscode/projects/augmentproxy",
+        agent_definition: JSON.stringify({
+          name: "askexpert",
+          description: "Expert diagnostic reviewer",
+        }),
+      }),
+    }),
+  );
+  const spawnBody = await spawnResponse.json() as JsonObject;
+  const agentId = String((spawnBody.tool_output as JsonObject).agent_id);
+
+  const sendResponse = await routeAugment(
+    testConfig(),
+    requestContext("cloud-agents/send-message", {
+      agent_id: agentId,
+      message: "continue",
+    }),
+  );
+  const sendBody = await sendResponse.json() as JsonObject;
+  const agent = sendBody.agent as JsonObject;
+  const sessionConfig = agent.session_config as JsonObject;
+  const capabilities = agent.capabilities as JsonObject[];
+
+  assertEquals(sessionConfig.mode, "askexpert");
+  assertEquals((capabilities[0] as JsonObject).mode, "askexpert");
+});
+
+Deno.test("spawn-agent preserves docs mode for system wiki tasks", async () => {
+  resetFakeAgentsForTest();
+  const spawnResponse = await routeAugment(
+    testConfig(),
+    requestContext("agents/run-remote-tool", {
+      tool_name: "spawn-agent",
+      tool_id: 26,
+      tool_input_json: JSON.stringify({
+        information_request:
+          "Analyze the system and write Markdown system wiki documentation",
+        workspace_folder: "/home/vscode/projects/augmentproxy",
+        agent_definition: JSON.stringify({
+          name: "docs",
+          description: "Documentation writer for system wiki pages",
+        }),
+      }),
+    }),
+  );
+  const spawnBody = await spawnResponse.json() as JsonObject;
+  const agentId = String((spawnBody.tool_output as JsonObject).agent_id);
+
+  const sendResponse = await routeAugment(
+    testConfig(),
+    requestContext("cloud-agents/send-message", {
+      agent_id: agentId,
+      message: "continue",
+    }),
+  );
+  const sendBody = await sendResponse.json() as JsonObject;
+  const agent = sendBody.agent as JsonObject;
+  const sessionConfig = agent.session_config as JsonObject;
+  const capabilities = agent.capabilities as JsonObject[];
+
+  assertEquals(sessionConfig.mode, "docs");
+  assertEquals((capabilities[0] as JsonObject).mode, "docs");
 });
 
 Deno.test("cloud agent create preserves capabilities", async () => {

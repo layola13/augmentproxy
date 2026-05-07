@@ -1,4 +1,5 @@
 import type {
+  ChannelConfig,
   JsonObject,
   JsonValue,
   OpenAIChatRequest,
@@ -9,6 +10,7 @@ import type {
   RequestContext,
 } from "./types.ts";
 import {
+  getExpertChannel,
   getNextOpenaiApiKey,
   getOpenAIKeyCount,
   getOpenAIModel,
@@ -1115,6 +1117,45 @@ function readOnlySubAgentMode(ctx: RequestContext): boolean {
     guidelineText.includes("read-only investigation sub-agent") ||
     guidelineText.includes("planning sub-agent")
   );
+}
+
+function isAskExpertContext(ctx: RequestContext): boolean {
+  const body = objectBody(ctx);
+  const values = [
+    body.agent_name,
+    body.name,
+    body.mode,
+    body.user_guidelines,
+    body.workspace_guidelines,
+    body.system_prompt,
+    body.system_prompt_append,
+  ];
+  const sessionConfig = body.session_config;
+  if (
+    sessionConfig && typeof sessionConfig === "object" &&
+    !Array.isArray(sessionConfig)
+  ) {
+    const config = sessionConfig as JsonObject;
+    values.push(config.mode, config.agent_name, config.name);
+    const agentDefinition = config.agent_definition;
+    if (
+      agentDefinition && typeof agentDefinition === "object" &&
+      !Array.isArray(agentDefinition)
+    ) {
+      const definition = agentDefinition as JsonObject;
+      values.push(definition.name, definition.description);
+    }
+  }
+  const haystack = values.map((value) => text(value).toLowerCase()).join("\n");
+  return haystack.includes("askexpert") || haystack.includes("ask expert") ||
+    haystack.includes("expert diagnostic");
+}
+
+function expertChannelForContext(
+  config: ProxyConfig,
+  ctx: RequestContext,
+): ChannelConfig | null {
+  return isAskExpertContext(ctx) ? getExpertChannel(config) : null;
 }
 
 function unavailableToolRecovery(
@@ -4721,7 +4762,8 @@ function buildOpenAIRequest(
   continuationNudge?: string,
   forceToolChoiceRequired = false,
 ): OpenAIUpstreamRequest {
-  if (config.switchApi === "CODEX") {
+  const expertChannel = expertChannelForContext(config, ctx);
+  if (config.switchApi === "CODEX" && !expertChannel) {
     return buildResponsesRequest(
       config,
       ctx,
@@ -4747,12 +4789,17 @@ function buildChatRequest(
   forceToolChoiceRequired = false,
 ): OpenAIChatRequest {
   const body = objectBody(ctx);
+  const expertChannel = expertChannelForContext(config, ctx);
   const messages = buildMessages(config, ctx);
   if (continuationNudge) {
     messages.push({ role: "user", content: continuationNudge });
   }
   const request: OpenAIChatRequest = {
-    model: activeUpstreamModel(config, body.model as string | undefined),
+    model: activeUpstreamModel(
+      config,
+      body.model as string | undefined,
+      expertChannel,
+    ),
     messages,
     stream,
   };
@@ -5055,9 +5102,15 @@ function openAIUsage(
   };
 }
 
-function openAIHeaders(config: ProxyConfig, stream: boolean): Headers {
+function openAIHeaders(
+  config: ProxyConfig,
+  stream: boolean,
+  channel?: ChannelConfig | null,
+): Headers {
   const headers = new Headers();
-  const apiKey = config.switchApi === "CODEX"
+  const apiKey = channel
+    ? getNextOpenaiApiKey(config, channel)
+    : config.switchApi === "CODEX"
     ? config.codexApiKey
     : getNextOpenaiApiKey(config);
   headers.set("authorization", `Bearer ${apiKey}`);
@@ -5067,17 +5120,23 @@ function openAIHeaders(config: ProxyConfig, stream: boolean): Headers {
   return headers;
 }
 
-function openAIUrl(config: ProxyConfig): string {
-  if (config.switchApi === "CODEX") return `${config.codexBaseUrl}/responses`;
-  return `${getOpenAIUrl(config)}/chat/completions`;
+function openAIUrl(
+  config: ProxyConfig,
+  channel?: ChannelConfig | null,
+): string {
+  if (!channel && config.switchApi === "CODEX") {
+    return `${config.codexBaseUrl}/responses`;
+  }
+  return `${getOpenAIUrl(config, channel)}/chat/completions`;
 }
 
 function activeUpstreamModel(
   config: ProxyConfig,
   requestedModel?: string,
+  channel?: ChannelConfig | null,
 ): string {
-  if (config.switchApi === "CODEX") return config.codexModel;
-  const mapped = getOpenAIModel(config, requestedModel);
+  if (!channel && config.switchApi === "CODEX") return config.codexModel;
+  const mapped = getOpenAIModel(config, requestedModel, channel);
   if (requestedModel && mapped !== requestedModel) {
     logInfo(config, "openai:model:mapped", {
       original: requestedModel,
@@ -5330,6 +5389,7 @@ export async function forwardAugmentJson(
   ctx: RequestContext,
 ): Promise<Response> {
   const body = objectBody(ctx);
+  const expertChannel = expertChannelForContext(config, ctx);
   const strictAllowedTools = hasToolDefinitions(ctx)
     ? availableToolNames(ctx)
     : undefined;
@@ -5346,9 +5406,13 @@ export async function forwardAugmentJson(
   const readFilePaths = collectReadFilePaths(ctx, fallbackPath);
   logInfo(config, "openai:json:start", {
     requestId: ctx.requestId,
-    api: config.switchApi,
-    model: activeUpstreamModel(config, body.model as string | undefined),
-    url: openAIUrl(config),
+    api: expertChannel ? "EXPERT" : config.switchApi,
+    model: activeUpstreamModel(
+      config,
+      body.model as string | undefined,
+      expertChannel,
+    ),
+    url: openAIUrl(config, expertChannel),
   });
   logInfo(config, "openai:json:payload", {
     requestId: ctx.requestId,
@@ -5364,9 +5428,9 @@ export async function forwardAugmentJson(
   while (attempts < 2) {
     attempts += 1;
     try {
-      upstream = await fetch(openAIUrl(config), {
+      upstream = await fetch(openAIUrl(config, expertChannel), {
         method: "POST",
-        headers: openAIHeaders(config, false),
+        headers: openAIHeaders(config, false, expertChannel),
         body: requestBody,
       });
     } catch (error) {
@@ -6005,6 +6069,7 @@ export async function forwardAugmentStream(
     return compactStreamResponse(config, ctx, compactSummary);
   }
   const continuationNudge = continuationControlNudge(ctx);
+  const expertChannel = expertChannelForContext(config, ctx);
   const forceToolChoiceRequired = Boolean(continuationNudge);
   const request = buildOpenAIRequest(
     config,
@@ -6222,12 +6287,13 @@ export async function forwardAugmentStream(
           const body = objectBody(ctx);
           logInfo(config, "openai:stream:start", {
             requestId,
-            api: config.switchApi,
+            api: expertChannel ? "EXPERT" : config.switchApi,
             model: activeUpstreamModel(
               config,
               body.model as string | undefined,
+              expertChannel,
             ),
-            url: openAIUrl(config),
+            url: openAIUrl(config, expertChannel),
           });
           logInfo(config, "openai:stream:payload", {
             requestId,
@@ -6249,9 +6315,9 @@ export async function forwardAugmentStream(
               15_000,
             );
             try {
-              upstream = await fetch(openAIUrl(config), {
+              upstream = await fetch(openAIUrl(config, expertChannel), {
                 method: "POST",
-                headers: openAIHeaders(config, true),
+                headers: openAIHeaders(config, true, expertChannel),
                 body: requestBody,
               });
             } catch (error) {

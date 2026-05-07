@@ -41,6 +41,30 @@ AUGMENT_REQUEST_LOG_DIR=proxy/logs
 `SWITCH_API=CODEX` sends upstream model requests to `CODEX_BASE_URL/responses` with `CODEX_API_KEY` and `CODEX_MODEL`.
 The two API keys are intentionally separate and are not used as fallbacks for each other.
 
+Expert sub-agent routing is configured in `proxy/config.toml`, not in `.env`:
+
+```toml
+model_provider = "difu"
+expert_provider = "expert"
+
+[model_providers.expert]
+base_url = "https://api.openai.com/v1"
+api_keys = ["sk-expert-***"]
+model = "gpt-5.3-codex"
+```
+
+When an `askexpert` sub-agent session is detected, the proxy sends that request to `expert_provider` using OpenAI-compatible `/chat/completions`. Main agent traffic still uses `model_provider` or `SWITCH_API=CODEX`.
+
+## Sub-Agent Templates
+
+Repository templates live in `proxy/agents/`. Copy them to `~/.augment/agents/` and enable the matching names in `~/.augment/feature-config.json`.
+
+- `code`: implements and edits files, but does not run commands.
+- `validate`: runs commands, tests, builds, and reproductions, but does not save files.
+- `judge`: read-only completion judge.
+- `askexpert`: read-only expert diagnosis routed to `expert_provider`.
+- `docs`: reads/searches/analyzes the system and writes Markdown docs or system wiki files only.
+
 ## Upstream Identity / Codex-like Requests
 
 Some OpenAI-compatible providers behave differently when request headers or prompts contain app-specific names. The proxy therefore sends upstream model requests with a Codex-like identity by default:

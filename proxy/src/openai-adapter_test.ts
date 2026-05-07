@@ -16,6 +16,7 @@ function testConfig(): ProxyConfig {
     port: 0,
     switchApi: "OPENAI",
     activeChannel: "default",
+    expertChannel: "",
     channels: {
       default: {
         baseUrl: "https://example.test/v1",
@@ -51,6 +52,25 @@ function testConfig(): ProxyConfig {
     indexChunkChars: 0,
     indexChunkOverlap: 0,
     logLevel: "error",
+  };
+}
+
+function expertConfig(): ProxyConfig {
+  return {
+    ...testConfig(),
+    expertChannel: "expert",
+    channels: {
+      default: {
+        baseUrl: "https://example.test/v1",
+        apiKeys: ["test-key"],
+        model: "test-model",
+      },
+      expert: {
+        baseUrl: "https://expert.example.test/v1",
+        apiKeys: ["expert-key"],
+        model: "expert-model",
+      },
+    },
   };
 }
 
@@ -408,6 +428,7 @@ function codexConfig(): ProxyConfig {
   return {
     ...testConfig(),
     switchApi: "CODEX",
+    expertChannel: "",
     openaiBaseUrl: "https://openai.example.test/v1",
     codexBaseUrl: "https://codex.example.test/v1",
     channels: {
@@ -600,6 +621,73 @@ Deno.test("codex switch uses responses endpoint and CODEX credentials/model", as
       assertEquals(Array.isArray(requests[0].body.input), true);
       assertEquals(typeof requests[0].body.instructions, "string");
       assertEquals(requests[0].body.stream, false);
+    },
+  );
+});
+
+Deno.test("askexpert context uses configured expert OpenAI provider", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "expert ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        expertConfig(),
+        testContext({
+          ...workspaceContext(),
+          session_config: { mode: "askexpert" },
+          user_guidelines: "askexpert diagnostic agent",
+          message: "diagnose the repeated failure",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(body.text, "expert ok");
+      assertEquals(requests.length, 1);
+      assertEquals(
+        requests[0].url,
+        "https://expert.example.test/v1/chat/completions",
+      );
+      assertEquals(
+        requests[0].headers.get("authorization"),
+        "Bearer expert-key",
+      );
+      assertEquals(requests[0].body.model, "expert-model");
+      assertEquals(Array.isArray(requests[0].body.messages), true);
+    },
+  );
+});
+
+Deno.test("askexpert context overrides CODEX switch with expert OpenAI provider", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "expert codex ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        { ...codexConfig(), ...expertConfig(), switchApi: "CODEX" },
+        testContext({
+          ...workspaceContext(),
+          session_config: { mode: "askexpert" },
+          message: "ask expert for root cause",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(body.text, "expert codex ok");
+      assertEquals(
+        requests[0].url,
+        "https://expert.example.test/v1/chat/completions",
+      );
+      assertEquals(requests[0].body.model, "expert-model");
+      assertEquals(Array.isArray(requests[0].body.messages), true);
+      assertEquals(Array.isArray(requests[0].body.input), false);
     },
   );
 });
@@ -1538,6 +1626,53 @@ Deno.test("codex json actual read-only client launch-process falls back to view 
       const input = firstToolInput(body);
       assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
       assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("askexpert stream uses configured expert OpenAI provider", async () => {
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({
+            choices: [{ delta: { content: "expert " } }],
+          })
+        }`,
+        `data: ${
+          JSON.stringify({
+            choices: [{ delta: { content: "stream" } }],
+          })
+        }`,
+        "data: [DONE]",
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentStream(
+        { ...codexConfig(), ...expertConfig(), switchApi: "CODEX" },
+        testContext({
+          ...workspaceContext(),
+          session_config: { mode: "askexpert" },
+          user_guidelines: "askexpert diagnostic agent",
+          message: "stream expert diagnosis",
+        }),
+      );
+      const objects = await collectStreamObjects(response);
+      const final = objects.find((item) => item.done === true);
+      assertEquals(final?.response_text, "expert stream");
+      assertEquals(
+        requests[0].url,
+        "https://expert.example.test/v1/chat/completions",
+      );
+      assertEquals(
+        requests[0].headers.get("authorization"),
+        "Bearer expert-key",
+      );
+      assertEquals(requests[0].body.model, "expert-model");
+      assertEquals(Array.isArray(requests[0].body.messages), true);
+      assertEquals(Array.isArray(requests[0].body.input), false);
     },
   );
 });

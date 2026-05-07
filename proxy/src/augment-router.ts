@@ -159,7 +159,7 @@ function parseAgentDefinition(raw: unknown): JsonObject {
 function inferSpawnAgentMode(
   informationRequest: string,
   agentDefinition: JsonObject,
-): "explore" | "plan" | "code" | "validate" {
+): "explore" | "plan" | "code" | "validate" | "judge" | "askexpert" | "docs" {
   const haystack = [
     informationRequest,
     typeof agentDefinition.name === "string" ? agentDefinition.name : "",
@@ -172,6 +172,45 @@ function inferSpawnAgentMode(
   ].join("\n").toLowerCase();
   const has = (...signals: string[]) =>
     signals.some((signal) => haystack.includes(signal));
+  if (
+    has(
+      "askexpert",
+      "ask expert",
+      "expert",
+      "expert diagnostic",
+      "expert review",
+      "consult expert",
+    )
+  ) {
+    return "askexpert";
+  }
+  if (
+    has(
+      "docs",
+      "documentation",
+      "document",
+      "wiki",
+      "readme",
+      "markdown",
+      ".md",
+      "system wiki",
+      "write docs",
+      "write documentation",
+    )
+  ) {
+    return "docs";
+  }
+  if (
+    has(
+      "judge",
+      "completion judge",
+      "judge completion",
+      "task complete",
+      "verdict",
+    )
+  ) {
+    return "judge";
+  }
   if (
     has(
       "validate",
