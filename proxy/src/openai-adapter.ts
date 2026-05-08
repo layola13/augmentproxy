@@ -1035,9 +1035,24 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     .map((tool) => toolPromptSummary(tool))
     .filter(Boolean);
 
+  const isReadOnlyAgent = readOnlySubAgentMode(ctx);
   const lines = [
     "Auggie/Codex-style tool protocol:",
-    "- You are an autonomous coding agent. Keep working until the user's request is fully resolved; do not stop after only announcing a plan or after one tool call.",
+  ];
+  
+  if (isReadOnlyAgent) {
+    lines.push(
+      "- You are a specialized READ-ONLY sub-agent. Your task is to investigate, read files, or make a plan.",
+      "- You DO NOT have tools to write code, save files, or run tests.",
+      "- Once you have gathered the requested information or completed the plan, summarize your findings directly in your response and STOP. Do not keep searching endlessly.",
+    );
+  } else {
+    lines.push(
+      "- You are an autonomous coding agent. Keep working until the user's request is fully resolved; do not stop after only announcing a plan or after one tool call.",
+    );
+  }
+
+  lines.push(
     "- Before using tools, briefly state what you are about to inspect or do. After tool results, continue from those exact results instead of repeating the same call.",
     "- Use tools only through the provided function-calling interface. Do not write XML, Markdown tool blocks, or prose pretending to be a tool call.",
     "- Every function call argument must be one complete JSON object that satisfies the tool schema. Never call a tool with {} unless that tool schema explicitly has no required fields.",
@@ -1053,7 +1068,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- For project evaluation, inspect the workspace root/directory first, then read specific files discovered from listings, then synthesize a final answer.",
     "- Final answers must be concise. While concrete tool work remains, use tools instead of appending follow-up suggestions.",
     "- If you already have a directory listing result, do not call view on the same root directory again in later turns. Move forward by reading specific files or using codebase-retrieval with a concrete information_request.",
-  ];
+  );
   if (toolNames.has("sub-agent-explore")) {
     lines.push(
       "- sub-agent-explore is read-only: use it only for reading, retrieval, and codebase investigation. Never use it for file creation, file edits, save-file, mkdir, terminal commands, compilation, or tests.",
@@ -3079,60 +3094,18 @@ function rewriteMisusedSubAgentToolCall(
   const instruction = text(args.instruction).trim();
   if (!instruction) return undefined;
   const lower = instruction.toLowerCase();
-  const writeSignals = [
-    "save file",
-    "save-file",
-    "write file",
-    "create file",
-    "create files",
-    "edit file",
-    "edit files",
-    "modify file",
-    "modify files",
-    "update file",
-    "update files",
-    "rewrite file",
-    "rewrite files",
-    "patch file",
-    "patch files",
-    "implement",
-    "implementation",
-    "refactor",
-    "mkdir",
-    "create directory",
-    "create folder",
-    "write code",
-    "code change",
-    "production code",
-  ];
-  const validateSignals = [
-    "run tests",
-    "run test",
-    "test ",
-    "compile",
-    "build",
-    "validate",
-    "verification",
-    "verify",
-    "reproduce",
-    "launch-process",
-    "terminal",
-    "command",
-    "execute",
-    "haxe -p",
-    "deno test",
-    "npm test",
-    "pnpm test",
-    "cargo test",
-  ];
+
+  const writeRegex = /^(?:please\s+)?(?:save|write|create|edit|modify|update|rewrite|patch|implement|refactor|mkdir)\b/i;
+  const validateRegex = /^(?:please\s+)?(?:run|test|compile|build|validate|verify|reproduce|execute|haxe|deno|npm|pnpm|cargo)\b/i;
+
   if (
-    containsAnySignal(lower, writeSignals) &&
+    writeRegex.test(instruction) &&
     (!allowedTools || allowedTools.has("sub-agent-code"))
   ) {
     return { name: "sub-agent-code", argumentsJson };
   }
   if (
-    containsAnySignal(lower, validateSignals) &&
+    validateRegex.test(instruction) &&
     (!allowedTools || allowedTools.has("sub-agent-validate"))
   ) {
     return { name: "sub-agent-validate", argumentsJson };
@@ -5587,6 +5560,12 @@ function recoveryViewTargetForInvalidToolCall(
     }
   } catch {
     // Fall back to workspace inspection below.
+  }
+
+  const name = typeof call.name === "string" ? call.name : "";
+  const isReadTool = name === "view" || name === "codebase-retrieval" || name === "search-untruncated" || name === "view-range-untruncated";
+  if (!isReadTool) {
+    return undefined;
   }
 
   const fallback = workspaceFolderFromPath(fallbackPath) ?? fallbackPath;

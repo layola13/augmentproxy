@@ -2474,7 +2474,7 @@ Deno.test("openai json narrows codebase-retrieval workspace folder to explicit t
   }
 });
 
-Deno.test("codex json invalid save-file recovers with view tool", async () => {
+Deno.test("codex json invalid save-file returns error message", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -2500,16 +2500,14 @@ Deno.test("codex json invalid save-file recovers with view tool", async () => {
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "save-file"), false);
-      assertEquals(hasToolName(body, "view"), true);
-      assertEquals(responseTextContains(body, "Tool call rejected"), false);
-      const input = firstToolInput(body);
-      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
-      assertEquals(input.type, "directory");
+      assertEquals(hasToolName(body, "view"), false);
+      assertEquals(responseTextContains(body, "Tool call rejected"), true);
+      assertEquals(responseTextContains(body, "outside the allowed scope"), true);
     },
   );
 });
 
-Deno.test("codex json unavailable save-file in read-only child falls back to view when code role is absent", async () => {
+Deno.test("codex json unavailable save-file in read-only child returns error message when code role is absent", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -2539,10 +2537,9 @@ Deno.test("codex json unavailable save-file in read-only child falls back to vie
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "save-file"), false);
       assertEquals(hasToolName(body, "sub-agent-code"), false);
-      assertEquals(hasToolName(body, "view"), true);
-      const input = firstToolInput(body);
-      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy/src");
-      assertEquals(input.type, "directory");
+      assertEquals(hasToolName(body, "view"), false);
+      assertEquals(responseTextContains(body, "Tool call rejected"), true);
+      assertEquals(responseTextContains(body, "not available in this session"), true);
     },
   );
 });
@@ -7654,6 +7651,86 @@ Deno.test("forwardAugmentStream emits thinking even without content", async () =
 
       assertEquals(thinkingNodes.length >= 1, true);
       assertEquals((thinkingNodes[0].thinking as any).summary, "Thinking only");
+    },
+  );
+});
+
+Deno.test("arbitrary agent transition: writable custom agent (e.g. doc) has access to all sub-agents", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const customSubAgents = [
+        ...subAgentAllDefinitions(),
+        { name: "sub-agent-doc", description: "Write docs" },
+        { name: "sub-agent-judge", description: "Evaluate code" }
+      ];
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: customSubAgents,
+          user_guidelines: "You are the documentation agent.",
+          message: "write some docs",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      // Writable agent should have all sub-agents available
+      assertEquals(names.includes("sub-agent-explore"), true);
+      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-code"), true);
+      assertEquals(names.includes("sub-agent-validate"), true);
+      assertEquals(names.includes("sub-agent-doc"), true);
+      assertEquals(names.includes("sub-agent-judge"), true);
+    },
+  );
+});
+
+Deno.test("arbitrary agent transition: read-only agent (e.g. plan) is restricted from writable sub-agents, forcing return to main thread", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const allTools = [
+        { name: "save-file", description: "Write file" },
+        { name: "launch-process", description: "Run command" },
+        { name: "view", description: "Read file" },
+        ...subAgentAllDefinitions(),
+        { name: "sub-agent-doc", description: "Write docs" },
+        { name: "sub-agent-judge", description: "Evaluate code" }
+      ];
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...readOnlySubAgentContext(),
+          tool_definitions: allTools,
+          message: "plan the architecture",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      // Read-only agent should NOT have write tools
+      assertEquals(names.includes("save-file"), false);
+      assertEquals(names.includes("launch-process"), false);
+      // But SHOULD have view
+      assertEquals(names.includes("view"), true);
+      // Read-only agents should have read-only sub-agents
+      assertEquals(names.includes("sub-agent-explore"), true);
+      assertEquals(names.includes("sub-agent-plan"), true);
+      // And MUST NOT have writable sub-agents, forcing a return to the main thread
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
+      assertEquals(names.includes("sub-agent-doc"), false);
+      assertEquals(names.includes("sub-agent-judge"), false);
     },
   );
 });

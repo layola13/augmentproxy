@@ -151,6 +151,37 @@ cd proxy
 deno task check
 ```
 
+## Chat Stream Replay
+
+仓库内置了一个日志回放脚本，用于本地重放 `POST /chat-stream` 请求，并验证 proxy 的 tool-call 过滤与恢复逻辑。
+
+脚本位置：
+
+```text
+proxy/scripts/replay-chat-stream.ts
+```
+
+该脚本最初来自 `/tmp/replay-current.ts`，已适配当前 `ProxyConfig` 结构和当前代码路径。
+
+运行方式：
+
+```bash
+cd proxy
+deno run --allow-env --allow-read scripts/replay-chat-stream.ts <log-json-path> [launch-command]
+```
+
+示例（可回放的完整 body 日志）：
+
+```bash
+cd proxy
+deno run --allow-env --allow-read scripts/replay-chat-stream.ts /tmp/augmentproxy-logs/2026-05-06/2026-05-06T02-58-53-055Z-POST-chat-stream.json
+```
+
+注意事项：
+
+- 如果日志文件里的 `body` 是 `"[BODY_TOO_LARGE: ...]"`，说明原始请求体已被截断，脚本会直接报错并提示该日志不可回放。
+- 回放脚本会 mock 上游 SSE 输出（默认优先用 `launch-process`，若该工具在日志定义中不可用会自动改用 `view`），用于稳定复现 proxy 内部处理流程。
+
 ## Helper Scripts
 
 仓库根目录新增了两个脚本，用来减少手动导出环境变量的步骤。
