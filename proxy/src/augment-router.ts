@@ -1,8 +1,8 @@
 import type { JsonObject, ProxyConfig, RequestContext } from "./types.ts";
-import { jsonResponse, textResponse } from "./http.ts";
+import { jsonResponse, ndjsonResponse, textResponse } from "./http.ts";
 import {
-  ensureFakeAgent,
   agentUsageStatsMarkdown,
+  ensureFakeAgent,
   fakeBatchUpload,
   fakeBillingSummary,
   fakeCheckpointBlobs,
@@ -11,7 +11,9 @@ import {
   fakeCreditInfo,
   fakeFindMissing,
   fakeGeneric,
+  fakeGetLatestBlobset,
   fakeModels,
+  fakeRegisterBlobset,
   fakeRemoteAgent,
   fakeSecrets,
   fakeSettings,
@@ -355,6 +357,16 @@ export async function routeAugment(
   if (path === "checkpoint-blobs") {
     await recordRequest(config, ctx, "mock-checkpoint-blobs-recorded");
     return jsonResponse(await indexCheckpoint(config, ctx));
+  }
+
+  if (path === "indexed-commits/get-latest-blobset") {
+    await recordRequest(config, ctx, "mock-indexed-commits-latest-recorded");
+    return ndjsonResponse(fakeGetLatestBlobset(ctx));
+  }
+
+  if (path === "indexed-commits/register-blobset") {
+    await recordRequest(config, ctx, "mock-indexed-commits-register-recorded");
+    return jsonResponse(fakeRegisterBlobset(ctx));
   }
 
   if (path === "context-canvas/list") {

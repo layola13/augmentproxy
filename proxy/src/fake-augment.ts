@@ -23,7 +23,174 @@ interface AgentRecord {
   output_tokens: number;
 }
 
+interface IndexedCommitBlobsetRecord {
+  commit: JsonObject;
+  blobset: JsonObject;
+}
+
 const agents = new Map<string, AgentRecord>();
+const indexedCommitBlobsets = new Map<string, IndexedCommitBlobsetRecord>();
+let indexedCommitBlobsetsLoadedFrom: string | undefined;
+
+function envValue(name: string): string {
+  try {
+    return Deno.env.get(name)?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function trimPathSeparators(path: string): string {
+  return path.replace(/[\\/]+$/, "");
+}
+
+function joinFsPath(...parts: string[]): string {
+  const separator = Deno.build.os === "windows" ? "\\" : "/";
+  const normalized = parts
+    .filter((part) => part.length > 0)
+    .map((part, index) =>
+      index === 0
+        ? trimPathSeparators(part)
+        : part.replace(/^[\\/]+/, "").replace(/[\\/]+$/, "")
+    );
+  return normalized.join(separator);
+}
+
+function parentDir(path: string): string | undefined {
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return index > 0 ? path.slice(0, index) : undefined;
+}
+
+function indexedCommitBlobsetCachePath(): string | undefined {
+  const explicit = envValue("AUGMENT_INDEXED_COMMITS_CACHE");
+  if (explicit) return explicit;
+
+  const xdgCacheHome = envValue("XDG_CACHE_HOME");
+  if (xdgCacheHome) {
+    return joinFsPath(
+      xdgCacheHome,
+      "augmentproxy",
+      "indexed-commits.json",
+    );
+  }
+
+  const localAppData = envValue("LOCALAPPDATA");
+  if (localAppData) {
+    return joinFsPath(
+      localAppData,
+      "augmentproxy",
+      "indexed-commits.json",
+    );
+  }
+
+  const home = envValue("HOME");
+  if (home) {
+    return joinFsPath(
+      home,
+      ".cache",
+      "augmentproxy",
+      "indexed-commits.json",
+    );
+  }
+
+  const userProfile = envValue("USERPROFILE");
+  if (userProfile) {
+    return joinFsPath(
+      userProfile,
+      "AppData",
+      "Local",
+      "augmentproxy",
+      "indexed-commits.json",
+    );
+  }
+
+  const homeDrive = envValue("HOMEDRIVE");
+  const homePath = envValue("HOMEPATH");
+  if (homeDrive && homePath) {
+    return joinFsPath(
+      `${homeDrive}${homePath}`,
+      "AppData",
+      "Local",
+      "augmentproxy",
+      "indexed-commits.json",
+    );
+  }
+
+  return undefined;
+}
+
+function jsonObjectValue(value: unknown): JsonObject | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonObject
+    : undefined;
+}
+
+function cloneJsonObject(value: JsonObject): JsonObject {
+  return JSON.parse(JSON.stringify(value)) as JsonObject;
+}
+
+function loadIndexedCommitBlobsets(): void {
+  const cachePath = indexedCommitBlobsetCachePath();
+  if (indexedCommitBlobsetsLoadedFrom === cachePath) return;
+
+  indexedCommitBlobsets.clear();
+  indexedCommitBlobsetsLoadedFrom = cachePath;
+  if (!cachePath) return;
+
+  try {
+    const parsed = JSON.parse(Deno.readTextFileSync(cachePath));
+    const root = jsonObjectValue(parsed);
+    const entries = jsonObjectValue(root?.entries);
+    if (!entries) return;
+
+    for (const value of Object.values(entries)) {
+      const record = jsonObjectValue(value);
+      const commit = jsonObjectValue(record?.commit);
+      const blobset = jsonObjectValue(record?.blobset);
+      const commitSha = typeof commit?.commit_sha === "string"
+        ? commit.commit_sha
+        : "";
+      if (commit && commitSha && blobset) {
+        indexedCommitBlobsets.set(commitSha, {
+          commit: cloneJsonObject(commit),
+          blobset: cloneJsonObject(blobset),
+        });
+      }
+    }
+  } catch {
+    // Missing or malformed cache files should not block Augment startup.
+  }
+}
+
+function saveIndexedCommitBlobsets(): void {
+  const cachePath = indexedCommitBlobsetsLoadedFrom ??
+    indexedCommitBlobsetCachePath();
+  if (!cachePath) return;
+
+  const entries: JsonObject = {};
+  for (const [commitSha, record] of indexedCommitBlobsets.entries()) {
+    entries[commitSha] = {
+      commit: record.commit,
+      blobset: record.blobset,
+    };
+  }
+
+  try {
+    const directory = parentDir(cachePath);
+    if (directory) Deno.mkdirSync(directory, { recursive: true });
+    Deno.writeTextFileSync(
+      cachePath,
+      `${JSON.stringify({ version: 1, entries }, null, 2)}\n`,
+    );
+  } catch {
+    // The in-memory cache still avoids repeated indexing while this process runs.
+  }
+}
+
+export function resetIndexedCommitBlobsetsForTest(): void {
+  indexedCommitBlobsets.clear();
+  indexedCommitBlobsetsLoadedFrom = undefined;
+}
 
 export function reportAgentUsage(
   agentId: string,
@@ -792,6 +959,53 @@ export function fakeBatchUpload(ctx: RequestContext): JsonObject {
 
 export function fakeCheckpointBlobs(): JsonObject {
   return { new_checkpoint_id: `checkpoint_${crypto.randomUUID()}` };
+}
+
+export function fakeGetLatestBlobset(ctx: RequestContext): JsonObject[] {
+  loadIndexedCommitBlobsets();
+
+  const body = bodyObject(ctx);
+  const commitShas = Array.isArray(body.commit_shas)
+    ? body.commit_shas.filter((sha): sha is string => typeof sha === "string")
+    : typeof body.commit_sha === "string"
+    ? [body.commit_sha]
+    : [];
+
+  for (const commitSha of commitShas) {
+    const record = indexedCommitBlobsets.get(commitSha);
+    if (record) {
+      const fileInfos = Array.isArray(record.blobset.file_infos)
+        ? record.blobset.file_infos
+        : [];
+      return [{
+        commit_sha: commitSha,
+        file_infos: JSON.parse(JSON.stringify(fileInfos)),
+      }];
+    }
+  }
+
+  return [];
+}
+
+export function fakeRegisterBlobset(ctx: RequestContext): JsonObject {
+  loadIndexedCommitBlobsets();
+
+  const body = bodyObject(ctx);
+  const commit = jsonObjectValue(body.commit);
+  const blobset = jsonObjectValue(body.blobs) ?? jsonObjectValue(body.blobset);
+  const commitSha = typeof commit?.commit_sha === "string"
+    ? commit.commit_sha
+    : "";
+
+  if (commit && commitSha && blobset) {
+    indexedCommitBlobsets.set(commitSha, {
+      commit: cloneJsonObject(commit),
+      blobset: cloneJsonObject(blobset),
+    });
+    saveIndexedCommitBlobsets();
+  }
+
+  return { ok: true };
 }
 
 export function fakeGeneric(path: string): JsonObject {

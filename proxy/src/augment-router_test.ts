@@ -1,5 +1,8 @@
 import { routeAugment } from "./augment-router.ts";
-import { resetFakeAgentsForTest } from "./fake-augment.ts";
+import {
+  resetFakeAgentsForTest,
+  resetIndexedCommitBlobsetsForTest,
+} from "./fake-augment.ts";
 import type { JsonObject, ProxyConfig, RequestContext } from "./types.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -78,6 +81,33 @@ function cliRequestContext(path: string, body: JsonObject): RequestContext {
   };
 }
 
+async function withIndexedCommitCache(
+  cachePath: string,
+  fn: () => Promise<void>,
+): Promise<void> {
+  const original = Deno.env.get("AUGMENT_INDEXED_COMMITS_CACHE");
+  Deno.env.set("AUGMENT_INDEXED_COMMITS_CACHE", cachePath);
+  resetIndexedCommitBlobsetsForTest();
+  try {
+    await fn();
+  } finally {
+    resetIndexedCommitBlobsetsForTest();
+    if (original === undefined) {
+      Deno.env.delete("AUGMENT_INDEXED_COMMITS_CACHE");
+    } else {
+      Deno.env.set("AUGMENT_INDEXED_COMMITS_CACHE", original);
+    }
+  }
+}
+
+async function parseNdjsonResponse(response: Response): Promise<JsonObject[]> {
+  const text = await response.text();
+  return text.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as JsonObject);
+}
+
 Deno.test({
   name: "reset fake agents state",
   fn() {
@@ -85,6 +115,67 @@ Deno.test({
   },
   sanitizeOps: false,
   sanitizeResources: false,
+});
+
+Deno.test("indexed commits return empty latest blobset for unknown commits", async () => {
+  const cachePath = await Deno.makeTempFile({ suffix: ".json" });
+  try {
+    await withIndexedCommitCache(cachePath, async () => {
+      const response = await routeAugment(
+        testConfig(),
+        requestContext("indexed-commits/get-latest-blobset", {
+          commit_shas: ["missing-sha"],
+        }),
+      );
+      assertEquals(
+        response.headers.get("content-type"),
+        "application/x-ndjson; charset=utf-8",
+      );
+      assertEquals(await parseNdjsonResponse(response), []);
+    });
+  } finally {
+    await Deno.remove(cachePath).catch(() => undefined);
+  }
+});
+
+Deno.test("indexed commits persist registered blobsets across cache reload", async () => {
+  const cachePath = await Deno.makeTempFile({ suffix: ".json" });
+  try {
+    await withIndexedCommitCache(cachePath, async () => {
+      const commit = {
+        commit_sha: "sha-a",
+        commit_time: "2026-05-07T09:17:06.000Z",
+      };
+      const blobset = {
+        checkpoint_id: "checkpoint-a",
+        added_blobs: ["blob-a"],
+        deleted_blobs: [],
+      };
+
+      const registerResponse = await routeAugment(
+        testConfig(),
+        requestContext("indexed-commits/register-blobset", {
+          commit,
+          blobs: blobset,
+        }),
+      );
+      assertEquals(await registerResponse.json(), { ok: true });
+
+      resetIndexedCommitBlobsetsForTest();
+      const latestResponse = await routeAugment(
+        testConfig(),
+        requestContext("indexed-commits/get-latest-blobset", {
+          commit_shas: ["missing-sha", "sha-a"],
+        }),
+      );
+      assertEquals(
+        await parseNdjsonResponse(latestResponse),
+        [{ commit_sha: "sha-a", file_infos: [] }],
+      );
+    });
+  } finally {
+    await Deno.remove(cachePath).catch(() => undefined);
+  }
 });
 
 Deno.test("list-remote-tools preserves request order", async () => {

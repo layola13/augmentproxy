@@ -215,6 +215,14 @@ function stripToolCallRejectedTail(value: string): string {
   return value.slice(0, index).trimEnd();
 }
 
+function stripInternalProxyHintLines(value: string): string {
+  if (!value) return value;
+  const filtered = value.split(/\r?\n/).filter((line) =>
+    !/^\s*(?:augmentproxy:|Repeated failed tool call suppressed:)/i.test(line)
+  );
+  return filtered.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function hasToolCallRejectedText(value: string): boolean {
   return /(?:^|\n)\s*Tool call rejected \([^)]+\):/i.test(value);
 }
@@ -596,6 +604,61 @@ function collectReadFilePaths(
   return paths;
 }
 
+function collectSuccessfulDirectoryViewPaths(
+  ctx: RequestContext,
+  fallbackPath?: string,
+): Set<string> {
+  const body = objectBody(ctx);
+  const viewPathById = new Map<string, string>();
+  const paths = new Set<string>();
+
+  const rememberViewCalls = (nodes: JsonValue) => {
+    for (const node of asArray(nodes)) {
+      const call = nodeToolUse(node);
+      if (!call) continue;
+      const parsed = parseToolCall(call, fallbackPath);
+      const path = directoryViewPath(parsed);
+      if (!parsed || !path) continue;
+      viewPathById.set(parsed.id, path);
+    }
+  };
+
+  const rememberSuccessfulResults = (nodes: JsonValue) => {
+    for (const node of asArray(nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const toolResult = (node as JsonObject).tool_result_node;
+      if (
+        !toolResult || typeof toolResult !== "object" ||
+        Array.isArray(toolResult)
+      ) continue;
+      const result = toolResult as JsonObject;
+      if (toolResultMutatedWorkspace(result)) {
+        paths.clear();
+        viewPathById.clear();
+        continue;
+      }
+      const id = typeof result.tool_use_id === "string"
+        ? result.tool_use_id
+        : "";
+      if (!id || !toolResultLooksSuccessful(result)) continue;
+      const path = viewPathById.get(id);
+      if (path) paths.add(path);
+    }
+  };
+
+  for (const item of asArray(body.chat_history)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    rememberViewCalls(record.response_nodes);
+    rememberViewCalls(record.request_nodes);
+    rememberSuccessfulResults(record.request_nodes);
+    rememberSuccessfulResults(record.response_nodes);
+  }
+  rememberViewCalls(body.nodes);
+  rememberSuccessfulResults(body.nodes);
+  return paths;
+}
+
 function toolResultLooksSuccessful(result: JsonObject): boolean {
   if (result.is_error === true || result.error === true) return false;
   const status = text(result.status).toLowerCase();
@@ -658,6 +721,7 @@ function shouldRetryStalledContinuation(ctx: RequestContext): boolean {
   const body = objectBody(ctx);
   const currentText = currentNodeUserText(body.nodes) || text(body.message) ||
     text(body.prompt) || text(body.instruction);
+  if (isAuxiliaryTitleRequestText(currentText)) return false;
   if (hasToolResultNodes(body.nodes) || isContinuationText(currentText)) {
     return true;
   }
@@ -674,14 +738,36 @@ function continuationControlNudge(ctx: RequestContext): string | undefined {
   ].join(" ");
 }
 
-function shouldPreferToolContinuation(
-  config: ProxyConfig,
-  ctx: RequestContext,
-): boolean {
-  if (config.switchApi !== "CODEX" || !hasToolDefinitions(ctx)) return false;
+function toolContinuationControlMessage(prefix?: string): string {
+  const header = prefix
+    ? `${prefix} tool-continuation control:`
+    : "Tool-continuation control:";
+  return [
+    `${header} this is an active agent turn with tools available.`,
+    "If the task is not fully complete, emit the next function call now instead of a final answer.",
+    "Do not include follow-up suggestions unless no concrete tool action remains.",
+  ].join(" ");
+}
+
+function isAuxiliaryTitleRequestText(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  const titleSignals = [
+    "provide a clear and concise title",
+    "title for this message",
+    "title must be less than",
+  ];
+  if (!titleSignals.some((signal) => lower.includes(signal))) return false;
+  return lower.includes("message:");
+}
+
+function shouldPreferToolContinuation(ctx: RequestContext): boolean {
+  if (!hasToolDefinitions(ctx)) return false;
   const body = objectBody(ctx);
   const currentText = currentNodeUserText(body.nodes) || text(body.message) ||
     text(body.prompt) || text(body.instruction);
+  if (isAuxiliaryTitleRequestText(currentText)) return false;
   if (
     hasToolResultNodes(body.nodes) ||
     isContinuationText(currentText) ||
@@ -996,6 +1082,17 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
       "- If an explore or plan sub-agent discovers that implementation or validation is needed, switch immediately to an available writable or validation sub-agent instead of continuing with the wrong role.",
     );
   }
+  if (shouldPreferMainThreadOverReadOnlySubAgents(toolNames)) {
+    lines.push(
+      "- Only read-only sub-agents are available in this session. Do not delegate implementation, file edits, terminal work, validation, or whole-project inspection to sub-agent-explore or sub-agent-plan when the main thread can perform that work directly.",
+    );
+    lines.push(
+      "- Use the main-thread tools yourself for reading, retrieval, file edits, and validation. Use sub-agent-explore or sub-agent-plan only for a short, bounded side investigation or plan that directly unblocks the next main-thread action.",
+    );
+    lines.push(
+      "- Do not repeatedly call sub-agent-explore or sub-agent-plan for the same workspace overview. After one bounded read-only result, continue in the main thread.",
+    );
+  }
   if (workspacePath) {
     lines.push(
       `- Current workspace/path from the client: ${workspacePath}. Use it as the starting directory when you need to inspect this project.`,
@@ -1025,6 +1122,36 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     lines.push(...toolSummaries.slice(0, 30));
   }
   return lines.join("\n");
+}
+
+function hasReadOnlySubAgentRolesOnly(toolNames: Set<string>): boolean {
+  return (
+    (toolNames.has("sub-agent-explore") || toolNames.has("sub-agent-plan")) &&
+    !toolNames.has("sub-agent-code") &&
+    !toolNames.has("sub-agent-validate")
+  );
+}
+
+function hasDirectMainThreadTools(toolNames: Set<string>): boolean {
+  return [
+    "view",
+    "codebase-retrieval",
+    "save-file",
+    "str-replace-editor",
+    "apply_patch",
+    "launch-process",
+    "read-process",
+    "write-process",
+    "kill-process",
+    "list-processes",
+  ].some((toolName) => toolNames.has(toolName));
+}
+
+function shouldPreferMainThreadOverReadOnlySubAgents(
+  toolNames: Set<string>,
+): boolean {
+  return hasReadOnlySubAgentRolesOnly(toolNames) &&
+    hasDirectMainThreadTools(toolNames);
 }
 
 function toolPromptSummary(tool: JsonObject): string {
@@ -1422,17 +1549,6 @@ function workspaceFallbackPath(ctx: RequestContext): string | undefined {
 }
 
 function explicitWorkspacePathFromTask(body: JsonObject): string | undefined {
-  const guidelineText = [
-    text(body.user_guidelines),
-    text(body.workspace_guidelines),
-    text(body.system_prompt),
-    text(body.system_prompt_append),
-  ].join("\n").toLowerCase();
-  const isExecutionAgent = guidelineText.includes("sub-agent") ||
-    guidelineText.includes("code implementation") ||
-    guidelineText.includes("documentation");
-  if (!isExecutionAgent) return undefined;
-
   const candidates: { path: string; score: number; index: number }[] = [];
   let index = 0;
   for (const taskText of currentTaskTexts(body)) {
@@ -1453,13 +1569,25 @@ function explicitWorkspacePathFromTask(body: JsonObject): string | undefined {
 
 function currentTaskTexts(body: JsonObject): string[] {
   const output: string[] = [];
-  for (const key of ["message", "prompt", "instruction"]) {
+  for (
+    const key of [
+      "message",
+      "prompt",
+      "instruction",
+      "current_user_text",
+      "message_summary",
+      "prompt_summary",
+      "instruction_summary",
+    ]
+  ) {
     const value = body[key];
     if (typeof value === "string" && value.trim()) output.push(value);
   }
   const nodeTextValue = currentNodeUserText(body.nodes);
   if (nodeTextValue) output.push(nodeTextValue);
-  for (const item of asArray(body.chat_history).slice(-2)) {
+  const recentHistory = asArray(body.chat_history).slice(-8);
+  for (let index = recentHistory.length - 1; index >= 0; index -= 1) {
+    const item = recentHistory[index];
     if (!item || typeof item !== "object" || Array.isArray(item)) continue;
     const record = item as JsonObject;
     const requestMessage = text(record.request_message).trim();
@@ -1476,7 +1604,8 @@ function taskPathCandidates(
   value: string,
 ): { path: string; score: number }[] {
   const output: { path: string; score: number }[] = [];
-  const pattern = /(?:~\/|\/home\/)[^\s"'`<>，。！？；;(){}[\]]+/g;
+  const pattern =
+    /(?:~\/[^\s"'`<>，。！？；;(){}[\]]+|\/[^\s"'`<>，。！？；;(){}[\]]+|[A-Za-z]:[\\/][^\s"'`<>，。！？；;(){}[\]]+)/g;
   for (const match of value.matchAll(pattern)) {
     const raw = match[0];
     const path = cleanExtractedPath(raw);
@@ -1536,12 +1665,36 @@ function projectRootFromPath(path: string): string | undefined {
     }
   }
   const markerRoot = workspaceFolderFromPath(normalized);
-  if (markerRoot) return markerRoot;
+  if (markerRoot) {
+    const normalizedHome = canonicalizePath(home ?? "");
+    if (!normalizedHome || canonicalizePath(markerRoot) !== normalizedHome) {
+      return markerRoot;
+    }
+  }
   return undefined;
 }
 
-function currentIdeWorkspacePath(body: JsonObject): string | undefined {
-  const candidates: string[] = [];
+function addWorkspacePathCandidate(
+  output: string[],
+  candidate: string | undefined,
+  requireExisting = false,
+): void {
+  if (typeof candidate !== "string" || !candidate.trim()) return;
+  const cleaned = canonicalizePath(cleanExtractedPath(candidate));
+  if (
+    !cleaned || !isAbsolutePath(cleaned) || !isPathWithinAllowedHome(cleaned)
+  ) {
+    return;
+  }
+  if (requireExisting && !pathExists(cleaned)) return;
+  if (!output.includes(cleaned)) output.push(cleaned);
+}
+
+function collectIdeWorkspaceFolders(
+  body: JsonObject,
+  requireExisting = false,
+): string[] {
+  const output: string[] = [];
   const collectFromNode = (node: JsonValue): void => {
     if (!node || typeof node !== "object" || Array.isArray(node)) return;
     const ideState = (node as JsonObject).ide_state_node;
@@ -1555,14 +1708,19 @@ function currentIdeWorkspacePath(body: JsonObject): string | undefined {
       }
       const record = folder as JsonObject;
       const root = record.repository_root ?? record.folder_root;
-      if (typeof root === "string" && root.startsWith("/")) {
-        candidates.push(root);
-      }
+      addWorkspacePathCandidate(
+        output,
+        typeof root === "string" ? root : undefined,
+      );
     }
     const terminal = state.current_terminal;
     if (terminal && typeof terminal === "object" && !Array.isArray(terminal)) {
       const cwd = (terminal as JsonObject).current_working_directory;
-      if (typeof cwd === "string" && cwd.startsWith("/")) candidates.push(cwd);
+      addWorkspacePathCandidate(
+        output,
+        typeof cwd === "string" ? cwd : undefined,
+        requireExisting,
+      );
     }
   };
 
@@ -1572,14 +1730,162 @@ function currentIdeWorkspacePath(body: JsonObject): string | undefined {
     const record = item as JsonObject;
     for (const node of asArray(record.request_nodes)) collectFromNode(node);
   }
+  return output.filter((candidate) =>
+    !requireExisting || pathExists(candidate)
+  );
+}
 
-  for (const candidate of candidates) {
-    const cleaned = cleanExtractedPath(candidate);
-    if (cleaned && isPathWithinAllowedHome(cleaned) && pathExists(cleaned)) {
-      return cleaned;
-    }
+function currentIdeWorkspacePath(body: JsonObject): string | undefined {
+  return collectIdeWorkspaceFolders(body, true)[0];
+}
+
+function collectAvailableWorkspaceFoldersFromText(
+  value: string,
+  output: string[],
+): void {
+  const marker = value.toLowerCase().indexOf("available folders");
+  if (marker < 0) return;
+  const tail = value.slice(marker);
+  const pattern =
+    /-\s*(~\/[^\s"'`<>，。！？；;(){}[\]]+|\/[^\s"'`<>，。！？；;(){}[\]]+|[A-Za-z]:[\\/][^\s"'`<>，。！？；;(){}[\]]+)/g;
+  for (const match of tail.matchAll(pattern)) {
+    addWorkspacePathCandidate(output, match[1]);
   }
+}
+
+function availableWorkspaceFoldersFromContext(ctx: RequestContext): string[] {
+  const body = objectBody(ctx);
+  const output = collectIdeWorkspaceFolders(body);
+  const collectFromNodes = (nodes: JsonValue): void => {
+    for (const node of asArray(nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const toolResult = (node as JsonObject).tool_result_node;
+      if (
+        !toolResult || typeof toolResult !== "object" ||
+        Array.isArray(toolResult)
+      ) continue;
+      const content = text((toolResult as JsonObject).content);
+      if (content) collectAvailableWorkspaceFoldersFromText(content, output);
+    }
+  };
+
+  for (const item of asArray(body.chat_history).slice(-8)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    collectFromNodes(record.request_nodes);
+    collectFromNodes(record.response_nodes);
+  }
+  collectFromNodes(body.nodes);
+  return output;
+}
+
+function collectAvailableWorkspaceFoldersFromWorkspaceError(
+  value: string,
+  output: string[],
+): void {
+  if (
+    !/workspace_folder/i.test(value) ||
+    !/does not match an open workspace folder/i.test(value)
+  ) {
+    return;
+  }
+  collectAvailableWorkspaceFoldersFromText(value, output);
+}
+
+function availableWorkspaceFoldersFromWorkspaceErrors(
+  ctx: RequestContext,
+): string[] {
+  const body = objectBody(ctx);
+  const output: string[] = [];
+  const collectFromNodes = (nodes: JsonValue): void => {
+    for (const node of asArray(nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const toolResult = (node as JsonObject).tool_result_node;
+      if (
+        !toolResult || typeof toolResult !== "object" ||
+        Array.isArray(toolResult)
+      ) continue;
+      const content = text((toolResult as JsonObject).content);
+      if (content) {
+        collectAvailableWorkspaceFoldersFromWorkspaceError(content, output);
+      }
+    }
+  };
+
+  for (const item of asArray(body.chat_history).slice(-8)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    collectFromNodes(record.request_nodes);
+    collectFromNodes(record.response_nodes);
+  }
+  collectFromNodes(body.nodes);
+  return output;
+}
+
+function retrievalWorkspaceFolderHintFromPath(
+  path?: string,
+): string | undefined {
+  if (!path) return undefined;
+  const normalized = canonicalizePath(cleanExtractedPath(path));
+  if (!normalized || !isPathWithinAllowedHome(normalized)) return undefined;
+  const projectRoot = projectRootFromPath(normalized);
+  if (projectRoot && isPathWithinAllowedHome(projectRoot)) return projectRoot;
+  if (directoryExists(normalized)) return normalized;
+  if (hasFileExtension(normalized) || isFilePath(normalized)) {
+    const dir = pathDirname(normalized);
+    if (dir && isPathWithinAllowedHome(dir)) return dir;
+  }
+  return normalized;
+}
+
+function bestWorkspaceFolderForTarget(
+  available: string[],
+  targetPath?: string,
+): string | undefined {
+  const normalizedTarget = targetPath
+    ? canonicalizePath(cleanExtractedPath(targetPath))
+    : "";
+  if (available.length === 0) return undefined;
+  if (normalizedTarget) {
+    const ranked = available.map((candidate, index) => {
+      let score = 0;
+      if (candidate === normalizedTarget) score += 500;
+      if (pathEqualsOrInside(normalizedTarget, candidate)) {
+        score += 400 + candidate.length;
+      }
+      if (pathEqualsOrInside(candidate, normalizedTarget)) {
+        score += 300 + candidate.length;
+      }
+      if (
+        pathBasename(candidate).toLowerCase() ===
+          pathBasename(normalizedTarget).toLowerCase()
+      ) {
+        score += 40;
+      }
+      return { candidate, score, index };
+    }).sort((a, b) =>
+      b.score - a.score || b.candidate.length - a.candidate.length ||
+      a.index - b.index
+    );
+    if ((ranked[0]?.score ?? 0) > 0) return ranked[0].candidate;
+  }
+  if (available.length === 1) return available[0];
   return undefined;
+}
+
+function preferredCodebaseWorkspaceFolder(
+  ctx: RequestContext,
+  targetPath?: string,
+): string | undefined {
+  const available = availableWorkspaceFoldersFromContext(ctx);
+  const direct = bestWorkspaceFolderForTarget(available, targetPath);
+  if (direct) return direct;
+  const normalizedTarget = targetPath
+    ? canonicalizePath(cleanExtractedPath(targetPath))
+    : "";
+
+  return retrievalWorkspaceFolderHintFromPath(normalizedTarget) ??
+    retrievalWorkspaceFolderFromPath(normalizedTarget);
 }
 
 function collectWorkspacePaths(
@@ -1591,11 +1897,10 @@ function collectWorkspacePaths(
     return output;
   }
   if (typeof value === "string") {
-    for (const match of value.matchAll(/\/[^\s"'`<>]+/g)) {
-      const path = cleanExtractedPath(match[0]);
+    for (const { path } of taskPathCandidates(value)) {
       if (
         path.includes("/home/") || path.includes("/workspace") ||
-        path.includes("/projects/")
+        path.includes("/projects/") || /^[A-Za-z]:\//.test(path)
       ) {
         if (!output.includes(path)) output.push(path);
       }
@@ -1622,9 +1927,11 @@ function collectWorkspacePaths(
     ]
   ) {
     const item = record[key];
-    if (typeof item === "string" && item.startsWith("/")) {
+    if (typeof item === "string") {
       const path = cleanExtractedPath(item);
-      if (!output.includes(path)) output.push(path);
+      if (path && isAbsolutePath(path) && !output.includes(path)) {
+        output.push(path);
+      }
     }
   }
   for (const item of Object.values(record)) {
@@ -1760,6 +2067,7 @@ function parseToolCall(
   ({ name, argumentsJson } = repairMisusedToolCall(
     name,
     argumentsJson,
+    fallbackPath,
     allowedTools,
   ));
   const nameBeforeExistingFileRepair = name;
@@ -1920,9 +2228,11 @@ function normalizeToolArguments(
   }
   if ((toolName === "view") && typeof args.path === "string") {
     args.path = repairViewPath(args.path, fallbackPath);
+    normalizeViewTypeForPath(args);
   }
   if ((toolName === "view") && args.path === "." && fallbackPath) {
     args.path = fallbackPath;
+    normalizeViewTypeForPath(args);
   }
   if (toolName === "view") {
     normalizeViewRangeArgument(args);
@@ -1991,12 +2301,8 @@ function normalizeToolArguments(
     args.information_request =
       "Provide an overview of this workspace and identify the key files relevant to the user's request.";
   }
-  if (
-    toolName === "codebase-retrieval" &&
-    typeof args.workspace_folder !== "string"
-  ) {
-    const workspaceFolder = retrievalWorkspaceFolderFromPath(fallbackPath);
-    if (workspaceFolder) args.workspace_folder = workspaceFolder;
+  if (toolName === "codebase-retrieval") {
+    normalizeCodebaseRetrievalWorkspaceFolder(args, fallbackPath);
   }
   if (toolName === "add_tasks" || toolName === "update_tasks") {
     normalizeTaskToolArguments(args, argumentsJson);
@@ -2008,6 +2314,43 @@ function normalizeToolArguments(
     normalizeSubAgentToolArguments(toolName, args);
   }
   return JSON.stringify(args);
+}
+
+function normalizeCodebaseRetrievalWorkspaceFolder(
+  args: JsonObject,
+  fallbackPath?: string,
+): void {
+  const fallbackWorkspace = retrievalWorkspaceFolderFromPath(fallbackPath);
+  const requestedRaw = typeof args.workspace_folder === "string"
+    ? args.workspace_folder
+    : undefined;
+  const requestedWorkspace = requestedRaw
+    ? retrievalWorkspaceFolderHintFromPath(requestedRaw) ??
+      retrievalWorkspaceFolderFromPath(requestedRaw) ??
+      canonicalizePath(cleanExtractedPath(requestedRaw))
+    : undefined;
+
+  if (!requestedWorkspace) {
+    if (fallbackWorkspace) args.workspace_folder = fallbackWorkspace;
+    return;
+  }
+
+  if (!fallbackWorkspace) {
+    args.workspace_folder = requestedWorkspace;
+    return;
+  }
+
+  const normalizedRequested = canonicalizePath(requestedWorkspace);
+  const normalizedFallback = canonicalizePath(fallbackWorkspace);
+  if (
+    !normalizedRequested || !pathExists(normalizedRequested) ||
+    pathEqualsOrInside(normalizedFallback, normalizedRequested)
+  ) {
+    args.workspace_folder = normalizedFallback;
+    return;
+  }
+
+  args.workspace_folder = normalizedRequested;
 }
 
 function normalizeSubAgentToolArguments(
@@ -2676,11 +3019,13 @@ function findFilesContainingAll(
 function repairMisusedToolCall(
   toolName: string,
   argumentsJson: string,
+  fallbackPath?: string,
   allowedTools?: Set<string>,
 ): { name: string; argumentsJson: string } {
   const rewrittenSubAgent = rewriteMisusedSubAgentToolCall(
     toolName,
     argumentsJson,
+    fallbackPath,
     allowedTools,
   );
   if (rewrittenSubAgent) return rewrittenSubAgent;
@@ -2714,6 +3059,7 @@ function repairMisusedToolCall(
 function rewriteMisusedSubAgentToolCall(
   toolName: string,
   argumentsJson: string,
+  fallbackPath?: string,
   allowedTools?: Set<string>,
 ): { name: string; argumentsJson: string } | undefined {
   if (toolName !== "sub-agent-explore" && toolName !== "sub-agent-plan") {
@@ -2791,11 +3137,64 @@ function rewriteMisusedSubAgentToolCall(
   ) {
     return { name: "sub-agent-validate", argumentsJson };
   }
+  if (
+    allowedTools &&
+    hasReadOnlySubAgentRolesOnly(allowedTools) &&
+    shouldRewriteBroadReadOnlySubAgentInstruction(instruction)
+  ) {
+    const workspaceFolder = retrievalWorkspaceFolderFromPath(fallbackPath);
+    if (workspaceFolder && allowedTools.has("codebase-retrieval")) {
+      return {
+        name: "codebase-retrieval",
+        argumentsJson: JSON.stringify({
+          workspace_folder: workspaceFolder,
+          information_request: instruction,
+        }),
+      };
+    }
+  }
   return undefined;
 }
 
 function containsAnySignal(textValue: string, signals: string[]): boolean {
   return signals.some((signal) => textValue.includes(signal));
+}
+
+function shouldRewriteBroadReadOnlySubAgentInstruction(
+  instruction: string,
+): boolean {
+  const lower = instruction.toLowerCase();
+  const scopeSignals = [
+    "project",
+    "workspace",
+    "repository",
+    "repo",
+    "directory",
+    "codebase",
+  ];
+  const broadSignals = [
+    "explore the",
+    "inspect the",
+    "analyze the",
+    "survey the",
+    "start by exploring",
+    "thoroughly",
+    "overall project structure",
+    "file organization",
+    "current state",
+    "need to understand",
+    "understand:",
+    "comprehensive",
+  ];
+  if (
+    containsAnySignal(lower, scopeSignals) &&
+    containsAnySignal(lower, broadSignals)
+  ) {
+    return true;
+  }
+  const numberedSections = (instruction.match(/\b[1-9]\./g) ?? []).length;
+  return instruction.length >= 220 && numberedSections >= 2 &&
+    containsAnySignal(lower, scopeSignals);
 }
 
 function repairArgumentsJson(argumentsJson: string): string {
@@ -3022,9 +3421,13 @@ function pathBasename(path: string): string {
 function pathDirname(path: string): string | undefined {
   const normalized = normalizePathSlashes(path).replace(/\/+$/g, "");
   if (!normalized) return undefined;
+  if (/^[A-Za-z]:$/.test(normalized)) return undefined;
   const idx = normalized.lastIndexOf("/");
   if (idx < 0) return undefined;
   if (idx === 0) return "/";
+  if (idx === 2 && /^[A-Za-z]:/.test(normalized)) {
+    return `${normalized.slice(0, 2)}/`;
+  }
   return normalized.slice(0, idx);
 }
 
@@ -3263,37 +3666,97 @@ function uniqueFilePrefixSibling(path: string): string | undefined {
 
 function canonicalizePath(path: string): string {
   let normalized = normalizePathSlashes(path).replace(/\/+/g, "/");
-  if (normalized.length > 1) normalized = normalized.replace(/\/+$/g, "");
+  if (normalized.length > 1 && !/^[A-Za-z]:\/$/.test(normalized)) {
+    normalized = normalized.replace(/\/+$/g, "");
+  }
   return normalized;
 }
 
-function allowedHomePrefix(): string | undefined {
-  let rawUser = "";
+function envPath(name: string): string | undefined {
   try {
-    rawUser = Deno.env.get("USER") ?? "";
+    const value = Deno.env.get(name)?.trim();
+    if (!value) return undefined;
+    const normalized = canonicalizePath(value);
+    return isAbsolutePath(normalized) ? normalized : undefined;
   } catch {
     return undefined;
   }
-  const user = rawUser.trim().replace(/^\/+|\/+$/g, "");
-  if (!user) return undefined;
-  return `/home/${user}`;
+}
+
+function allowedRootPrefixes(): string[] {
+  const candidates: string[] = [];
+  const add = (value?: string) => {
+    if (!value) return;
+    const normalized = canonicalizePath(value);
+    if (!isAbsolutePath(normalized)) return;
+    if (!candidates.includes(normalized)) candidates.push(normalized);
+  };
+
+  add(envPath("HOME"));
+  add(envPath("USERPROFILE"));
+  try {
+    const drive = Deno.env.get("HOMEDRIVE")?.trim() ?? "";
+    const homePath = Deno.env.get("HOMEPATH")?.trim() ?? "";
+    add(drive && homePath ? `${drive}${homePath}` : undefined);
+  } catch {
+    // Environment access can be unavailable in restricted test runs.
+  }
+
+  try {
+    const user = Deno.env.get("USER")?.trim().replace(/^\/+|\/+$/g, "");
+    add(user ? `/home/${user}` : undefined);
+  } catch {
+    // Keep the roots collected from cross-platform home variables above.
+  }
+
+  return candidates;
+}
+
+function allowedHomePrefix(): string | undefined {
+  return allowedRootPrefixes()[0];
 }
 
 function allowedHomeHint(): string {
-  const prefix = allowedHomePrefix();
-  return prefix ? `${prefix}/...` : "/home/<user>/...";
+  const roots = allowedRootPrefixes();
+  return roots.length > 0 ? `${roots.join(" or ")}/...` : "<user-home>/...";
+}
+
+function pathEqualsOrInside(path: string, root: string): boolean {
+  const normalizedPath = canonicalizePath(path);
+  const normalizedRoot = canonicalizePath(root);
+  const caseInsensitive = /^[A-Za-z]:/.test(normalizedPath) ||
+    /^[A-Za-z]:/.test(normalizedRoot);
+  const target = caseInsensitive
+    ? normalizedPath.toLowerCase()
+    : normalizedPath;
+  const base = caseInsensitive ? normalizedRoot.toLowerCase() : normalizedRoot;
+  return target === base || target.startsWith(`${base}/`);
 }
 
 function isPathWithinAllowedHome(path: string): boolean {
   const normalized = canonicalizePath(path);
   if (!isAbsolutePath(normalized)) return false;
   if (normalized === "/" || normalized === "/home") return false;
-  const userPrefix = allowedHomePrefix();
-  if (userPrefix) {
-    const prefix = canonicalizePath(userPrefix);
-    return normalized === prefix || normalized.startsWith(`${prefix}/`);
+  if (/^[A-Za-z]:\/?$/.test(normalized)) return false;
+  const roots = allowedRootPrefixes();
+  if (roots.length > 0) {
+    return roots.some((root) => pathEqualsOrInside(normalized, root));
   }
-  return /^\/home\/[^/]+(?:\/.*)?$/.test(normalized);
+  return /^\/home\/[^/]+(?:\/.*)?$/.test(normalized) ||
+    /^[A-Za-z]:\/Users\/[^/]+(?:\/.*)?$/i.test(normalized);
+}
+
+function nearestExistingAncestorDirectory(path: string): string | undefined {
+  let candidate = canonicalizePath(path);
+  while (candidate) {
+    if (directoryExists(candidate) && isPathWithinAllowedHome(candidate)) {
+      return candidate;
+    }
+    const parent = pathDirname(candidate);
+    if (!parent || parent === candidate) break;
+    candidate = canonicalizePath(parent);
+  }
+  return undefined;
 }
 
 function repairViewPath(path: string, fallbackPath?: string): string {
@@ -3359,13 +3822,15 @@ function repairViewPath(path: string, fallbackPath?: string): string {
     if (repairedDir) return repairedDir;
   }
   for (const candidate of ordered) {
-    const dir = pathDirname(candidate);
-    const base = pathBasename(candidate);
-    if (!dir || !directoryExists(dir)) continue;
-    if (base.length <= 1) return dir;
-    if (hasFileExtension(base)) return dir;
+    const ancestor = nearestExistingAncestorDirectory(candidate);
+    if (ancestor) return ancestor;
   }
   return cleaned;
+}
+
+function normalizeViewTypeForPath(args: JsonObject): void {
+  if (typeof args.path !== "string" || !pathExists(args.path)) return;
+  args.type = directoryExists(args.path) ? "directory" : "file";
 }
 
 function invalidToolReason(
@@ -3661,6 +4126,21 @@ function saveFilePathKey(call: ParsedToolCall): string | undefined {
   }
 }
 
+function directoryViewPath(call?: ParsedToolCall): string | undefined {
+  if (!call || call.name !== "view") return undefined;
+  try {
+    const args = JSON.parse(call.argumentsJson) as JsonObject;
+    const path = typeof args.path === "string" ? args.path.trim() : "";
+    if (!path) return undefined;
+    if (args.type === "directory" || directoryExists(path)) {
+      return canonicalizePath(path);
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
 function textResponseNode(content: string, id = 1): JsonObject | undefined {
   const trimmed = content.trim();
   if (!trimmed) return undefined;
@@ -3688,15 +4168,23 @@ interface RecentFailedToolCall {
   exhaustedContinuationSatisfied?: boolean;
 }
 
-function recentFailedToolCalls(
+interface ExecutionState {
+  failures: Map<string, RecentFailedToolCall>;
+  successfulToolSignatures: Set<string>;
+  successfulToolContent: Map<string, string>;
+}
+
+function collectExecutionState(
   ctx: RequestContext,
   fallbackPath?: string,
-): Map<string, RecentFailedToolCall> {
+): ExecutionState {
   const failures = new Map<string, RecentFailedToolCall>();
-  const body = objectBody(ctx);
-  const toolById = new Map<string, ParsedToolCall>();
   const successfulToolSignatures = new Set<string>();
   const successfulToolContent = new Map<string, string>();
+
+  const body = objectBody(ctx);
+  const toolById = new Map<string, ParsedToolCall>();
+
   const rememberToolCalls = (nodes: JsonValue): void => {
     for (const node of asArray(nodes)) {
       const call = nodeToolUse(node);
@@ -3792,7 +4280,7 @@ function recentFailedToolCalls(
       fallbackPath,
     );
   }
-  return failures;
+  return { failures, successfulToolSignatures, successfulToolContent };
 }
 
 function refreshRecentFailureProgress(
@@ -3939,6 +4427,26 @@ function successfulRecoverySignature(
       path,
       type: directoryExists(path) ? "directory" : "file",
     });
+  }
+  if (parsed.name === "codebase-retrieval") {
+    const workspaceFolder = typeof args.workspace_folder === "string"
+      ? canonicalizePath(args.workspace_folder)
+      : "";
+    if (!workspaceFolder) return undefined;
+    return recoverySignature("codebase-retrieval", {
+      ...args,
+      workspace_folder: workspaceFolder,
+    });
+  }
+  if (parsed.name === "grep_search") {
+    return recoverySignature("grep_search", args);
+  }
+  if (parsed.name === "read_file") {
+    const path = typeof args.path === "string"
+      ? canonicalizePath(args.path)
+      : "";
+    if (!path) return undefined;
+    return recoverySignature("read_file", { ...args, path });
   }
   if (parsed.name === "list-processes") {
     return recoverySignature("list-processes", {});
@@ -4165,6 +4673,211 @@ function filterRepeatedFailedToolCalls(
     recoveryNodes.push(recovery);
   }
   return { valid, repeated, recoveryNodes };
+}
+
+function filterRepeatedDirectoryViewToolCalls(
+  toolCalls: JsonObject[],
+  ctx: RequestContext,
+  successfulToolSignatures: Set<string>,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+  allowedTools?: Set<string>,
+): {
+  valid: JsonObject[];
+  repeated: JsonObject[];
+} {
+  const valid: JsonObject[] = [];
+  const repeated: JsonObject[] = [];
+  const successfulDirectoryViews = collectSuccessfulDirectoryViewPaths(
+    ctx,
+    fallbackPath,
+  );
+  const emittedDirectoryViews = new Set<string>();
+  for (const call of toolCalls) {
+    const parsed = parseToolCall(
+      call,
+      fallbackPath,
+      launchCommandFallback,
+      allowedTools,
+    );
+    const directoryPath = directoryViewPath(parsed);
+    if (!directoryPath) {
+      valid.push(call);
+      continue;
+    }
+    if (
+      successfulDirectoryViews.has(directoryPath) ||
+      emittedDirectoryViews.has(directoryPath)
+    ) {
+      repeated.push(call);
+      continue;
+    }
+    emittedDirectoryViews.add(directoryPath);
+    valid.push(call);
+  }
+  return { valid, repeated };
+}
+
+function appendRepeatedDirectoryViewHint(
+  content: string,
+  repeatedToolCalls: JsonObject[],
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+  allowedTools?: Set<string>,
+): string {
+  if (repeatedToolCalls.length === 0) return content;
+  const rendered = repeatedToolCalls
+    .map((call) => {
+      const parsed = parseToolCall(
+        call,
+        fallbackPath,
+        launchCommandFallback,
+        allowedTools,
+      );
+      const path = directoryViewPath(parsed);
+      return path
+        ? `augmentproxy: repeated directory view suppressed: ${path}. The directory listing is already available in recent tool results; use a specific file path or codebase-retrieval next.`
+        : "";
+    })
+    .filter(Boolean);
+  const unique = [...new Set(rendered)].join("\n");
+  if (!unique || content.includes(unique)) return content;
+  return content.trim() ? `${content.trimEnd()}\n\n${unique}` : unique;
+}
+
+function recoveryToolNodesForRepeatedDirectoryViews(
+  repeatedToolCalls: JsonObject[],
+  ctx: RequestContext,
+  successfulToolSignatures: Set<string>,
+  startingId = 1,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+  allowedTools?: Set<string>,
+): JsonObject[] {
+  if (repeatedToolCalls.length === 0) return [];
+
+  const nodes: JsonObject[] = [];
+  const seenRecoveries = new Set<string>();
+  const successfulDirectoryViews = collectSuccessfulDirectoryViewPaths(
+    ctx,
+    fallbackPath,
+  );
+  let id = startingId;
+
+  for (const call of repeatedToolCalls) {
+    const parsed = parseToolCall(
+      call,
+      fallbackPath,
+      launchCommandFallback,
+      allowedTools,
+    );
+    if (!parsed) continue;
+    const repeatedPath = directoryViewPath(parsed);
+    const recovery = recoveryToolForRepeatedDirectoryView(
+      repeatedPath,
+      ctx,
+      fallbackPath,
+      successfulDirectoryViews,
+      successfulToolSignatures,
+      allowedTools,
+    );
+    if (!recovery) continue;
+    const recoveryKey = recoverySignature(recovery.toolName, recovery.input);
+    if (
+      seenRecoveries.has(recoveryKey) ||
+      successfulToolSignatures.has(recoveryKey)
+    ) continue;
+    seenRecoveries.add(recoveryKey);
+    nodes.push({
+      id,
+      type: 5,
+      tool_use: {
+        tool_name: recovery.toolName,
+        tool_use_id: `${parsed.id}_repeated_directory_${
+          recovery.toolName.replace(/[^a-z0-9]+/gi, "_")
+        }`,
+        input_json: JSON.stringify(recovery.input),
+      },
+    });
+    id += 1;
+  }
+
+  return nodes;
+}
+
+function recoveryToolForRepeatedDirectoryView(
+  repeatedPath: string | undefined,
+  ctx: RequestContext,
+  fallbackPath: string | undefined,
+  successfulDirectoryViews: Set<string>,
+  successfulToolSignatures: Set<string>,
+  allowedTools?: Set<string>,
+): { toolName: string; input: JsonObject } | undefined {
+  const explicitTarget = explicitWorkspacePathFromTask(objectBody(ctx));
+  const normalizedRepeatedPath = repeatedPath
+    ? canonicalizePath(repeatedPath)
+    : "";
+  const normalizedExplicitTarget = explicitTarget
+    ? canonicalizePath(explicitTarget)
+    : "";
+  const workspaceErrorFolders = availableWorkspaceFoldersFromWorkspaceErrors(
+    ctx,
+  );
+  const shouldPreferCodebaseRecovery = workspaceErrorFolders.length > 0;
+  if (
+    !shouldPreferCodebaseRecovery &&
+    (!allowedTools || allowedTools.has("view"))
+  ) {
+    const targetPath = explicitTarget ? canonicalizePath(explicitTarget) : "";
+    if (
+      targetPath &&
+      pathExists(targetPath) &&
+      (!repeatedPath || targetPath !== repeatedPath) &&
+      !successfulDirectoryViews.has(targetPath)
+    ) {
+      return {
+        toolName: "view",
+        input: {
+          path: targetPath,
+          type: directoryExists(targetPath) ? "directory" : "file",
+        },
+      };
+    }
+  }
+
+  if (allowedTools && !allowedTools.has("codebase-retrieval")) {
+    return undefined;
+  }
+  const workspaceFolder = bestWorkspaceFolderForTarget(
+    workspaceErrorFolders,
+    explicitTarget ?? fallbackPath,
+  ) ?? preferredCodebaseWorkspaceFolder(
+    ctx,
+    explicitTarget ?? fallbackPath,
+  );
+  if (!workspaceFolder) return undefined;
+  const normalizedWorkspaceFolder = canonicalizePath(workspaceFolder);
+  if (
+    normalizedRepeatedPath &&
+    normalizedWorkspaceFolder === normalizedRepeatedPath &&
+    (!normalizedExplicitTarget ||
+      normalizedExplicitTarget === normalizedRepeatedPath) &&
+    !shouldPreferCodebaseRecovery
+  ) {
+    return undefined;
+  }
+  const taskText = currentTaskTexts(objectBody(ctx)).join("\n").trim();
+  const focus = taskText
+    ? truncateMiddle(taskText, 500)
+    : "the current coding task";
+  return {
+    toolName: "codebase-retrieval",
+    input: {
+      workspace_folder: workspaceFolder,
+      information_request:
+        `Continue the user's task by identifying the concrete files and next implementation steps for: ${focus}`,
+    },
+  };
 }
 
 function appendRepeatedToolCallHint(
@@ -4754,6 +5467,103 @@ function recoveryToolNodesForStaleRejectedText(
   );
 }
 
+function currentTaskText(ctx: RequestContext): string {
+  const body = objectBody(ctx);
+  return (
+    currentNodeUserText(body.nodes) || text(body.message) ||
+    text(body.prompt) || text(body.instruction)
+  ).trim();
+}
+
+function continuationRecoveryInformationRequest(ctx: RequestContext): string {
+  const taskText = currentTaskText(ctx);
+  if (taskText && !isContinuationText(taskText)) {
+    return `${taskText}\n\nInspect the relevant files in this workspace and continue with the next concrete step.`;
+  }
+  return "Inspect the relevant files in this workspace and continue the latest task with the next concrete step.";
+}
+
+function recoveryToolNodesForToolContinuationStall(
+  ctx: RequestContext,
+  startingId = 1,
+  fallbackPath?: string,
+  allowedTools?: Set<string>,
+): JsonObject[] {
+  const body = objectBody(ctx);
+  const canUseView = !allowedTools || allowedTools.has("view");
+  const canUseRetrieval = !allowedTools ||
+    allowedTools.has("codebase-retrieval");
+  const rawWorkspacePath = typeof body.path === "string" && body.path.trim()
+    ? body.path.trim()
+    : undefined;
+  const workspacePath = rawWorkspacePath
+    ? repairViewPath(rawWorkspacePath, fallbackPath)
+    : undefined;
+
+  if (
+    canUseView &&
+    workspacePath &&
+    isPathWithinAllowedHome(workspacePath) &&
+    pathExists(workspacePath) &&
+    (!directoryExists(workspacePath) ||
+      !hasDirectoryListingResult(ctx, workspacePath))
+  ) {
+    return [{
+      id: startingId,
+      type: 5,
+      tool_use: {
+        tool_name: "view",
+        tool_use_id: "tool_continuation_stall_recovery_view",
+        input_json: JSON.stringify({
+          path: workspacePath,
+          type: directoryExists(workspacePath) ? "directory" : "file",
+        }),
+      },
+    }];
+  }
+
+  const retrievalWorkspace = retrievalWorkspaceFolderFromPath(
+    workspacePath ?? fallbackPath,
+  );
+  if (canUseRetrieval && retrievalWorkspace) {
+    return [{
+      id: startingId,
+      type: 5,
+      tool_use: {
+        tool_name: "codebase-retrieval",
+        tool_use_id: "tool_continuation_stall_recovery_codebase",
+        input_json: JSON.stringify({
+          workspace_folder: retrievalWorkspace,
+          information_request: continuationRecoveryInformationRequest(ctx),
+        }),
+      },
+    }];
+  }
+
+  if (canUseView) {
+    const fallbackTarget = fallbackViewTarget(fallbackPath);
+    if (fallbackTarget) {
+      return [{
+        id: startingId,
+        type: 5,
+        tool_use: {
+          tool_name: "view",
+          tool_use_id: "tool_continuation_stall_recovery_fallback_view",
+          input_json: JSON.stringify(fallbackTarget),
+        },
+      }];
+    }
+  }
+
+  return [];
+}
+
+function requiresToolContinuation(
+  request: OpenAIUpstreamRequest,
+): boolean {
+  return request.tool_choice === "required";
+}
+
 function recoveryViewTargetForInvalidToolCall(
   call: JsonObject,
   fallbackPath?: string,
@@ -4991,6 +5801,14 @@ function buildChatRequest(
   if (continuationNudge) {
     messages.push({ role: "user", content: continuationNudge });
   }
+  const tools = buildOpenAITools(ctx);
+  const preferToolContinuation = shouldPreferToolContinuation(ctx);
+  if (preferToolContinuation && tools.length > 0) {
+    messages.push({
+      role: "user",
+      content: toolContinuationControlMessage(),
+    });
+  }
   const request: OpenAIChatRequest = {
     model: activeUpstreamModel(
       config,
@@ -5005,10 +5823,11 @@ function buildChatRequest(
   }
   if (typeof body.max_tokens === "number") request.max_tokens = body.max_tokens;
   if (stream) request.stream_options = { include_usage: true };
-  const tools = buildOpenAITools(ctx);
   if (tools.length > 0) {
     request.tools = tools;
-    request.tool_choice = forceToolChoiceRequired ? "required" : "auto";
+    request.tool_choice = forceToolChoiceRequired || preferToolContinuation
+      ? "required"
+      : "auto";
   }
   return request;
 }
@@ -5025,15 +5844,11 @@ function buildResponsesRequest(
     messages.push({ role: "user", content: continuationNudge });
   }
   const tools = buildResponsesTools(ctx);
-  const preferToolContinuation = shouldPreferToolContinuation(config, ctx);
+  const preferToolContinuation = shouldPreferToolContinuation(ctx);
   if (preferToolContinuation) {
     messages.push({
       role: "user",
-      content: [
-        "CODEX tool-continuation control: this is an active agent turn with tools available.",
-        "If the task is not fully complete, emit the next function call now instead of a final answer.",
-        "Do not include follow-up suggestions unless no concrete tool action remains.",
-      ].join(" "),
+      content: toolContinuationControlMessage("CODEX"),
     });
   }
   const instructions = messages[0]?.role === "system"
@@ -5738,7 +6553,8 @@ export async function forwardAugmentJson(
     toolChoice: request.tool_choice,
     bytes: JSON.stringify(request).length,
   });
-  const requestBody = JSON.stringify(request);
+  let requestBody = JSON.stringify(request);
+  let usedToolChoiceFallback = false;
   let upstream: Response | undefined;
   let raw = "";
   let attempts = 0;
@@ -5777,6 +6593,26 @@ export async function forwardAugmentJson(
       attempt: attempts,
     });
     if (upstream.ok && raw.trim()) break;
+
+    if (
+      requiresToolContinuation(request) &&
+      !usedToolChoiceFallback &&
+      shouldFallbackToolChoiceAuto(upstream.status, raw)
+    ) {
+      requestBody = JSON.stringify({
+        ...request,
+        tool_choice: "auto",
+      });
+      usedToolChoiceFallback = true;
+      logWarn(config, "openai:json:tool-choice-required-fallback", {
+        requestId: ctx.requestId,
+        attempt: attempts,
+        status: upstream.status,
+        body: raw.slice(0, 240),
+      });
+      await delay(200);
+      continue;
+    }
 
     const retry = shouldRetryUpstreamFailure(
       config,
@@ -5854,7 +6690,9 @@ export async function forwardAugmentJson(
   let nodes: JsonObject[] = [];
   let reasoningFallback = "";
   let invalidToolCallsForHint: JsonObject[] = [];
-  const recentFailures = recentFailedToolCalls(ctx, fallbackPath);
+  const executionState = collectExecutionState(ctx, fallbackPath);
+  const recentFailures = executionState.failures;
+  const successfulToolSignatures = executionState.successfulToolSignatures;
   const usage = isResponsesRequest(request)
     ? parseResponsesJson(data).usage
     : data.usage;
@@ -5875,7 +6713,27 @@ export async function forwardAugmentJson(
       undefined,
       strictAllowedTools,
     );
-    const candidateToolCalls = repeatedFilter.valid;
+    const directoryFilter = filterRepeatedDirectoryViewToolCalls(
+      repeatedFilter.valid,
+      ctx,
+      successfulToolSignatures,
+      fallbackPath,
+      undefined,
+      strictAllowedTools,
+    );
+    const candidateToolCalls = directoryFilter.valid;
+    const directoryRecoveryNodes = candidateToolCalls.length === 0 &&
+        repeatedFilter.recoveryNodes.length === 0
+      ? recoveryToolNodesForRepeatedDirectoryViews(
+        directoryFilter.repeated,
+        ctx,
+        successfulToolSignatures,
+        1,
+        fallbackPath,
+        undefined,
+        strictAllowedTools,
+      )
+      : [];
     if (
       repeatedFilter.repeated.length > 0 &&
       repeatedFilter.recoveryNodes.length === 0
@@ -5884,6 +6742,20 @@ export async function forwardAugmentJson(
         content,
         repeatedFilter.repeated,
         fallbackPath,
+      );
+    }
+    if (
+      directoryFilter.repeated.length > 0 &&
+      candidateToolCalls.length === 0 &&
+      repeatedFilter.recoveryNodes.length === 0 &&
+      directoryRecoveryNodes.length === 0
+    ) {
+      content = appendRepeatedDirectoryViewHint(
+        content,
+        directoryFilter.repeated,
+        fallbackPath,
+        undefined,
+        strictAllowedTools,
       );
     }
     const invalidToolCalls = invalidToolCallSummaries(
@@ -5915,6 +6787,8 @@ export async function forwardAugmentJson(
       ...nodes,
       ...(repeatedFilter.recoveryNodes.length > 0
         ? repeatedFilter.recoveryNodes
+        : directoryRecoveryNodes.length > 0
+        ? directoryRecoveryNodes
         : recoveryToolNodes.length > 0
         ? recoveryToolNodes
         : validToolNodes),
@@ -5941,6 +6815,26 @@ export async function forwardAugmentJson(
           undefined,
           strictAllowedTools,
         );
+        const directoryFilter = filterRepeatedDirectoryViewToolCalls(
+          repeatedFilter.valid,
+          ctx,
+          successfulToolSignatures,
+          fallbackPath,
+          undefined,
+          strictAllowedTools,
+        );
+        const directoryRecoveryNodes = directoryFilter.valid.length === 0 &&
+            repeatedFilter.recoveryNodes.length === 0
+          ? recoveryToolNodesForRepeatedDirectoryViews(
+            directoryFilter.repeated,
+            ctx,
+            successfulToolSignatures,
+            1,
+            fallbackPath,
+            undefined,
+            strictAllowedTools,
+          )
+          : [];
         if (
           repeatedFilter.repeated.length > 0 &&
           repeatedFilter.recoveryNodes.length === 0
@@ -5951,14 +6845,28 @@ export async function forwardAugmentJson(
             fallbackPath,
           );
         }
+        if (
+          directoryFilter.repeated.length > 0 &&
+          directoryFilter.valid.length === 0 &&
+          repeatedFilter.recoveryNodes.length === 0 &&
+          directoryRecoveryNodes.length === 0
+        ) {
+          content = appendRepeatedDirectoryViewHint(
+            content,
+            directoryFilter.repeated,
+            fallbackPath,
+            undefined,
+            strictAllowedTools,
+          );
+        }
         const invalidToolCalls = invalidToolCallSummaries(
-          repeatedFilter.valid,
+          directoryFilter.valid,
           fallbackPath,
           undefined,
           strictAllowedTools,
         );
         const validToolNodes = toolCallsToNodes(
-          repeatedFilter.valid,
+          directoryFilter.valid,
           1,
           fallbackPath,
           undefined,
@@ -5980,6 +6888,8 @@ export async function forwardAugmentJson(
           ...nodes,
           ...(repeatedFilter.recoveryNodes.length > 0
             ? repeatedFilter.recoveryNodes
+            : directoryRecoveryNodes.length > 0
+            ? directoryRecoveryNodes
             : recoveryToolNodes.length > 0
             ? recoveryToolNodes
             : validToolNodes),
@@ -6006,6 +6916,9 @@ export async function forwardAugmentJson(
   content = invalidToolCallsForHint.length > 0
     ? appendInvalidToolCallHint(split.visible, invalidToolCallsForHint)
     : stripToolCallRejectedTail(split.visible);
+  if (requiresToolContinuation(request)) {
+    content = stripInternalProxyHintLines(content);
+  }
   if (
     staleRejectedText && nodes.every((node) => !(node as JsonObject).tool_use)
   ) {
@@ -6013,6 +6926,28 @@ export async function forwardAugmentJson(
       ...nodes,
       ...recoveryToolNodesForStaleRejectedText(1, fallbackPath),
     ];
+  }
+  if (
+    requiresToolContinuation(request) &&
+    nodes.every((node) => !(node as JsonObject).tool_use)
+  ) {
+    const recoveryNodes = recoveryToolNodesForToolContinuationStall(
+      ctx,
+      1,
+      fallbackPath,
+      strictAllowedTools,
+    );
+    if (recoveryNodes.length > 0) {
+      logWarn(config, "openai:json:tool-continuation-stall-recovery", {
+        requestId,
+        contentPreview: content.slice(0, 200),
+        reasoningPreview: reasoningFallback.slice(0, 200),
+        recovery: recoveryNodes.map((node) =>
+          (node.tool_use as JsonObject | undefined)?.tool_name ?? "unknown"
+        ),
+      });
+      nodes = [...nodes, ...recoveryNodes];
+    }
   }
   if (
     !content && reasoningFallback &&
@@ -6409,6 +7344,9 @@ export async function forwardAugmentStream(
   );
   const requestId = ctx.requestId;
   const fallbackPath = workspaceFallbackPath(ctx);
+  const executionState = collectExecutionState(ctx, fallbackPath);
+  const recentFailures = executionState.failures;
+  const successfulToolSignatures = executionState.successfulToolSignatures;
   const readFilePaths = collectReadFilePaths(ctx, fallbackPath);
   const strictAllowedTools = hasToolDefinitions(ctx)
     ? availableToolNames(ctx)
@@ -6890,17 +7828,39 @@ export async function forwardAugmentStream(
           const mergedToolCalls = mergeStreamToolCalls(streamToolCalls);
           const repeatedFilter = filterRepeatedFailedToolCalls(
             mergedToolCalls,
-            recentFailedToolCalls(ctx, fallbackPath),
+            recentFailures,
             fallbackPath,
             launchCommandFallback,
             strictAllowedTools,
           );
+          const directoryFilter = filterRepeatedDirectoryViewToolCalls(
+            repeatedFilter.valid,
+            ctx,
+            successfulToolSignatures,
+            fallbackPath,
+            launchCommandFallback,
+            strictAllowedTools,
+          );
+          const directoryRecoveryNodes = directoryFilter.valid.length === 0 &&
+              repeatedFilter.recoveryNodes.length === 0
+            ? recoveryToolNodesForRepeatedDirectoryViews(
+              directoryFilter.repeated,
+              ctx,
+              successfulToolSignatures,
+              1,
+              fallbackPath,
+              launchCommandFallback,
+              strictAllowedTools,
+            )
+            : [];
+
           if (streamToolCalls.length > 0) {
             logInfo(config, "openai:stream:tool-calls", {
               requestId,
               fragments: streamToolCalls.length,
               merged: mergedToolCalls.length,
               repeatedFailed: repeatedFilter.repeated.length,
+              repeatedDirectoryViews: directoryFilter.repeated.length,
             });
           }
           if (
@@ -6913,8 +7873,22 @@ export async function forwardAugmentStream(
               fallbackPath,
             );
           }
+          if (
+            directoryFilter.repeated.length > 0 &&
+            directoryFilter.valid.length === 0 &&
+            repeatedFilter.recoveryNodes.length === 0 &&
+            directoryRecoveryNodes.length === 0
+          ) {
+            visibleText = appendRepeatedDirectoryViewHint(
+              visibleText,
+              directoryFilter.repeated,
+              fallbackPath,
+              launchCommandFallback,
+              strictAllowedTools,
+            );
+          }
           const invalidToolCalls = invalidToolCallSummaries(
-            repeatedFilter.valid,
+            directoryFilter.valid,
             fallbackPath,
             launchCommandFallback,
             strictAllowedTools,
@@ -6925,7 +7899,7 @@ export async function forwardAugmentStream(
               invalidToolCalls,
             });
           }
-          const nonInvalidToolCalls = repeatedFilter.valid.filter((call) => {
+          const nonInvalidToolCalls = directoryFilter.valid.filter((call) => {
             const parsed = parseToolCall(
               call,
               fallbackPath,
@@ -6972,6 +7946,8 @@ export async function forwardAugmentStream(
           }
           let toolNodes = repeatedFilter.recoveryNodes.length > 0
             ? repeatedFilter.recoveryNodes
+            : directoryRecoveryNodes.length > 0
+            ? directoryRecoveryNodes
             : recoveryToolNodes.length > 0
             ? recoveryToolNodes
             : validToolNodes;
@@ -7021,6 +7997,36 @@ export async function forwardAugmentStream(
               requestId,
               fallbackPath,
             });
+          }
+          if (requiresToolContinuation(request)) {
+            visibleText = stripInternalProxyHintLines(visibleText);
+          }
+          if (requiresToolContinuation(request) && toolNodes.length === 0) {
+            const recoveryNodes = recoveryToolNodesForToolContinuationStall(
+              ctx,
+              1,
+              fallbackPath,
+              strictAllowedTools,
+            );
+            if (recoveryNodes.length > 0) {
+              logWarn(
+                config,
+                "openai:stream:tool-continuation-stall-recovery",
+                {
+                  requestId,
+                  visiblePreview: visibleText.slice(0, 200),
+                  thinkingPreview: allCurrentThinking().join("\n").slice(
+                    0,
+                    200,
+                  ),
+                  recovery: recoveryNodes.map((node) =>
+                    (node.tool_use as JsonObject | undefined)?.tool_name ??
+                      "unknown"
+                  ),
+                },
+              );
+              toolNodes = recoveryNodes;
+            }
           }
           const allThinking = allCurrentThinking().filter((
             item,

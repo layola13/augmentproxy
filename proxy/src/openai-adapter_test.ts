@@ -86,6 +86,32 @@ function testContext(body: JsonObject): RequestContext {
   };
 }
 
+function testUserHomeDir(): string {
+  const candidates = [
+    Deno.env.get("HOME"),
+    Deno.env.get("USERPROFILE"),
+    `${Deno.env.get("HOMEDRIVE") ?? ""}${Deno.env.get("HOMEPATH") ?? ""}`,
+  ];
+  const home = candidates.find((item) => item?.trim());
+  if (!home) throw new Error("No user home directory environment variable");
+  return home;
+}
+
+function normalizeExpectedPath(path: string): string {
+  let normalized = path.replace(/\\/g, "/").replace(/\/+/g, "/");
+  if (normalized.length > 1 && !/^[A-Za-z]:\/$/.test(normalized)) {
+    normalized = normalized.replace(/\/+$/g, "");
+  }
+  return normalized;
+}
+
+async function makeAllowedTempDir(prefix: string): Promise<string> {
+  return await Deno.makeTempDir({
+    dir: testUserHomeDir(),
+    prefix,
+  });
+}
+
 function workspaceContext(): JsonObject {
   return { path: "/home/vscode/projects/augmentproxy/proxy" };
 }
@@ -140,6 +166,49 @@ function launchProcessToolDefinition(): JsonObject {
       required: ["command"],
     },
   };
+}
+
+function mainThreadDefinitionsWithReadOnlySubAgents(): JsonObject[] {
+  return [
+    ...toolDefinitions(),
+    {
+      name: "codebase-retrieval",
+      description: "Code search",
+      input_schema: {
+        type: "object",
+        properties: {
+          workspace_folder: { type: "string" },
+          information_request: { type: "string" },
+        },
+        required: ["information_request"],
+      },
+    },
+    {
+      name: "save-file",
+      description: "Save file",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          file_content: { type: "string" },
+        },
+        required: ["path", "file_content"],
+      },
+    },
+    {
+      name: "str-replace-editor",
+      description: "Edit file",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+        },
+        required: ["path"],
+      },
+    },
+    launchProcessToolDefinition(),
+    ...subAgentExplorePlanDefinitions(),
+  ];
 }
 
 function subAgentExplorePlanDefinitions(): JsonObject[] {
@@ -318,6 +387,144 @@ function contextAfterView(path: string): JsonObject {
         },
       }],
     }],
+  };
+}
+
+function contextAfterDirectoryView(path: string): JsonObject {
+  return {
+    path,
+    chat_history: [{
+      response_nodes: [{
+        id: 1,
+        type: 5,
+        tool_use: {
+          tool_name: "view",
+          tool_use_id: "call_view_directory_previous",
+          input_json: JSON.stringify({ path, type: "directory" }),
+        },
+      }],
+      request_nodes: [{
+        id: 2,
+        type: 1,
+        tool_result_node: {
+          tool_use_id: "call_view_directory_previous",
+          content:
+            `Here's the files and directories up to 2 levels deep in ${path}`,
+        },
+      }],
+    }],
+  };
+}
+
+function contextAfterParentDirectoryView(
+  parentPath: string,
+  targetFile: string,
+): JsonObject {
+  const toolUseId = "call_view_parent_directory_previous";
+  return {
+    path: parentPath,
+    chat_history: [{
+      request_nodes: [{
+        id: 1,
+        type: 0,
+        text_node: {
+          content:
+            `继续修复项目，让它能顺利编译 '${targetFile}' 为 js，并顺利运行。`,
+        },
+      }],
+      response_nodes: [{
+        id: 2,
+        type: 5,
+        tool_use: {
+          tool_name: "view",
+          tool_use_id: toolUseId,
+          input_json: JSON.stringify({
+            path: parentPath,
+            type: "directory",
+          }),
+        },
+      }],
+    }],
+    nodes: [{
+      id: 3,
+      type: 1,
+      tool_result_node: {
+        tool_use_id: toolUseId,
+        content:
+          `Here's the files and directories up to 2 levels deep in ${parentPath}`,
+      },
+    }],
+  };
+}
+
+function contextAfterParentDirectoryRecoveryFailure(
+  parentPath: string,
+  targetFile: string,
+  errorContent: string,
+): JsonObject {
+  const viewToolUseId = "call_view_parent_directory_previous";
+  const retrievalToolUseId = "call_repeated_directory_codebase_previous";
+  return {
+    path: parentPath,
+    chat_history: [
+      {
+        request_nodes: [{
+          id: 1,
+          type: 0,
+          text_node: {
+            content:
+              `继续修复项目，让它能顺利编译 '${targetFile}' 为 js，并顺利运行。`,
+          },
+        }],
+        response_nodes: [{
+          id: 2,
+          type: 5,
+          tool_use: {
+            tool_name: "view",
+            tool_use_id: viewToolUseId,
+            input_json: JSON.stringify({
+              path: parentPath,
+              type: "directory",
+            }),
+          },
+        }],
+      },
+      {
+        request_nodes: [{
+          id: 3,
+          type: 1,
+          tool_result_node: {
+            tool_use_id: viewToolUseId,
+            content:
+              `Here's the files and directories up to 2 levels deep in ${parentPath}`,
+          },
+        }],
+        response_nodes: [{
+          id: 4,
+          type: 5,
+          tool_use: {
+            tool_name: "codebase-retrieval",
+            tool_use_id: retrievalToolUseId,
+            input_json: JSON.stringify({
+              workspace_folder: parentPath,
+              information_request:
+                "Inspect the workspace and continue the task.",
+            }),
+          },
+        }],
+      },
+      {
+        request_nodes: [{
+          id: 5,
+          type: 1,
+          tool_result_node: {
+            tool_use_id: retrievalToolUseId,
+            is_error: true,
+            content: errorContent,
+          },
+        }],
+      },
+    ],
   };
 }
 
@@ -957,6 +1164,50 @@ Deno.test("codex instructions only mention sub-agent roles exposed by client", a
   );
 });
 
+Deno.test("codex instructions prefer main-thread tools when only read-only sub-agents exist", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        id: "resp-json",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "ok" }],
+        }],
+        usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        codexConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: "fix the file and validate the build",
+        }),
+      );
+      const instructions = String(requests[0].body.instructions ?? "");
+      assertEquals(
+        instructions.includes(
+          "Only read-only sub-agents are available in this session",
+        ),
+        true,
+      );
+      assertEquals(
+        instructions.includes("Use the main-thread tools yourself"),
+        true,
+      );
+      assertEquals(
+        instructions.includes(
+          "Do not repeatedly call sub-agent-explore or sub-agent-plan",
+        ),
+        true,
+      );
+    },
+  );
+});
+
 Deno.test("openai does not inject synthetic save-file into read-only sub-agent tool list", async () => {
   await withCaptureFetch(
     new Response(
@@ -1316,6 +1567,110 @@ Deno.test("Responses stream token_usage includes input cache details", async () 
   );
 });
 
+Deno.test("openai agent task with user text requires first tool call", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 7, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          mode: "CLI_AGENT",
+          tool_definitions: toolDefinitions(),
+          nodes: [{
+            id: 1,
+            type: 0,
+            text_node: {
+              content: "Implement the macro layer and run tests.",
+            },
+          }],
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(requests[0].body.tool_choice, "required");
+      const messagesText = JSON.stringify(requests[0].body.messages);
+      assertEquals(messagesText.includes("Tool-continuation control"), true);
+      assertEquals(messagesText.includes("Implement the macro layer"), true);
+      assertEquals(hasToolName(body, "view"), true);
+    },
+  );
+});
+
+Deno.test("openai agent title request does not force tool continuation", async () => {
+  const titlePrompt =
+    "Please provide a clear and concise title for this message. The title must be less than 6 words long. It should capture the key intent. Do not include quotation marks or additional formatting. Message: 继续修复zts，让它能顺利编译 '/home/vscode/projects/typescript-go/test_ts_project/index.ts'。";
+
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "zts 重构计划" } }],
+        usage: { prompt_tokens: 9, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          mode: "CLI_AGENT",
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: titlePrompt,
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(requests[0].body.tool_choice === "required", false);
+      assertEquals(hasToolName(body, "view"), false);
+      assertEquals(responseTextContains(body, "zts 重构计划"), true);
+    },
+  );
+});
+
+Deno.test("openai stream title request does not force tool continuation", async () => {
+  const titlePrompt =
+    "Please provide a clear and concise title for this message. The title must be less than 6 words long. It should capture the key intent. Do not include quotation marks or additional formatting. Message: 继续修复zts，让它能顺利编译 '/home/vscode/projects/typescript-go/test_ts_project/index.ts'。";
+
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({
+            choices: [{
+              delta: {
+                content: "zts 重构计划",
+              },
+            }],
+          })
+        }`,
+        "data: [DONE]",
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          mode: "CLI_AGENT",
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: titlePrompt,
+        }),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(requests[0].body.tool_choice === "required", false);
+      assertEquals(hasToolName(objects, "view"), false);
+      assertEquals(responseTextContains(objects, "zts 重构计划"), true);
+    },
+  );
+});
+
 Deno.test("codex agent task with user text requires first tool call", async () => {
   await withCaptureFetch(
     new Response(
@@ -1352,6 +1707,71 @@ Deno.test("codex agent task with user text requires first tool call", async () =
       assertEquals(inputText.includes("Implement the macro layer"), true);
     },
   );
+});
+
+Deno.test("openai json required tool_choice falls back to auto when upstream rejects it", async () => {
+  const requests: JsonObject[] = [];
+  let callCount = 0;
+  const originalFetch = globalThis.fetch;
+  (globalThis as unknown as { fetch: typeof fetch }).fetch =
+    ((input: RequestInfo | URL, init?: RequestInit) => {
+      callCount += 1;
+      requests.push(JSON.parse(String(init?.body ?? "{}")) as JsonObject);
+      if (callCount === 1) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              error: {
+                message: "tool_choice required is unsupported by this provider",
+              },
+            }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            choices: [{
+              message: {
+                content: "",
+                tool_calls: [{
+                  id: "call_openai_fallback_view",
+                  type: "function",
+                  function: {
+                    name: "view",
+                    arguments: JSON.stringify({
+                      path: String(workspaceContext().path),
+                      type: "directory",
+                    }),
+                  },
+                }],
+              },
+            }],
+            usage: { prompt_tokens: 8, completion_tokens: 2 },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }) as typeof fetch;
+  try {
+    const response = await forwardAugmentJson(
+      testConfig(),
+      testContext({
+        ...workspaceContext(),
+        mode: "CLI_AGENT",
+        tool_definitions: toolDefinitions(),
+        message: "Implement the macro layer and run tests.",
+      }),
+    );
+    const body = await response.json() as JsonObject;
+    assertEquals(callCount, 2);
+    assertEquals(requests[0].tool_choice, "required");
+    assertEquals(requests[1].tool_choice, "auto");
+    assertEquals(hasToolName(body, "view"), true);
+  } finally {
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch;
+  }
 });
 
 Deno.test("openai request strips historical stale tool rejection text", async () => {
@@ -1649,6 +2069,85 @@ Deno.test("codex json keeps genuine explore sub-agent calls unchanged", async ()
   );
 });
 
+Deno.test("openai json rewrites broad read-only sub-agent exploration to codebase-retrieval", async () => {
+  const workspacePath = String(workspaceContext().path);
+  const expectedRoot = normalizeExpectedPath(
+    workspacePath.replace(/\/proxy$/, ""),
+  );
+
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_broad_readonly_explore",
+        type: "function",
+        function: {
+          name: "sub-agent-explore",
+          arguments: JSON.stringify({
+            action: "run",
+            name: "explore_zts",
+            instruction:
+              `Explore the ${workspacePath} directory thoroughly. I need to understand: 1. The overall project structure and file organization 2. The current state of the compiler pipeline 3. Existing tests or examples 4. Configuration files.`,
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: "fix the compiler",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-explore"), false);
+      assertEquals(hasToolName(body, "codebase-retrieval"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.workspace_folder, expectedRoot);
+      assertEquals(
+        String(input.information_request).includes("overall project structure"),
+        true,
+      );
+    },
+  );
+});
+
+Deno.test("openai json stalled tool continuation after directory listing recovers with codebase-retrieval", async () => {
+  const workspacePath = String(workspaceContext().path);
+  const expectedRoot = normalizeExpectedPath(
+    workspacePath.replace(/\/proxy$/, ""),
+  );
+
+  await withFakeOpenAIMessage(
+    {
+      content:
+        "Let me first inspect the project structure and understand the current implementation state.",
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...contextAfterDirectoryView(workspacePath),
+          mode: "CLI_AGENT",
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "view"), false);
+      assertEquals(hasToolName(body, "codebase-retrieval"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.workspace_folder, expectedRoot);
+      assertEquals(
+        String(input.information_request).includes("continue the latest task"),
+        true,
+      );
+    },
+  );
+});
+
 Deno.test("openai json invalid save-file recovers with view tool", async () => {
   await withFakeOpenAIMessage(
     {
@@ -1679,6 +2178,300 @@ Deno.test("openai json invalid save-file recovers with view tool", async () => {
       assertEquals(input.type, "directory");
     },
   );
+});
+
+Deno.test("openai json missing view path falls back to nearest existing directory", async () => {
+  const root = await makeAllowedTempDir("openai-adapter-missing-view-");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_openai_missing_view",
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: `${root}/internal`,
+              type: "file",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: root }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "view"), true);
+        assertEquals(responseTextContains(body, "Tool call rejected"), false);
+        const input = firstToolInput(body);
+        assertEquals(input.path, normalizeExpectedPath(root));
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("openai json missing nested view path falls back to nearest existing ancestor", async () => {
+  const root = await makeAllowedTempDir("openai-adapter-missing-view-nested-");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_openai_missing_nested_view",
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: `${root}/missing-project/zig`,
+              type: "file",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({ path: root }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "view"), true);
+        assertEquals(responseTextContains(body, "Tool call rejected"), false);
+        const input = firstToolInput(body);
+        assertEquals(input.path, normalizeExpectedPath(root));
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("openai json suppresses repeated successful directory view", async () => {
+  const root = await makeAllowedTempDir("openai-adapter-repeat-dir-view-");
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_directory_view",
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: root,
+              type: "directory",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(contextAfterDirectoryView(root)),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "view"), false);
+        assertEquals(
+          responseTextContains(body, "repeated directory view suppressed"),
+          true,
+        );
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("openai json redirects repeated parent directory view to explicit task workspace", async () => {
+  const parent = await makeAllowedTempDir("openai-adapter-repeat-parent-");
+  try {
+    const project = `${parent}/typescript-go`;
+    const targetDir = `${project}/test_ts_project`;
+    const targetFile = `${targetDir}/index.ts`;
+    await Deno.mkdir(targetDir, { recursive: true });
+    await Deno.writeTextFile(`${project}/build.zig`, "");
+    await Deno.writeTextFile(targetFile, "export const value = 1;\n");
+
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_parent_directory_view",
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: parent,
+              type: "directory",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(contextAfterParentDirectoryView(parent, targetFile)),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "view"), true);
+        assertEquals(
+          responseTextContains(body, "repeated directory view suppressed"),
+          false,
+        );
+        const input = firstToolInput(body);
+        assertEquals(input.path, normalizeExpectedPath(project));
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("openai json keeps older task path available for repeated directory recovery", async () => {
+  const parent = await makeAllowedTempDir(
+    "openai-adapter-repeat-parent-older-",
+  );
+  try {
+    const project = `${parent}/typescript-go`;
+    const targetDir = `${project}/test_ts_project`;
+    const targetFile = `${targetDir}/index.ts`;
+    await Deno.mkdir(targetDir, { recursive: true });
+    await Deno.writeTextFile(`${project}/build.zig`, "");
+    await Deno.writeTextFile(targetFile, "export const value = 1;\n");
+
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_parent_directory_view_older",
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: parent,
+              type: "directory",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext(
+            contextAfterParentDirectoryRecoveryFailure(
+              parent,
+              targetFile,
+              "Tool call rejected: retry with a concrete workspace folder.",
+            ),
+          ),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "view"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, normalizeExpectedPath(project));
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("openai json repeated directory recovery reuses available workspace folder from errors", async () => {
+  const parent = normalizeExpectedPath(`${testUserHomeDir()}/projects`);
+  const targetFile = `${parent}/typescript-go/test_ts_project/index.ts`;
+
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_repeat_parent_directory_view_workspace_error",
+        type: "function",
+        function: {
+          name: "view",
+          arguments: JSON.stringify({
+            path: parent,
+            type: "directory",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext(
+          contextAfterParentDirectoryRecoveryFailure(
+            parent,
+            targetFile,
+            `The workspace_folder parameter does not match an open workspace folder: ${parent} Available folders: - ${parent}/typescript-go`,
+          ),
+        ),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "codebase-retrieval"), true);
+      const input = firstToolInput(body);
+      assertEquals(
+        input.workspace_folder,
+        normalizeExpectedPath(`${parent}/typescript-go`),
+      );
+    },
+  );
+});
+
+Deno.test("openai json narrows codebase-retrieval workspace folder to explicit task project", async () => {
+  const parent = await makeAllowedTempDir(
+    "openai-adapter-codebase-workspace-parent-",
+  );
+  try {
+    const project = `${parent}/typescript-go`;
+    const targetDir = `${project}/test_ts_project`;
+    const targetFile = `${targetDir}/index.ts`;
+    await Deno.mkdir(targetDir, { recursive: true });
+    await Deno.writeTextFile(`${project}/build.zig`, "");
+    await Deno.writeTextFile(targetFile, "export const value = 1;\n");
+
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_broad_codebase_retrieval",
+          type: "function",
+          function: {
+            name: "codebase-retrieval",
+            arguments: JSON.stringify({
+              workspace_folder: parent,
+              information_request: "Inspect the workspace and continue.",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            path: parent,
+            mode: "CLI_AGENT",
+            tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+            message:
+              `继续修复zts，让它能顺利编译 '${targetFile}' 为 js，并顺利运行。`,
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        const input = firstToolInput(body);
+        assertEquals(hasToolName(body, "codebase-retrieval"), true);
+        assertEquals(input.workspace_folder, normalizeExpectedPath(project));
+      },
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
 });
 
 Deno.test("codex json invalid save-file recovers with view tool", async () => {
@@ -1984,6 +2777,93 @@ Deno.test("openai stream stale rejection text recovers with view tool", async ()
   );
 });
 
+Deno.test("openai stream stalled agent turn recovers with workspace view", async () => {
+  await withFakeFetch(
+    () =>
+      new Response(
+        [
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: {
+                  content:
+                    "Let me first inspect the project structure and understand the current implementation state.",
+                },
+              }],
+            })
+          }`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          mode: "CLI_AGENT",
+          tool_definitions: toolDefinitions(),
+          message: "Implement the macro layer and run tests.",
+        }),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "view"), true);
+      const input = firstToolInput(objects);
+      assertEquals(input.path, "/home/vscode/projects/augmentproxy/proxy");
+      assertEquals(input.type, "directory");
+      const final = objects.find((item) => item.done === true);
+      assertEquals(
+        String(final?.response_text).includes("inspect the project structure"),
+        true,
+      );
+    },
+  );
+});
+
+Deno.test("openai stream rewrites broad read-only sub-agent exploration to codebase-retrieval", async () => {
+  const workspacePath = String(workspaceContext().path);
+  const expectedRoot = normalizeExpectedPath(
+    workspacePath.replace(/\/proxy$/, ""),
+  );
+
+  await withFakeOpenAIStreamToolCall(
+    {
+      id: "call_broad_readonly_explore_stream",
+      index: 0,
+      type: "function",
+      function: {
+        name: "sub-agent-explore",
+        arguments: JSON.stringify({
+          action: "run",
+          name: "explore_zts",
+          instruction:
+            `Explore the ${workspacePath} directory thoroughly. I need to understand: 1. The overall project structure and file organization 2. The current state of the compiler pipeline 3. Existing tests or examples 4. Configuration files.`,
+        }),
+      },
+    },
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: "fix the compiler",
+        }),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "sub-agent-explore"), false);
+      assertEquals(hasToolName(objects, "codebase-retrieval"), true);
+      const input = firstToolInput(objects);
+      assertEquals(input.workspace_folder, expectedRoot);
+      assertEquals(
+        String(input.information_request).includes("overall project structure"),
+        true,
+      );
+    },
+  );
+});
+
 Deno.test("codex stream invalid save-file recovers with view tool", async () => {
   await withFakeFetch(
     () =>
@@ -2031,6 +2911,43 @@ Deno.test("codex stream invalid save-file recovers with view tool", async () => 
       assertEquals(input.type, "directory");
     },
   );
+});
+
+Deno.test("openai stream missing view path falls back to nearest existing directory", async () => {
+  const root = await makeAllowedTempDir("openai-adapter-missing-view-stream-");
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_openai_missing_view_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "view",
+          arguments: JSON.stringify({
+            path: `${root}/internal`,
+            type: "file",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: root }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), true);
+        assertEquals(
+          responseTextContains(objects, "Tool call rejected"),
+          false,
+        );
+        const input = firstToolInput(objects);
+        assertEquals(input.path, normalizeExpectedPath(root));
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
 });
 
 Deno.test("codex json upstream failed recovers with view tool", async () => {
@@ -4012,6 +4929,268 @@ Deno.test("stream keeps repeated single-thread view reads to same file", async (
   }
 });
 
+Deno.test("stream suppresses repeated successful directory view", async () => {
+  const root = await makeAllowedTempDir(
+    "openai-adapter-repeat-dir-view-stream-",
+  );
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_repeat_directory_view_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "view",
+          arguments: JSON.stringify({
+            path: root,
+            type: "directory",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext(contextAfterDirectoryView(root)),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), false);
+        assertEquals(
+          responseTextContains(objects, "repeated directory view suppressed"),
+          true,
+        );
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream redirects repeated parent directory view to explicit task workspace", async () => {
+  const parent = await makeAllowedTempDir(
+    "openai-adapter-repeat-parent-stream-",
+  );
+  try {
+    const project = `${parent}/typescript-go`;
+    const targetDir = `${project}/test_ts_project`;
+    const targetFile = `${targetDir}/index.ts`;
+    await Deno.mkdir(targetDir, { recursive: true });
+    await Deno.writeTextFile(`${project}/build.zig`, "");
+    await Deno.writeTextFile(targetFile, "export const value = 1;\n");
+
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_repeat_parent_directory_view_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "view",
+          arguments: JSON.stringify({
+            path: parent,
+            type: "directory",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext(contextAfterParentDirectoryView(parent, targetFile)),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), true);
+        assertEquals(
+          responseTextContains(objects, "repeated directory view suppressed"),
+          false,
+        );
+        const input = firstToolInput(objects);
+        assertEquals(input.path, normalizeExpectedPath(project));
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream keeps older task path available for repeated directory recovery", async () => {
+  const parent = await makeAllowedTempDir(
+    "openai-adapter-repeat-parent-older-stream-",
+  );
+  try {
+    const project = `${parent}/typescript-go`;
+    const targetDir = `${project}/test_ts_project`;
+    const targetFile = `${targetDir}/index.ts`;
+    await Deno.mkdir(targetDir, { recursive: true });
+    await Deno.writeTextFile(`${project}/build.zig`, "");
+    await Deno.writeTextFile(targetFile, "export const value = 1;\n");
+
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_repeat_parent_directory_view_older_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "view",
+          arguments: JSON.stringify({
+            path: parent,
+            type: "directory",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext(
+            contextAfterParentDirectoryRecoveryFailure(
+              parent,
+              targetFile,
+              "Tool call rejected: retry with a concrete workspace folder.",
+            ),
+          ),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.path, normalizeExpectedPath(project));
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream repeated directory recovery reuses available workspace folder from errors", async () => {
+  const parent = normalizeExpectedPath(`${testUserHomeDir()}/projects`);
+  const targetFile = `${parent}/typescript-go/test_ts_project/index.ts`;
+
+  await withFakeOpenAIStreamToolCall(
+    {
+      id: "call_repeat_parent_directory_view_workspace_error_stream",
+      index: 0,
+      type: "function",
+      function: {
+        name: "view",
+        arguments: JSON.stringify({
+          path: parent,
+          type: "directory",
+        }),
+      },
+    },
+    async () => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext(
+          contextAfterParentDirectoryRecoveryFailure(
+            parent,
+            targetFile,
+            `The workspace_folder parameter does not match an open workspace folder: ${parent} Available folders: - ${parent}/typescript-go`,
+          ),
+        ),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(hasToolName(objects, "codebase-retrieval"), true);
+      const input = firstToolInput(objects);
+      assertEquals(
+        input.workspace_folder,
+        normalizeExpectedPath(`${parent}/typescript-go`),
+      );
+    },
+  );
+});
+
+Deno.test("openai stream narrows codebase-retrieval workspace folder to explicit task project", async () => {
+  const parent = await makeAllowedTempDir(
+    "openai-adapter-codebase-workspace-parent-stream-",
+  );
+  try {
+    const project = `${parent}/typescript-go`;
+    const targetDir = `${project}/test_ts_project`;
+    const targetFile = `${targetDir}/index.ts`;
+    await Deno.mkdir(targetDir, { recursive: true });
+    await Deno.writeTextFile(`${project}/build.zig`, "");
+    await Deno.writeTextFile(targetFile, "export const value = 1;\n");
+
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_broad_codebase_retrieval_stream",
+        index: 0,
+        type: "function",
+        function: {
+          name: "codebase-retrieval",
+          arguments: JSON.stringify({
+            workspace_folder: parent,
+            information_request: "Inspect the workspace and continue.",
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            path: parent,
+            mode: "CLI_AGENT",
+            tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+            message:
+              `继续修复zts，让它能顺利编译 '${targetFile}' 为 js，并顺利运行。`,
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        const input = firstToolInput(objects);
+        assertEquals(hasToolName(objects, "codebase-retrieval"), true);
+        assertEquals(input.workspace_folder, normalizeExpectedPath(project));
+      },
+    );
+  } finally {
+    await Deno.remove(parent, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream coalesces duplicate directory views in one response", async () => {
+  const root = await makeAllowedTempDir("openai-adapter-duplicate-dir-view-");
+  try {
+    await withFakeOpenAIStreamToolCalls(
+      [
+        {
+          id: "call_duplicate_directory_view_1",
+          index: 0,
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: root,
+              type: "directory",
+            }),
+          },
+        },
+        {
+          id: "call_duplicate_directory_view_2",
+          index: 1,
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: root,
+              type: "directory",
+            }),
+          },
+        },
+      ],
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({ path: root }),
+        );
+        const inputs = toolInputs(await collectStreamObjects(response));
+        assertEquals(inputs.length, 1);
+        assertEquals(inputs[0].path, normalizeExpectedPath(root));
+        assertEquals(inputs[0].type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
 Deno.test("stream coalesces repeated same-path save-file writes to final content", async () => {
   const path = await makeTempTargetPath();
   try {
@@ -4584,6 +5763,97 @@ Deno.test("repeated failed launch-process recovers by reading diagnostic file", 
         const input = firstToolInput(body);
         assertEquals(input.path, path);
         assertEquals(input.type, "file");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("successful recovery codebase-retrieval suppresses repeated directory view loop", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-directory-loop-",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeated_view",
+          type: "function",
+          function: {
+            name: "view",
+            arguments: JSON.stringify({
+              path: root,
+              type: "directory",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              // Turn 1: Successful view
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_view_1",
+                  input_json: JSON.stringify({ path: root, type: "directory" }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_view_1",
+                  content: "directory listing of " + root,
+                },
+              }],
+            }, {
+              // Turn 2: Successful codebase-retrieval (as recovery)
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "codebase-retrieval",
+                  tool_use_id:
+                    "call_view_1_repeated_directory_codebase_retrieval",
+                  input_json: JSON.stringify({
+                    workspace_folder: root,
+                    information_request:
+                      "Continue the user's task by identifying the concrete files and next implementation steps for: the current coding task",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id:
+                    "call_view_1_repeated_directory_codebase_retrieval",
+                  content: "codebase retrieval results for " + root,
+                },
+              }],
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        // Should NOT suggest codebase-retrieval again because it was already successful.
+        assertEquals(hasToolName(body, "codebase-retrieval"), false);
+        // Should only have the suppression hint in the content.
+        const content = String(
+          body.response_text || body.text || body.completion || "",
+        );
+        assertEquals(
+          content.includes("repeated directory view suppressed"),
+          true,
+        );
       },
     );
   } finally {

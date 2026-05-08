@@ -1,6 +1,10 @@
 import type { JsonValue, RequestContext } from "./types.ts";
 
-export function jsonResponse(value: unknown, status = 200, headers?: HeadersInit): Response {
+export function jsonResponse(
+  value: unknown,
+  status = 200,
+  headers?: HeadersInit,
+): Response {
   return new Response(JSON.stringify(value), {
     status,
     headers: {
@@ -10,11 +14,34 @@ export function jsonResponse(value: unknown, status = 200, headers?: HeadersInit
   });
 }
 
-export function textResponse(value: string, status = 200, headers?: HeadersInit): Response {
+export function textResponse(
+  value: string,
+  status = 200,
+  headers?: HeadersInit,
+): Response {
   return new Response(value, { status, headers });
 }
 
-export function augmentError(message: string, status = 500, code = "internal"): Response {
+export function ndjsonResponse(
+  values: unknown[],
+  status = 200,
+  headers?: HeadersInit,
+): Response {
+  const body = values.map((value) => JSON.stringify(value)).join("\n");
+  return new Response(body ? `${body}\n` : "", {
+    status,
+    headers: {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      ...headers,
+    },
+  });
+}
+
+export function augmentError(
+  message: string,
+  status = 500,
+  code = "internal",
+): Response {
   return jsonResponse({ error: { message, code, status } }, status);
 }
 
@@ -24,7 +51,9 @@ function requestId(headers: Headers): string {
 
 export async function parseRequest(request: Request): Promise<RequestContext> {
   const url = new URL(request.url);
-  const rawBody = ["GET", "HEAD"].includes(request.method) ? "" : await request.text();
+  const rawBody = ["GET", "HEAD"].includes(request.method)
+    ? ""
+    : await request.text();
   let body: JsonValue | undefined;
   if (rawBody.trim()) {
     try {
