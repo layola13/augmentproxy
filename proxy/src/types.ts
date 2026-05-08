@@ -89,6 +89,48 @@ export interface OpenAIResponsesRequest {
 
 export type OpenAIUpstreamRequest = OpenAIChatRequest | OpenAIResponsesRequest;
 
+export enum AgentExecutionMode {
+  Main = "main",
+  Explore = "explore",
+  Plan = "plan",
+  Code = "code",
+  Validate = "validate",
+  Summary = "summary",
+  Title = "title",
+  AskExpert = "askexpert",
+  Unknown = "unknown",
+}
+
+export enum RequestIntent {
+  Evaluate = "evaluate",
+  Plan = "plan",
+  Implement = "implement",
+  Validate = "validate",
+  Continue = "continue",
+  CompactSummary = "compact_summary",
+  TitleOnly = "title_only",
+  Unknown = "unknown",
+}
+
+export enum RepeatedFailureStage {
+  None = "none",
+  Recovery = "recovery",
+  Continuation = "continuation",
+  Resolution = "resolution",
+  Directive = "directive",
+  Exhausted = "exhausted",
+}
+
+export interface ToolPolicy {
+  mode: AgentExecutionMode;
+  intent: RequestIntent;
+  readOnly: boolean;
+  preferToolContinuation: boolean;
+  retryStalledContinuation: boolean;
+  allowAgentSwitching: boolean;
+  allowedToolNames?: Set<string>;
+}
+
 export interface AgentUsage {
   agent_id: string;
   name: string;

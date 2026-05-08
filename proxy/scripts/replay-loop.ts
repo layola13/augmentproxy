@@ -49,6 +49,9 @@ function classifyToolCall(toolName: string, input: JsonObject): string {
   if (toolName === "launch-process") {
     const command = String(input.command ?? "");
     if (command.includes("grep -RIn")) return "launch:grep";
+    if (command.includes("repeated failed tool call was suppressed")) {
+      return "launch:exhausted";
+    }
     if (command.includes("printf")) return "launch:directive";
     if (command.includes("haxe -p src")) return "launch:compile";
     return `launch:${command.slice(0, 80)}`;
@@ -313,7 +316,7 @@ async function runRound(round: number): Promise<string[]> {
 try {
   for (let i = 0; i < rounds; i += 1) {
     const labels = await runRound(i);
-    if (i % 20 === 0) {
+    if (i < 12 || i % 20 === 0) {
       console.log("round", i, labels.join(","));
     }
     if (repeatedBad !== 0) {

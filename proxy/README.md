@@ -182,6 +182,28 @@ deno run --allow-env --allow-read scripts/replay-chat-stream.ts /tmp/augmentprox
 - 如果日志文件里的 `body` 是 `"[BODY_TOO_LARGE: ...]"`，说明原始请求体已被截断，脚本会直接报错并提示该日志不可回放。
 - 回放脚本会 mock 上游 SSE 输出（默认优先用 `launch-process`，若该工具在日志定义中不可用会自动改用 `view`），用于稳定复现 proxy 内部处理流程。
 
+## Repeated Failure Loop Replay
+
+仓库还内置了一个纯本地循环回放脚本，用于稳定复现并验证 repeated-failure 自动恢复链：
+
+```text
+proxy/scripts/replay-loop.ts
+```
+
+运行方式：
+
+```bash
+cd proxy
+deno run --allow-env --allow-read --allow-write scripts/replay-loop.ts 120
+```
+
+当前预期行为：
+
+- 第一次失败后依次进入 `view diagnostic -> grep -> view definition -> directive -> exhausted`。
+- `directive` 只能出现一次。
+- `exhausted` 只能出现一次。
+- 后续轮次不应再自动注入新的 `view` / `grep` / `directive` 恢复工具。
+
 ## Helper Scripts
 
 仓库根目录新增了两个脚本，用来减少手动导出环境变量的步骤。

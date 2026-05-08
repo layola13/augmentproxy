@@ -1671,6 +1671,75 @@ Deno.test("openai stream title request does not force tool continuation", async 
   );
 });
 
+Deno.test("openai continuation summary request does not force tool continuation", async () => {
+  const summaryPrompt =
+    "Create a compact continuation summary for this agent conversation. Preserve the user's explicit instructions, current objective, important decisions, files changed or inspected, commands run, test results, unresolved errors, and the next concrete steps. Do not invent facts. Prefer exact paths, symbols, command names, and error messages over general descriptions. Write the summary so the agent can continue the same task after context compaction without re-reading unrelated history.";
+
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "summary" } }],
+        usage: { prompt_tokens: 9, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          mode: "CLI_AGENT",
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: summaryPrompt,
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(requests[0].body.tool_choice === "required", false);
+      assertEquals(hasToolName(body, "view"), false);
+      assertEquals(responseTextContains(body, "summary"), true);
+    },
+  );
+});
+
+Deno.test("openai stream continuation summary request does not force tool continuation", async () => {
+  const summaryPrompt =
+    "Create a compact continuation summary for this agent conversation. Preserve the user's explicit instructions, current objective, important decisions, files changed or inspected, commands run, test results, unresolved errors, and the next concrete steps. Do not invent facts. Prefer exact paths, symbols, command names, and error messages over general descriptions. Write the summary so the agent can continue the same task after context compaction without re-reading unrelated history.";
+
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({
+            choices: [{
+              delta: {
+                content: "summary",
+              },
+            }],
+          })
+        }`,
+        "data: [DONE]",
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          mode: "CLI_AGENT",
+          tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+          message: summaryPrompt,
+        }),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(requests[0].body.tool_choice === "required", false);
+      assertEquals(hasToolName(objects, "view"), false);
+      assertEquals(responseTextContains(objects, "summary"), true);
+    },
+  );
+});
+
 Deno.test("codex agent task with user text requires first tool call", async () => {
   await withCaptureFetch(
     new Response(
@@ -2069,6 +2138,37 @@ Deno.test("codex json keeps genuine explore sub-agent calls unchanged", async ()
   );
 });
 
+Deno.test("openai plan sub-agent keeps planning role available instead of read-only pruning", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [
+            ...mainThreadDefinitionsWithReadOnlySubAgents(),
+            ...subAgentAllDefinitions(),
+          ],
+          user_guidelines: "You are a planning sub-agent that creates detailed implementation plans.",
+          message: "plan the refactor",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("save-file"), true);
+      assertEquals(names.includes("launch-process"), true);
+      assertEquals(names.includes("sub-agent-code"), true);
+      assertEquals(names.includes("sub-agent-validate"), true);
+    },
+  );
+});
+
 Deno.test("openai json rewrites broad read-only sub-agent exploration to codebase-retrieval", async () => {
   const workspacePath = String(workspaceContext().path);
   const expectedRoot = normalizeExpectedPath(
@@ -2110,6 +2210,42 @@ Deno.test("openai json rewrites broad read-only sub-agent exploration to codebas
         String(input.information_request).includes("overall project structure"),
         true,
       );
+    },
+  );
+});
+
+Deno.test("openai json rewrites broad code sub-agent exploration back to plan role", async () => {
+  await withFakeOpenAIMessage(
+    {
+      content: "",
+      tool_calls: [{
+        id: "call_wrong_code_for_planning",
+        type: "function",
+        function: {
+          name: "sub-agent-code",
+          arguments: JSON.stringify({
+            action: "run",
+            name: "code_zts",
+            instruction:
+              "Explore the typescript-go project at /home/vscode/projects/typescript-go to understand the zts implementation. Focus on: 1. Project structure 2. zts module layout 3. current implementation state 4. old backups or previous refactors.",
+          }),
+        },
+      }],
+    },
+    async () => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-plan"), true);
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      const input = firstToolInput(body);
+      assertEquals(input.name, "code_zts");
     },
   );
 });
@@ -6982,6 +7118,236 @@ Deno.test("stream exhausted repeated failure emits continuation tool instead of 
         );
         assertEquals(String(input.command).includes("haxe -p src"), false);
         assertEquals(String(input.command).includes("grep -RIn"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("stream exhausted repeated failure does not fall back to workspace view stall recovery", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-stream-exhausted-no-stall-",
+  });
+  const nextStatePath = `${root}/src/haxe/state/NextState.hx`;
+  const statePath = `${root}/src/haxe/state/State.hx`;
+  await Deno.mkdir(`${root}/src/haxe/state`, { recursive: true });
+  await Deno.writeTextFile(nextStatePath, "class NextState<T:States> {}\n");
+  await Deno.writeTextFile(statePath, "interface States {}\n");
+  const command =
+    "cd /home/vscode/projects/bevy_haxe && haxe -p src -main TestAll --interp 2>&1";
+  const compileFailure = [
+    "Here are the results from executing the command.",
+    "<return-code>",
+    "1",
+    "</return-code>",
+    "<output>",
+    "src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States",
+    "",
+    "</output>",
+  ].join("\n");
+  try {
+    await withFakeOpenAIStreamToolCall(
+      {
+        id: "call_model_compile_after_exhausted_no_stall",
+        index: 0,
+        type: "function",
+        function: {
+          name: "launch-process",
+          arguments: JSON.stringify({
+            command,
+            cwd: root,
+            wait: true,
+            max_wait_seconds: 60,
+          }),
+        },
+      },
+      async () => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_failed_compile_original",
+                  input_json: JSON.stringify({
+                    command,
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_failed_compile_original",
+                  content: compileFailure,
+                  is_error: true,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 3,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_recovery_view",
+                  input_json: JSON.stringify({
+                    path: nextStatePath,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 4,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_view",
+                  content:
+                    `Here's the result of running \`cat -n\` on ${nextStatePath}:\n     1\tclass NextState<T:States> {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 5,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_recovery_grep",
+                  input_json: JSON.stringify({
+                    command:
+                      "grep -RIn --include='*.hx' -E '\\b(interface|class|enum|typedef)[[:space:]]+States\\b|\\bStates\\b' . || true",
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 60,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 6,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_recovery_grep",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "./src/haxe/state/State.hx:1:interface States {}",
+                    "./src/haxe/state/NextState.hx:1:class NextState<T:States> {}",
+                    "",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 7,
+                type: 5,
+                tool_use: {
+                  tool_name: "view",
+                  tool_use_id: "call_definition_view",
+                  input_json: JSON.stringify({
+                    path: statePath,
+                    type: "file",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 8,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_definition_view",
+                  content:
+                    `Here's the result of running \`cat -n\` on ${statePath}:\n     1\tinterface States {}\n`,
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 9,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_directive",
+                  input_json: JSON.stringify({
+                    command:
+                      "printf '%s\\n' 'augmentproxy: repeated compile failure already has diagnostic files loaded. latest diagnostic: src/haxe/state/NextState.hx:21: characters 19-25 : Type not found : States Do not read the same files again. Edit the relevant Haxe file with str-replace-editor, then rerun the compile command.'",
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 10,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 10,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_directive",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "augmentproxy directive printed",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }, {
+              response_nodes: [{
+                id: 11,
+                type: 5,
+                tool_use: {
+                  tool_name: "launch-process",
+                  tool_use_id: "call_exhausted",
+                  input_json: JSON.stringify({
+                    command:
+                      "printf '%s\\n' 'augmentproxy: repeated failed tool call was suppressed after recovery actions were already completed. suppressed: launch-process command. Do not repeat that same tool call. Modify the relevant file or run a different diagnostic, then retry verification.'",
+                    cwd: root,
+                    wait: true,
+                    max_wait_seconds: 10,
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 12,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_exhausted",
+                  content: [
+                    "Here are the results from executing the command.",
+                    "<return-code>",
+                    "0",
+                    "</return-code>",
+                    "<output>",
+                    "augmentproxy directive printed",
+                    "</output>",
+                  ].join("\n"),
+                },
+              }],
+            }],
+            tool_definitions: toolDefinitions(),
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(hasToolName(objects, "view"), false);
+        assertEquals(hasToolName(objects, "launch-process"), false);
+        assertEquals(
+          responseTextContains(
+            objects,
+            "Repeated failed tool call suppressed: launch-process command.",
+          ),
+          true,
+        );
       },
     );
   } finally {
