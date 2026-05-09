@@ -6,6 +6,10 @@ import type {
   ProxyConfig,
   RequestContext,
 } from "./types.ts";
+import {
+  rememberBlobFileInfos,
+  resolveBlobsetFileInfos,
+} from "./indexer.ts";
 
 interface AgentRecord {
   agent_id: string;
@@ -151,9 +155,11 @@ function loadIndexedCommitBlobsets(): void {
         ? commit.commit_sha
         : "";
       if (commit && commitSha && blobset) {
+        const hydratedBlobset = cloneJsonObject(blobset);
+        hydratedBlobset.file_infos = resolveBlobsetFileInfos(hydratedBlobset);
         indexedCommitBlobsets.set(commitSha, {
           commit: cloneJsonObject(commit),
-          blobset: cloneJsonObject(blobset),
+          blobset: hydratedBlobset,
         });
       }
     }
@@ -974,9 +980,7 @@ export function fakeGetLatestBlobset(ctx: RequestContext): JsonObject[] {
   for (const commitSha of commitShas) {
     const record = indexedCommitBlobsets.get(commitSha);
     if (record) {
-      const fileInfos = Array.isArray(record.blobset.file_infos)
-        ? record.blobset.file_infos
-        : [];
+      const fileInfos = resolveBlobsetFileInfos(record.blobset);
       return [{
         commit_sha: commitSha,
         file_infos: JSON.parse(JSON.stringify(fileInfos)),
@@ -998,9 +1002,13 @@ export function fakeRegisterBlobset(ctx: RequestContext): JsonObject {
     : "";
 
   if (commit && commitSha && blobset) {
+    const hydratedBlobset = cloneJsonObject(blobset);
+    const fileInfos = resolveBlobsetFileInfos(hydratedBlobset);
+    hydratedBlobset.file_infos = fileInfos;
+    rememberBlobFileInfos(fileInfos);
     indexedCommitBlobsets.set(commitSha, {
       commit: cloneJsonObject(commit),
-      blobset: cloneJsonObject(blobset),
+      blobset: hydratedBlobset,
     });
     saveIndexedCommitBlobsets();
   }

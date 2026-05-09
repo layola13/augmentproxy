@@ -3,13 +3,10 @@ import { jsonResponse, ndjsonResponse, textResponse } from "./http.ts";
 import {
   agentUsageStatsMarkdown,
   ensureFakeAgent,
-  fakeBatchUpload,
   fakeBillingSummary,
-  fakeCheckpointBlobs,
   fakeCloudAgent,
   fakeContextList,
   fakeCreditInfo,
-  fakeFindMissing,
   fakeGeneric,
   fakeGetLatestBlobset,
   fakeModels,
@@ -275,20 +272,6 @@ function shouldRecord(path: string): boolean {
     path.startsWith("indexed-commits/");
 }
 
-function isAugmentCli(ctx: RequestContext): boolean {
-  const userAgent = ctx.headers.get("user-agent")?.toLowerCase() ?? "";
-  return userAgent.includes("augment.cli") || userAgent.includes("auggie");
-}
-
-function fastIndexingResponse(path: string, ctx: RequestContext): JsonObject {
-  if (path === "find-missing") {
-    return fakeFindMissing(ctx, true);
-  }
-  if (path === "batch-upload") return fakeBatchUpload(ctx);
-  if (path === "checkpoint-blobs") return fakeCheckpointBlobs();
-  return fakeGeneric(path);
-}
-
 export async function routeAugment(
   config: ProxyConfig,
   ctx: RequestContext,
@@ -334,14 +317,6 @@ export async function routeAugment(
 
   if (path === "record-request-events" || path === "record-session-events") {
     return jsonResponse({ ok: true });
-  }
-
-  if (
-    isAugmentCli(ctx) &&
-    (path === "find-missing" || path === "batch-upload" ||
-      path === "checkpoint-blobs")
-  ) {
-    return jsonResponse(fastIndexingResponse(path, ctx));
   }
 
   if (path === "find-missing") {

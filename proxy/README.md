@@ -182,6 +182,40 @@ deno run --allow-env --allow-read scripts/replay-chat-stream.ts /tmp/augmentprox
 - 如果日志文件里的 `body` 是 `"[BODY_TOO_LARGE: ...]"`，说明原始请求体已被截断，脚本会直接报错并提示该日志不可回放。
 - 回放脚本会 mock 上游 SSE 输出（默认优先用 `launch-process`，若该工具在日志定义中不可用会自动改用 `view`），用于稳定复现 proxy 内部处理流程。
 
+## Chat Stream Summary Replay
+
+对于 `body` 已经被截断、但仍保留 `body_summary` 的大日志，仓库内置了一个摘要回放脚本：
+
+```text
+proxy/scripts/replay-chat-stream-summary.ts
+```
+
+运行方式：
+
+```bash
+cd proxy
+deno run --allow-read scripts/replay-chat-stream-summary.ts <log-json-path>
+```
+
+示例（适用于 `BODY_TOO_LARGE` 日志）：
+
+```bash
+cd proxy
+deno run --allow-read scripts/replay-chat-stream-summary.ts /tmp/augmentproxy-logs/2026-05-08/2026-05-08T11-19-02-191Z-POST-chat-stream.json
+```
+
+这个脚本不会尝试还原完整原始请求体，而是：
+
+- 从 `body_summary.chat_history.recent` 合成一个最小可重放上下文
+- 复用摘要里最后一轮 assistant 的 `response_text` / `text_nodes` / `tool_uses`
+- 直接验证当前 proxy 是否会在 `tool_choice=required` 的场景下补出恢复工具节点
+
+适合排查这类问题：
+
+- 上游只输出 `Let me directly view the key files...` 之类的文字，没有真正 tool call
+- `codebase-retrieval` 返回 `Found 0 files`
+- 怀疑 `chat-stream` 收尾阶段没有自动恢复到 `view`
+
 ## Repeated Failure Loop Replay
 
 仓库还内置了一个纯本地循环回放脚本，用于稳定复现并验证 repeated-failure 自动恢复链：
@@ -203,6 +237,44 @@ deno run --allow-env --allow-read --allow-write scripts/replay-loop.ts 120
 - `directive` 只能出现一次。
 - `exhausted` 只能出现一次。
 - 后续轮次不应再自动注入新的 `view` / `grep` / `directive` 恢复工具。
+
+## Agent Exposure Policy
+
+当前 `openai/router` 链路已经改成“主线程优先，本地直做”：
+
+- 默认主线程不会向模型暴露任何 `sub-agent-*` 工具。
+- 只有两种情况会在主线程暴露 `sub-agent-*`：
+  - 用户明确要求 `sub-agents` / `delegation` / `parallel agent work`
+  - 用户明确提出并行 sidecar 任务
+- 仅仅因为用户要求“评估 / 调研 / 深入分析 / 详细计划”，不会自动进入 agent 模式。
+- 仅仅提到 “agent mode” 或笼统提到 “agent” 也不算授权。
+- 子代理会话一律不再继续暴露 `sub-agent-*`，禁止嵌套派生 agent。
+- `plan` / `explore` / `docs` / `judge` / `askexpert` 都按子代理会话处理，不再持有主线程的工具权限。
+- 如果主线程已经有 `view` / `save-file` / `str-replace-editor` / `launch-process` 等直接工具，优先由主线程完成，不再自动偷偷改派到 `sub-agent-code` 或 `sub-agent-validate`。
+
+这次调整的目的，是消除以下两类死循环：
+
+- 主线程因为工具表里存在 `sub-agent-*` 而不断偏向 `plan/explore/export`
+- 子代理或恢复链在不可用工具上自动改派到另一个 agent，形成嵌套切换和无效循环
+
+当前已经专门验证两条关键链路：
+
+- `main -> plan -> main`
+  - 主线程只有在明确并行/委托请求时才会暴露 `sub-agent-plan`
+  - `plan` 子代理自身不再暴露任何 `sub-agent-*`
+  - `plan` 完成后回到主线程，主线程继续使用本地工具，当前恢复表现为 `view` 工作区而不是自动跳 `code`
+- `main -> explore -> code`
+  - 这条链路现在被明确阻断
+  - 即使主线程因明确并行请求暴露了 `sub-agent-explore` 和 `sub-agent-code`，`explore` 子代理自身也不能再进入 `code`
+  - `explore` 完成后回到主线程，主线程继续用本地工具恢复，不会自动进入 `code`
+
+如果后续产品要支持 `main -> explore -> code` 自动交接，必须先在协议层重新定义：
+
+- 哪些情况下主线程允许自动交接
+- 是否允许子代理返回结构化“建议切换 code”
+- 切换决策由主线程还是 proxy 执行
+
+在这些规则明确之前，proxy 当前行为是保守且有意的：回主线程，本地直做，不自动切 `code`。
 
 ## Helper Scripts
 
@@ -529,18 +601,18 @@ The operation was aborted due to timeout
 
 restart proxy after pulling the latest code so the optimized lookup is active.
 
-For Augment CLI / Auggie agent sessions, the proxy now treats indexing as
-non-blocking bootstrap traffic even when `AUGMENT_INDEXING_MODE=real`:
+For Augment CLI / Auggie sessions, `AUGMENT_INDEXING_MODE=real` now means real
+indexing:
 
-- `POST /find-missing` returns `unknown_memory_names: []`.
-- `POST /batch-upload` echoes uploaded `blob_names` without embedding.
-- `POST /checkpoint-blobs` returns a synthetic checkpoint id.
-- `record-request-events` and `record-session-events` are acknowledged
-  immediately.
+- `POST /find-missing` checks Qdrant marker state and returns genuinely unknown
+  blob names.
+- `POST /batch-upload` chunks file content, calls the embedding model, and
+  writes both `kind=chunk` and `kind=blob_marker` records into Qdrant.
+- `POST /checkpoint-blobs` updates in-memory checkpoint state and deletes Qdrant
+  points for removed blobs.
 
-This prevents large subagent fan-out, for example 30 documentation agents, from
-blocking on Qdrant or embedding work. Real Qdrant indexing remains available for
-non-CLI indexing tests and explicit indexing workflows.
+If codebase retrieval returns `Indexed blobs considered: 0`, first verify that
+this indexing chain is actually succeeding for the active workspace.
 
 ## Agent Usage Stats
 

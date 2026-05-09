@@ -68,6 +68,65 @@ function hasToolDefinitions(ctx: RequestContext): boolean {
   );
 }
 
+function recentAssistantLikeText(history: unknown, maxTurns = 3): string {
+  const items = asArray(history).slice(-maxTurns);
+  const chunks: string[] = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    const readOnlySubAgentIds = new Set<string>();
+    const responseText = text(record.response_text).trim();
+    if (responseText) chunks.push(responseText);
+    for (const node of asArray(record.response_nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const nodeRecord = node as JsonObject;
+      const toolUse = nodeRecord.tool_use;
+      if (
+        toolUse && typeof toolUse === "object" && !Array.isArray(toolUse)
+      ) {
+        const tool = toolUse as JsonObject;
+        const toolName = text(tool.tool_name).trim();
+        const toolUseId = text(tool.tool_use_id).trim();
+        if (
+          toolUseId &&
+          (toolName === "sub-agent-explore" || toolName === "sub-agent-plan")
+        ) {
+          readOnlySubAgentIds.add(toolUseId);
+        }
+      }
+      const textNode = nodeRecord.text_node;
+      if (
+        textNode && typeof textNode === "object" &&
+        !Array.isArray(textNode)
+      ) {
+        const content = text((textNode as JsonObject).content).trim();
+        if (content) chunks.push(content);
+      }
+      const content = text(nodeRecord.content).trim();
+      if (content) chunks.push(content);
+    }
+    for (const nodes of [record.request_nodes, record.response_nodes]) {
+      for (const node of asArray(nodes)) {
+        if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+        const toolResult = (node as JsonObject).tool_result_node;
+        if (
+          !toolResult || typeof toolResult !== "object" ||
+          Array.isArray(toolResult)
+        ) {
+          continue;
+        }
+        const result = toolResult as JsonObject;
+        const toolUseId = text(result.tool_use_id).trim();
+        if (!toolUseId || !readOnlySubAgentIds.has(toolUseId)) continue;
+        const content = text(result.content).trim();
+        if (content) chunks.push(content);
+      }
+    }
+  }
+  return chunks.join("\n").trim();
+}
+
 function isContinuationText(value: string): boolean {
   const normalized = value.trim().toLowerCase();
   return normalized === "继续" || normalized === "continue" ||
@@ -94,6 +153,23 @@ function isAuxiliaryContinuationSummaryRequestText(value: string): boolean {
   const lower = trimmed.toLowerCase();
   return lower.includes("create a compact continuation summary") &&
     lower.includes("continue the same task after context compaction");
+}
+
+function isExplicitSubAgentRequestText(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  return /\b(sub-?agents?|delegate|delegation|parallel(?:\s+agent\s+work|\s+tasks?|\s+work)?|multi-?agent)\b/i
+    .test(trimmed) ||
+    /并行任务|并行工作|子代理|委托|分工|多线程/.test(trimmed);
+}
+
+function seemsLikeParallelWorkRequest(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (/并行任务|并行工作|parallel(?:\s+agent\s+work|\s+tasks?|\s+work)/i.test(trimmed)) return true;
+  const numbered = (trimmed.match(/\b[1-9]\./g) ?? []).length;
+  return numbered >= 2 &&
+    /\b(parallel|independent|separate)\b/i.test(trimmed);
 }
 
 export function detectAgentExecutionMode(ctx: RequestContext): AgentExecutionMode {
@@ -126,11 +202,20 @@ export function detectAgentExecutionMode(ctx: RequestContext): AgentExecutionMod
   if (haystack.includes("read-only investigation sub-agent") || haystack.includes("sub-agent-explore")) {
     return AgentExecutionMode.Explore;
   }
+  if (haystack.includes("documentation sub-agent") || haystack.includes("sub-agent-doc")) {
+    return AgentExecutionMode.Docs;
+  }
+  if (haystack.includes("task-completion judge") || haystack.includes("sub-agent-judge")) {
+    return AgentExecutionMode.Judge;
+  }
   if (haystack.includes("sub-agent-code") || haystack.includes("writable implementation sub-agent")) {
     return AgentExecutionMode.Code;
   }
   if (haystack.includes("sub-agent-validate") || haystack.includes("validation sub-agent")) {
     return AgentExecutionMode.Validate;
+  }
+  if (haystack.includes("sub-agent prompt")) {
+    return AgentExecutionMode.SubAgent;
   }
   return AgentExecutionMode.Main;
 }
@@ -139,12 +224,32 @@ export function detectRequestIntent(ctx: RequestContext): RequestIntent {
   const body = objectBody(ctx);
   const currentText = currentNodeUserText(body.nodes) || text(body.message) ||
     text(body.prompt) || text(body.instruction);
-  const lower = currentText.trim().toLowerCase();
+  const trimmed = currentText.trim();
+  const lower = trimmed.toLowerCase();
+  const continuation = isContinuationText(currentText);
+  const recentAssistantText = continuation || !trimmed
+    ? recentAssistantLikeText(body.chat_history)
+    : "";
+  const recentLower = recentAssistantText.toLowerCase();
   if (isAuxiliaryTitleRequestText(currentText)) return RequestIntent.TitleOnly;
   if (isAuxiliaryContinuationSummaryRequestText(currentText)) {
     return RequestIntent.CompactSummary;
   }
-  if (isContinuationText(currentText)) return RequestIntent.Continue;
+  if (
+    continuation &&
+    /\b(return to the main thread|back to the main thread|ready to implement|proceed to implement|begin implementation|start implementation|now implement|implement the fix|apply the fix|edit the files|write the code)\b/i
+      .test(recentAssistantText)
+  ) {
+    return RequestIntent.Implement;
+  }
+  if (
+    continuation &&
+    /\b(return to the main thread|back to the main thread|ready to validate|proceed to validate|run the tests|run validation|compile and test|verify the build)\b/i
+      .test(recentAssistantText)
+  ) {
+    return RequestIntent.Validate;
+  }
+  if (continuation) return RequestIntent.Continue;
   if (
     /\b(plan|planning|开发计划|方案|评估后计划)\b/i.test(currentText)
   ) return RequestIntent.Plan;
@@ -157,6 +262,20 @@ export function detectRequestIntent(ctx: RequestContext): RequestIntent {
   if (
     /\b(explore|inspect|analyze|evaluate|调查|探索|评估|查看)\b/i.test(currentText)
   ) return RequestIntent.Evaluate;
+  if (
+    !trimmed &&
+    /\b(implement|fix|edit|refactor|write|modify|create|coding|修复|重构|修改|实现)\b/i
+      .test(recentLower)
+  ) {
+    return RequestIntent.Implement;
+  }
+  if (
+    !trimmed &&
+    /\b(test|tests|compile|build|validate|verify|运行|编译|测试|验收)\b/i
+      .test(recentLower)
+  ) {
+    return RequestIntent.Validate;
+  }
   if (!lower) return RequestIntent.Continue;
   return RequestIntent.Unknown;
 }
@@ -168,16 +287,30 @@ export function buildToolPolicy(
   const body = objectBody(ctx);
   const mode = detectAgentExecutionMode(ctx);
   const intent = detectRequestIntent(ctx);
-  const readOnly = mode === AgentExecutionMode.Explore;
+  const isSubAgentSession = mode !== AgentExecutionMode.Main &&
+    mode !== AgentExecutionMode.Summary &&
+    mode !== AgentExecutionMode.Title &&
+    mode !== AgentExecutionMode.Unknown;
+  const readOnly = mode === AgentExecutionMode.Explore ||
+    mode === AgentExecutionMode.Plan ||
+    mode === AgentExecutionMode.Docs ||
+    mode === AgentExecutionMode.Judge ||
+    mode === AgentExecutionMode.AskExpert ||
+    mode === AgentExecutionMode.SubAgent;
   const currentText = currentNodeUserText(body.nodes) || text(body.message) ||
     text(body.prompt) || text(body.instruction);
   const continuationSuppressed = intent === RequestIntent.TitleOnly ||
     intent === RequestIntent.CompactSummary;
+  const readOnlyCompletionMode = readOnly;
+  const explicitSubAgentRequest = isExplicitSubAgentRequestText(currentText);
+  const parallelWorkRequest = seemsLikeParallelWorkRequest(currentText);
   const retryStalledContinuation = !continuationSuppressed &&
+    !readOnlyCompletionMode &&
     (hasToolResultNodes(body.nodes) || isContinuationText(currentText) ||
       (!currentText.trim() && hasRecentHistoryToolResultNodes(body.chat_history)));
   const preferToolContinuation = hasToolDefinitions(ctx) &&
     !continuationSuppressed &&
+    !readOnlyCompletionMode &&
     (
       hasToolResultNodes(body.nodes) ||
       isContinuationText(currentText) ||
@@ -186,12 +319,14 @@ export function buildToolPolicy(
     );
   return {
     mode,
+    isSubAgentSession,
     intent,
     readOnly,
     preferToolContinuation,
     retryStalledContinuation,
-    allowAgentSwitching:
-      mode === AgentExecutionMode.Main || mode === AgentExecutionMode.Plan,
+    allowSubAgentsInMainThread:
+      !isSubAgentSession &&
+      (explicitSubAgentRequest || parallelWorkRequest),
     allowedToolNames,
   };
 }

@@ -528,6 +528,41 @@ function contextAfterParentDirectoryRecoveryFailure(
   };
 }
 
+function contextAfterReadOnlyHandoffToImplementation(
+  workspacePath: string,
+  agentName: "sub-agent-explore" | "sub-agent-plan" = "sub-agent-explore",
+): JsonObject {
+  const toolUseId = "call_readonly_handoff";
+  return {
+    path: workspacePath,
+    chat_history: [{
+      response_nodes: [{
+        id: 1,
+        type: 5,
+        tool_use: {
+          tool_name: agentName,
+          tool_use_id: toolUseId,
+          input_json: JSON.stringify({
+            action: "run",
+            name: agentName === "sub-agent-plan" ? "plan_zts" : "explore_zts",
+            instruction:
+              "Inspect the workspace, summarize findings, and return to the main thread when implementation should begin.",
+          }),
+        },
+      }],
+      request_nodes: [{
+        id: 2,
+        type: 1,
+        tool_result_node: {
+          tool_use_id: toolUseId,
+          content:
+            "I inspected the workspace and identified the relevant files. Return to the main thread to implement the fix now.",
+        },
+      }],
+    }],
+  };
+}
+
 async function withFakeOpenAIMessage(
   message: JsonObject,
   run: () => Promise<void>,
@@ -1080,8 +1115,8 @@ Deno.test("openai does not inject missing code and validate sub-agent tools", as
         }),
       );
       const names = toolNamesFromOpenAIRequestBody(requests[0].body);
-      assertEquals(names.includes("sub-agent-explore"), true);
-      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
       assertEquals(names.includes("sub-agent-code"), false);
       assertEquals(names.includes("sub-agent-validate"), false);
     },
@@ -1112,8 +1147,8 @@ Deno.test("codex does not inject missing code and validate sub-agent tools", asy
         }),
       );
       const names = toolNamesFromResponsesRequestBody(requests[0].body);
-      assertEquals(names.includes("sub-agent-explore"), true);
-      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
       assertEquals(names.includes("sub-agent-code"), false);
       assertEquals(names.includes("sub-agent-validate"), false);
     },
@@ -1146,11 +1181,11 @@ Deno.test("codex instructions only mention sub-agent roles exposed by client", a
       const instructions = String(requests[0].body.instructions ?? "");
       assertEquals(
         instructions.includes("sub-agent-explore is read-only"),
-        true,
+        false,
       );
       assertEquals(
         instructions.includes("sub-agent-plan is planning-only"),
-        true,
+        false,
       );
       assertEquals(
         instructions.includes("sub-agent-code is the writable"),
@@ -1192,18 +1227,135 @@ Deno.test("codex instructions prefer main-thread tools when only read-only sub-a
         instructions.includes(
           "Only read-only sub-agents are available in this session",
         ),
-        true,
+        false,
       );
       assertEquals(
         instructions.includes("Use the main-thread tools yourself"),
-        true,
+        false,
       );
       assertEquals(
         instructions.includes(
           "Do not repeatedly call sub-agent-explore or sub-agent-plan",
         ),
+        false,
+      );
+    },
+  );
+});
+
+Deno.test("openai main thread hides sub-agents by default", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message: "fix the file and run tests",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
+      assertEquals(names.includes("view"), true);
+      assertEquals(names.includes("save-file"), true);
+      assertEquals(names.includes("launch-process"), true);
+    },
+  );
+});
+
+Deno.test("openai main thread exposes sub-agents for explicit parallel delegation request", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message:
+            "Use parallel tasks: one agent explores the codebase and another agent prepares validation while the main thread keeps working.",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("sub-agent-explore"), true);
+      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-code"), true);
+      assertEquals(names.includes("sub-agent-validate"), true);
+    },
+  );
+});
+
+Deno.test("openai explicit parallel main-thread request mentions delegation-only guidance", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message:
+            "Use parallel tasks: one agent explores the codebase and another validates while I keep working in the main thread.",
+        }),
+      );
+      const instructions = JSON.stringify(requests[0].body);
+      assertEquals(
+        instructions.includes("Do not use sub-agents unless the current session explicitly exposes sub-agent tools"),
         true,
       );
+      assertEquals(
+        instructions.includes("Requests for depth, thoroughness, evaluation, planning, research, or codebase analysis alone are not permission"),
+        true,
+      );
+    },
+  );
+});
+
+Deno.test("openai main thread does not expose sub-agents for vague agent-mode wording", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message: "please use agent mode and think carefully about the refactor",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
     },
   );
 });
@@ -1227,8 +1379,8 @@ Deno.test("openai does not inject synthetic save-file into read-only sub-agent t
       );
       const names = toolNamesFromOpenAIRequestBody(requests[0].body);
       assertEquals(names.includes("save-file"), false);
-      assertEquals(names.includes("sub-agent-explore"), true);
-      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
       assertEquals(names.includes("sub-agent-code"), false);
       assertEquals(names.includes("sub-agent-validate"), false);
     },
@@ -1256,8 +1408,8 @@ Deno.test("openai prunes writable sub-agent roles from read-only sessions", asyn
         }),
       );
       const names = toolNamesFromOpenAIRequestBody(requests[0].body);
-      assertEquals(names.includes("sub-agent-explore"), true);
-      assertEquals(names.includes("sub-agent-plan"), true);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
       assertEquals(names.includes("sub-agent-code"), false);
       assertEquals(names.includes("sub-agent-validate"), false);
     },
@@ -1701,6 +1853,267 @@ Deno.test("openai continuation summary request does not force tool continuation"
   );
 });
 
+Deno.test("openai read-only explore sub-agent continuation does not force another tool call", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "I inspected the workspace and identified the relevant files. Return to the main thread to implement the fix." } }],
+        usage: { prompt_tokens: 9, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...readOnlySubAgentContext(),
+          chat_history: historyAfterToolResult("Directory listing result\n"),
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(requests[0].body.tool_choice === "required", false);
+      const messagesText = JSON.stringify(requests[0].body.messages);
+      assertEquals(messagesText.includes("Tool-continuation control"), false);
+      assertEquals(hasToolName(body, "view"), false);
+      assertEquals(
+        responseTextContains(body, "Return to the main thread to implement the fix."),
+        true,
+      );
+    },
+  );
+});
+
+Deno.test("openai stream read-only explore sub-agent continuation does not inject stall recovery", async () => {
+  await withCaptureFetch(
+    new Response(
+      [
+        `data: ${
+          JSON.stringify({
+            choices: [{
+              delta: {
+                content:
+                  "I inspected the workspace and identified the relevant files. Return to the main thread to implement the fix.",
+              },
+            }],
+          })
+        }`,
+        "data: [DONE]",
+        "",
+      ].join("\n\n"),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ),
+    async (requests) => {
+      const response = await forwardAugmentStream(
+        testConfig(),
+        testContext({
+          ...readOnlySubAgentContext(),
+          chat_history: historyAfterToolResult("Directory listing result\n"),
+          message: "continue",
+        }),
+      );
+      const objects = await collectStreamObjects(response);
+      assertEquals(requests[0].body.tool_choice === "required", false);
+      assertEquals(hasToolName(objects, "view"), false);
+      assertEquals(hasToolName(objects, "codebase-retrieval"), false);
+      assertEquals(
+        responseTextContains(
+          objects,
+          "Return to the main thread to implement the fix.",
+        ),
+        true,
+      );
+    },
+  );
+});
+
+Deno.test("openai main-thread continuation after explore handoff stays on main-thread tools", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "Implementation should start now." } }],
+        usage: { prompt_tokens: 9, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (_requests) => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...contextAfterReadOnlyHandoffToImplementation(
+            String(workspaceContext().path),
+            "sub-agent-explore",
+          ),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      assertEquals(hasToolName(body, "sub-agent-plan"), false);
+      assertEquals(hasToolName(body, "sub-agent-explore"), false);
+      assertEquals(hasToolName(body, "codebase-retrieval"), false);
+      assertEquals(hasToolName(body, "view"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.path, String(workspaceContext().path));
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("openai main-thread continuation after plan handoff stays on main-thread tools", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "Implementation should start now." } }],
+        usage: { prompt_tokens: 9, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (_requests) => {
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...contextAfterReadOnlyHandoffToImplementation(
+            String(workspaceContext().path),
+            "sub-agent-plan",
+          ),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      assertEquals(hasToolName(body, "sub-agent-plan"), false);
+      assertEquals(hasToolName(body, "sub-agent-explore"), false);
+      assertEquals(hasToolName(body, "codebase-retrieval"), false);
+      assertEquals(hasToolName(body, "view"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.path, String(workspaceContext().path));
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("verified chain main -> plan -> main uses local tools after handoff", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 9, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message:
+            "Use parallel tasks: create a planning agent for side analysis while the main thread keeps working.",
+        }),
+      );
+      const mainNames = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(mainNames.includes("sub-agent-plan"), true);
+
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          user_guidelines:
+            "You are a planning sub-agent that creates detailed implementation plans.",
+          message: "plan the refactor",
+        }),
+      );
+      const childNames = toolNamesFromOpenAIRequestBody(requests[1].body);
+      assertEquals(childNames.includes("sub-agent-plan"), false);
+      assertEquals(childNames.includes("sub-agent-code"), false);
+      assertEquals(childNames.includes("save-file"), false);
+      assertEquals(childNames.includes("view"), true);
+
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...contextAfterReadOnlyHandoffToImplementation(
+            String(workspaceContext().path),
+            "sub-agent-plan",
+          ),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      assertEquals(hasToolName(body, "view"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.path, String(workspaceContext().path));
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
+Deno.test("verified chain main -> explore -> code is blocked and main resumes locally", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 9, completion_tokens: 3 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message:
+            "Use parallel tasks: one agent explores the codebase while another validates side effects.",
+        }),
+      );
+      const mainNames = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(mainNames.includes("sub-agent-explore"), true);
+      assertEquals(mainNames.includes("sub-agent-code"), true);
+
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          user_guidelines:
+            "Read-only investigation sub-agent. Do NOT modify any files. Do NOT run any commands or launch any processes.",
+          message: "inspect the project",
+        }),
+      );
+      const childNames = toolNamesFromOpenAIRequestBody(requests[1].body);
+      assertEquals(childNames.includes("sub-agent-explore"), false);
+      assertEquals(childNames.includes("sub-agent-code"), false);
+      assertEquals(childNames.includes("save-file"), false);
+      assertEquals(childNames.includes("view"), true);
+
+      const response = await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...contextAfterReadOnlyHandoffToImplementation(
+            String(workspaceContext().path),
+            "sub-agent-explore",
+          ),
+          tool_definitions: [...mainThreadDefinitionsWithReadOnlySubAgents(), ...subAgentAllDefinitions()],
+          message: "continue",
+        }),
+      );
+      const body = await response.json() as JsonObject;
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
+      assertEquals(hasToolName(body, "view"), true);
+      const input = firstToolInput(body);
+      assertEquals(input.path, String(workspaceContext().path));
+      assertEquals(input.type, "directory");
+    },
+  );
+});
+
 Deno.test("openai stream continuation summary request does not force tool continuation", async () => {
   const summaryPrompt =
     "Create a compact continuation summary for this agent conversation. Preserve the user's explicit instructions, current objective, important decisions, files changed or inspected, commands run, test results, unresolved errors, and the next concrete steps. Do not invent facts. Prefer exact paths, symbols, command names, and error messages over general descriptions. Write the summary so the agent can continue the same task after context compaction without re-reading unrelated history.";
@@ -1982,10 +2395,7 @@ Deno.test("codex json does not rewrite explore sub-agent to unavailable code rol
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "sub-agent-code"), false);
-      assertEquals(hasToolName(body, "sub-agent-explore"), true);
-      const input = firstToolInput(body);
-      assertEquals(input.action, "run");
-      assertEquals(input.name, "worker1");
+      assertEquals(hasToolName(body, "sub-agent-explore"), false);
     },
   );
 });
@@ -2021,15 +2431,12 @@ Deno.test("codex json does not rewrite plan sub-agent to unavailable validate ro
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "sub-agent-validate"), false);
-      assertEquals(hasToolName(body, "sub-agent-plan"), true);
-      const input = firstToolInput(body);
-      assertEquals(input.action, "run");
-      assertEquals(input.name, "validator1");
+      assertEquals(hasToolName(body, "sub-agent-plan"), false);
     },
   );
 });
 
-Deno.test("codex json sub-agent run without name gets normalized default name", async () => {
+Deno.test("codex main thread suppresses direct sub-agent-code call when agent mode is not enabled", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -2056,15 +2463,12 @@ Deno.test("codex json sub-agent run without name gets normalized default name", 
         }),
       );
       const body = await response.json() as JsonObject;
-      assertEquals(hasToolName(body, "sub-agent-code"), true);
-      const input = firstToolInput(body);
-      assertEquals(input.action, "run");
-      assertEquals(input.name, "code_worker");
+      assertEquals(hasToolName(body, "sub-agent-code"), false);
     },
   );
 });
 
-Deno.test("codex json sub-agent run sanitizes invalid names", async () => {
+Deno.test("codex main thread suppresses direct sub-agent-validate call when agent mode is not enabled", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -2093,15 +2497,12 @@ Deno.test("codex json sub-agent run sanitizes invalid names", async () => {
         }),
       );
       const body = await response.json() as JsonObject;
-      assertEquals(hasToolName(body, "sub-agent-validate"), true);
-      const input = firstToolInput(body);
-      assertEquals(input.action, "run");
-      assertEquals(input.name, "validator_1_test");
+      assertEquals(hasToolName(body, "sub-agent-validate"), false);
     },
   );
 });
 
-Deno.test("codex json keeps genuine explore sub-agent calls unchanged", async () => {
+Deno.test("codex main thread suppresses direct sub-agent-explore call when agent mode is not enabled", async () => {
   await withFakeFetch(
     () =>
       new Response(
@@ -2131,14 +2532,14 @@ Deno.test("codex json keeps genuine explore sub-agent calls unchanged", async ()
         }),
       );
       const body = await response.json() as JsonObject;
-      assertEquals(hasToolName(body, "sub-agent-explore"), true);
+      assertEquals(hasToolName(body, "sub-agent-explore"), false);
       assertEquals(hasToolName(body, "sub-agent-code"), false);
       assertEquals(hasToolName(body, "sub-agent-validate"), false);
     },
   );
 });
 
-Deno.test("openai plan sub-agent keeps planning role available instead of read-only pruning", async () => {
+Deno.test("openai plan sub-agent is read-only and cannot spawn nested sub-agents", async () => {
   await withCaptureFetch(
     new Response(
       JSON.stringify({
@@ -2161,15 +2562,18 @@ Deno.test("openai plan sub-agent keeps planning role available instead of read-o
         }),
       );
       const names = toolNamesFromOpenAIRequestBody(requests[0].body);
-      assertEquals(names.includes("save-file"), true);
-      assertEquals(names.includes("launch-process"), true);
-      assertEquals(names.includes("sub-agent-code"), true);
-      assertEquals(names.includes("sub-agent-validate"), true);
+      assertEquals(names.includes("save-file"), false);
+      assertEquals(names.includes("launch-process"), false);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("view"), true);
     },
   );
 });
 
-Deno.test("openai json rewrites broad read-only sub-agent exploration to codebase-retrieval", async () => {
+Deno.test("openai main thread suppresses broad read-only sub-agent exploration when agent mode is not enabled", async () => {
   const workspacePath = String(workspaceContext().path);
   const expectedRoot = normalizeExpectedPath(
     workspacePath.replace(/\/proxy$/, ""),
@@ -2203,18 +2607,12 @@ Deno.test("openai json rewrites broad read-only sub-agent exploration to codebas
       );
       const body = await response.json() as JsonObject;
       assertEquals(hasToolName(body, "sub-agent-explore"), false);
-      assertEquals(hasToolName(body, "codebase-retrieval"), true);
-      const input = firstToolInput(body);
-      assertEquals(input.workspace_folder, expectedRoot);
-      assertEquals(
-        String(input.information_request).includes("overall project structure"),
-        true,
-      );
+      assertEquals(hasToolName(body, "codebase-retrieval"), false);
     },
   );
 });
 
-Deno.test("openai json rewrites broad code sub-agent exploration back to plan role", async () => {
+Deno.test("openai main thread suppresses broad code sub-agent exploration when agent mode is not enabled", async () => {
   await withFakeOpenAIMessage(
     {
       content: "",
@@ -2242,10 +2640,8 @@ Deno.test("openai json rewrites broad code sub-agent exploration back to plan ro
         }),
       );
       const body = await response.json() as JsonObject;
-      assertEquals(hasToolName(body, "sub-agent-plan"), true);
       assertEquals(hasToolName(body, "sub-agent-code"), false);
-      const input = firstToolInput(body);
-      assertEquals(input.name, "code_zts");
+      assertEquals(hasToolName(body, "sub-agent-plan"), false);
     },
   );
 });
@@ -2954,7 +3350,7 @@ Deno.test("openai stream stalled agent turn recovers with workspace view", async
   );
 });
 
-Deno.test("openai stream rewrites broad read-only sub-agent exploration to codebase-retrieval", async () => {
+Deno.test("openai stream suppresses broad read-only sub-agent exploration when agent mode is not enabled", async () => {
   const workspacePath = String(workspaceContext().path);
   const expectedRoot = normalizeExpectedPath(
     workspacePath.replace(/\/proxy$/, ""),
@@ -2986,13 +3382,7 @@ Deno.test("openai stream rewrites broad read-only sub-agent exploration to codeb
       );
       const objects = await collectStreamObjects(response);
       assertEquals(hasToolName(objects, "sub-agent-explore"), false);
-      assertEquals(hasToolName(objects, "codebase-retrieval"), true);
-      const input = firstToolInput(objects);
-      assertEquals(input.workspace_folder, expectedRoot);
-      assertEquals(
-        String(input.information_request).includes("overall project structure"),
-        true,
-      );
+      assertEquals(hasToolName(objects, "codebase-retrieval"), false);
     },
   );
 });
@@ -5994,6 +6384,212 @@ Deno.test("successful recovery codebase-retrieval suppresses repeated directory 
   }
 });
 
+Deno.test("successful codebase-retrieval is not repeated in subsequent turn", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects/augmentproxy/proxy",
+    prefix: "openai-adapter-codebase-repeat-",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content: "",
+        tool_calls: [{
+          id: "call_repeat_codebase",
+          type: "function",
+          function: {
+            name: "codebase-retrieval",
+            arguments: JSON.stringify({
+              workspace_folder: root,
+              information_request:
+                "Continue the user's task by identifying the concrete files and next implementation steps for: inspect architecture",
+            }),
+          },
+        }],
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "codebase-retrieval",
+                  tool_use_id: "call_codebase_1",
+                  input_json: JSON.stringify({
+                    workspace_folder: root,
+                    information_request:
+                      "Continue the user's task by identifying the concrete files and next implementation steps for: inspect architecture",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_codebase_1",
+                  content: "Information request: inspect architecture\nWorkspace root: " +
+                    root +
+                    "\nIndexed blobs considered: 34\nRelevant files and excerpts:\n1. src/main.ts (best score: 0.91)",
+                },
+              }],
+            }],
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "codebase-retrieval"), false);
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("empty codebase-retrieval result suppresses repeated continuation code search loop", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects",
+    prefix: "openai-adapter-empty-codebase-loop-",
+  });
+  try {
+    await withFakeOpenAIMessage(
+      {
+        content:
+          "Let me directly explore the project by viewing the key files directly instead of using the codebase retrieval index.",
+      },
+      async () => {
+        const response = await forwardAugmentJson(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "codebase-retrieval",
+                  tool_use_id: "call_empty_codebase_1",
+                  input_json: JSON.stringify({
+                    workspace_folder: root,
+                    information_request:
+                      "Continue the user's task by identifying the concrete files and next implementation steps for: the current coding task",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_empty_codebase_1",
+                  content: [
+                    "Codebase search - context engine",
+                    "Continue the user's task by identifying the concrete files and next implementation steps for: the current coding task",
+                    "Found 0 files",
+                  ].join("\n"),
+                },
+              }],
+            }],
+            tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+            message: "continue",
+          }),
+        );
+        const body = await response.json() as JsonObject;
+        assertEquals(hasToolName(body, "codebase-retrieval"), false);
+        assertEquals(hasToolName(body, "view"), true);
+        const input = firstToolInput(body);
+        assertEquals(input.path, root);
+        assertEquals(input.type, "directory");
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
+Deno.test("openai stream empty codebase-retrieval continuation recovers with workspace view after text-only intent", async () => {
+  const root = await Deno.makeTempDir({
+    dir: "/home/vscode/projects",
+    prefix: "openai-adapter-empty-codebase-stream-",
+  });
+  try {
+    await withCaptureFetch(
+      new Response(
+        [
+          `data: ${
+            JSON.stringify({
+              choices: [{
+                delta: {
+                  content:
+                    "Let me directly view the key files to understand the codebase:",
+                },
+              }],
+            })
+          }`,
+          "data: [DONE]",
+          "",
+        ].join("\n\n"),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      ),
+      async (requests) => {
+        const response = await forwardAugmentStream(
+          testConfig(),
+          testContext({
+            ...ideWorkspaceContext(root),
+            chat_history: [{
+              response_nodes: [{
+                id: 1,
+                type: 5,
+                tool_use: {
+                  tool_name: "codebase-retrieval",
+                  tool_use_id: "call_empty_codebase_stream_1",
+                  input_json: JSON.stringify({
+                    workspace_folder: root,
+                    information_request:
+                      "Continue the user's task by identifying the concrete files and next implementation steps for: the current coding task",
+                  }),
+                },
+              }],
+              request_nodes: [{
+                id: 2,
+                type: 1,
+                tool_result_node: {
+                  tool_use_id: "call_empty_codebase_stream_1",
+                  content: [
+                    "Codebase search - context engine",
+                    "Continue the user's task by identifying the concrete files and next implementation steps for: the current coding task",
+                    "Indexed blobs considered: 0",
+                    "Found 0 files",
+                  ].join("\n"),
+                },
+              }],
+            }],
+            tool_definitions: mainThreadDefinitionsWithReadOnlySubAgents(),
+            message: "continue",
+            mode: "CLI_AGENT",
+          }),
+        );
+        const objects = await collectStreamObjects(response);
+        assertEquals(requests[0].body.tool_choice, "required");
+        assertEquals(hasToolName(objects, "codebase-retrieval"), false);
+        assertEquals(hasToolName(objects, "view"), true);
+        const input = firstToolInput(objects);
+        assertEquals(input.path, root);
+        assertEquals(input.type, "directory");
+        const final = objects.find((item) => item.done === true);
+        assertEquals(
+          String(final?.response_text).includes(
+            "Let me directly view the key files",
+          ),
+          true,
+        );
+      },
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => undefined);
+  }
+});
+
 Deno.test("successful recovery view suppresses repeated auto-recovery loop", async () => {
   const root = await Deno.makeTempDir({
     dir: "/home/vscode/projects/augmentproxy/proxy",
@@ -8021,7 +8617,7 @@ Deno.test("forwardAugmentStream emits thinking even without content", async () =
   );
 });
 
-Deno.test("arbitrary agent transition: writable custom agent (e.g. doc) has access to all sub-agents", async () => {
+Deno.test("arbitrary agent transition: custom docs agent cannot spawn nested sub-agents", async () => {
   await withCaptureFetch(
     new Response(
       JSON.stringify({
@@ -8046,13 +8642,12 @@ Deno.test("arbitrary agent transition: writable custom agent (e.g. doc) has acce
         }),
       );
       const names = toolNamesFromOpenAIRequestBody(requests[0].body);
-      // Writable agent should have all sub-agents available
-      assertEquals(names.includes("sub-agent-explore"), true);
-      assertEquals(names.includes("sub-agent-plan"), true);
-      assertEquals(names.includes("sub-agent-code"), true);
-      assertEquals(names.includes("sub-agent-validate"), true);
-      assertEquals(names.includes("sub-agent-doc"), true);
-      assertEquals(names.includes("sub-agent-judge"), true);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
+      assertEquals(names.includes("sub-agent-doc"), false);
+      assertEquals(names.includes("sub-agent-judge"), false);
     },
   );
 });
@@ -8089,14 +8684,54 @@ Deno.test("arbitrary agent transition: read-only agent (e.g. plan) is restricted
       assertEquals(names.includes("launch-process"), false);
       // But SHOULD have view
       assertEquals(names.includes("view"), true);
-      // Read-only agents should have read-only sub-agents
-      assertEquals(names.includes("sub-agent-explore"), true);
-      assertEquals(names.includes("sub-agent-plan"), true);
-      // And MUST NOT have writable sub-agents, forcing a return to the main thread
+      // Read-only agents should not be able to spawn nested sub-agents
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
       assertEquals(names.includes("sub-agent-code"), false);
       assertEquals(names.includes("sub-agent-validate"), false);
       assertEquals(names.includes("sub-agent-doc"), false);
       assertEquals(names.includes("sub-agent-judge"), false);
+    },
+  );
+});
+
+Deno.test("openai custom judge agent is read-only and cannot spawn nested sub-agents", async () => {
+  await withCaptureFetch(
+    new Response(
+      JSON.stringify({
+        choices: [{ message: { content: "ok" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 2 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    ),
+    async (requests) => {
+      const allTools = [
+        { name: "save-file", description: "Write file" },
+        { name: "launch-process", description: "Run command" },
+        { name: "view", description: "Read file" },
+        ...subAgentAllDefinitions(),
+        { name: "sub-agent-doc", description: "Write docs" },
+        { name: "sub-agent-judge", description: "Evaluate code" },
+      ];
+      await forwardAugmentJson(
+        testConfig(),
+        testContext({
+          ...workspaceContext(),
+          tool_definitions: allTools,
+          user_guidelines: "You are a task-completion judge sub-agent.",
+          message: "judge whether the task is complete",
+        }),
+      );
+      const names = toolNamesFromOpenAIRequestBody(requests[0].body);
+      assertEquals(names.includes("save-file"), false);
+      assertEquals(names.includes("launch-process"), false);
+      assertEquals(names.includes("sub-agent-explore"), false);
+      assertEquals(names.includes("sub-agent-plan"), false);
+      assertEquals(names.includes("sub-agent-code"), false);
+      assertEquals(names.includes("sub-agent-validate"), false);
+      assertEquals(names.includes("sub-agent-doc"), false);
+      assertEquals(names.includes("sub-agent-judge"), false);
+      assertEquals(names.includes("view"), true);
     },
   );
 });

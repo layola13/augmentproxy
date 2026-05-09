@@ -1,5 +1,4 @@
 import type {
-  AgentExecutionMode,
   ChannelConfig,
   JsonObject,
   JsonValue,
@@ -12,7 +11,7 @@ import type {
   RequestIntent,
   ToolPolicy,
 } from "./types.ts";
-import { RepeatedFailureStage } from "./types.ts";
+import { AgentExecutionMode, RepeatedFailureStage } from "./types.ts";
 import {
   buildToolPolicy,
   detectAgentExecutionMode,
@@ -688,8 +687,19 @@ function toolResultLooksSuccessful(result: JsonObject): boolean {
     content.includes("no such file") ||
     content.includes("not found") ||
     content.includes("is a directory") ||
-    content.includes("tool call rejected")
+    content.includes("tool call rejected") ||
+    codebaseRetrievalResultLooksEmpty(content)
   );
+}
+
+function codebaseRetrievalResultLooksEmpty(content: string): boolean {
+  return /\bfound\s+0\s+files\b/i.test(content) ||
+    /\b0\s+files\s+found\b/i.test(content) ||
+    /\bworkspace index seems empty\b/i.test(content) ||
+    /\bcodebase-retrieval tool is returning irrelevant results\b/i.test(
+      content,
+    ) ||
+    /\bnot finding relevant files\b/i.test(content);
 }
 
 function currentNodeUserText(nodes: JsonValue): string {
@@ -1048,7 +1058,7 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     lines.push(
       "- You are a specialized READ-ONLY sub-agent. Your task is to investigate, read files, or make a plan.",
       "- You DO NOT have tools to write code, save files, or run tests.",
-      "- Once you have gathered the requested information or completed the plan, summarize your findings directly in your response and STOP. Do not keep searching endlessly.",
+      "- Once you have gathered the requested information or completed the plan, summarize your findings directly in your response and STOP. Return control to the main thread. Do not keep searching endlessly.",
     );
   } else {
     lines.push(
@@ -1069,6 +1079,8 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
     "- If str-replace-editor reports old_str not found or no changes, do not repeat the same edit call. Re-read the file and regenerate fresh old_str/new_str from current content.",
     "- For launch-process checks that may legitimately return no matches (for example grep probes), append `|| true` to avoid unnecessary hard-failure retries.",
     "- Use only tools listed in the current function-calling tool schema. Do not invent missing sub-agent roles or call sub-agent tools that are not listed.",
+    "- Do not use sub-agents unless the current session explicitly exposes sub-agent tools for an intentional delegation or parallel-work request.",
+    "- Requests for depth, thoroughness, evaluation, planning, research, or codebase analysis alone are not permission to spawn or switch to sub-agents.",
     "- For project evaluation, inspect the workspace root/directory first, then read specific files discovered from listings, then synthesize a final answer.",
     "- Final answers must be concise. While concrete tool work remains, use tools instead of appending follow-up suggestions.",
     "- If you already have a directory listing result, do not call view on the same root directory again in later turns. Move forward by reading specific files or using codebase-retrieval with a concrete information_request.",
@@ -1093,12 +1105,12 @@ function toolUseSystemPrompt(ctx: RequestContext): string {
       "- sub-agent-validate is the validation sub-agent: use it for compiling, testing, running commands, validation, or reproduction steps in the terminal.",
     );
   }
-  if (
+  if (!policy.isSubAgentSession &&
     (toolNames.has("sub-agent-explore") || toolNames.has("sub-agent-plan")) &&
     (toolNames.has("sub-agent-code") || toolNames.has("sub-agent-validate"))
   ) {
     lines.push(
-      "- If an explore or plan sub-agent discovers that implementation or validation is needed, switch immediately to an available writable or validation sub-agent instead of continuing with the wrong role.",
+      "- In the main thread, use sub-agents only for explicit delegation or truly parallel side work. Keep immediate critical-path implementation and validation in the main thread when direct tools are available.",
     );
   }
   if (shouldPreferMainThreadOverReadOnlySubAgents(toolNames)) {
@@ -1226,6 +1238,21 @@ function effectiveToolDefinitions(ctx: RequestContext): JsonObject[] {
   let base = toolDefinitions.filter((item): item is JsonObject =>
     Boolean(item) && typeof item === "object" && !Array.isArray(item)
   );
+  if (policy.isSubAgentSession) {
+    base = base.filter((tool) => {
+      const name = typeof tool.name === "string"
+        ? normalizeToolName(tool.name)
+        : "";
+      return !name.startsWith("sub-agent-");
+    });
+  } else if (!policy.allowSubAgentsInMainThread && policy.mode === AgentExecutionMode.Main) {
+    base = base.filter((tool) => {
+      const name = typeof tool.name === "string"
+        ? normalizeToolName(tool.name)
+        : "";
+      return !name.startsWith("sub-agent-");
+    });
+  }
   if (policy.readOnly) {
     const allowedReadOnlyTools = new Set([
       "view",
@@ -1312,126 +1339,7 @@ function unavailableToolRecovery(
   argumentsJson: string,
 ): { toolName: string; input: JsonObject } | undefined {
   if (availableTools.has(toolName)) return undefined;
-  let args: JsonObject = {};
-  try {
-    const parsed = JSON.parse(argumentsJson || "{}");
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      args = parsed as JsonObject;
-    }
-  } catch {
-    // Ignore malformed arguments here; invalidToolReason will report separately.
-  }
-  if (
-    (toolName === "save-file" || toolName === "str-replace-editor") &&
-    availableTools.has("sub-agent-code")
-  ) {
-    const path = typeof args.path === "string" ? args.path.trim() : "";
-    const instruction = path
-      ? `Edit or create the file at ${path}. Read the current file first if it exists, then apply the required code change and persist it with the tools available in this agent.`
-      : "Continue the implementation using the writable tools available in this agent. Read the target file first if it exists, then apply the code change.";
-    return {
-      toolName: "sub-agent-code",
-      input: { action: "run", name: "code_recovery", instruction },
-    };
-  }
-  if (
-    (toolName === "launch-process" || toolName === "read-process" ||
-      toolName === "write-process" || toolName === "kill-process") &&
-    availableTools.has("sub-agent-validate")
-  ) {
-    return {
-      toolName: "sub-agent-validate",
-      input: {
-        action: "run",
-        name: "validate_recovery",
-        instruction:
-          "Continue by running the necessary terminal or validation steps with the tools available in this agent. Inspect the latest failure, run the exact command needed, and keep going until the validation result is clear.",
-      },
-    };
-  }
   return undefined;
-}
-
-function injectMissingSubAgentToolDefinitions(
-  toolDefinitions: JsonObject[],
-): JsonObject[] {
-  const byName = new Map<string, JsonObject>();
-  for (const tool of toolDefinitions) {
-    const name = typeof tool.name === "string" ? tool.name : "";
-    if (name) byName.set(name, tool);
-  }
-  const hasExplore = byName.has("sub-agent-explore");
-  const hasPlan = byName.has("sub-agent-plan");
-  const hasCode = byName.has("sub-agent-code");
-  const hasValidate = byName.has("sub-agent-validate");
-  if ((hasCode && hasValidate)) {
-    return toolDefinitions;
-  }
-
-  if (!hasExplore && !hasPlan && !hasCode && !hasValidate) {
-    return toolDefinitions;
-  }
-
-  const injected = [...toolDefinitions];
-  if (!hasCode) {
-    injected.push(makeSyntheticSubAgentToolDefinition(
-      "sub-agent-code",
-      "code",
-      "Implements features and writes production code. Use this role for file creation, file edits, save-file, refactors, mkdir/setup work, and other write tasks. Do not use this role for destructive file removal.",
-    ));
-  }
-  if (!hasValidate) {
-    injected.push(makeSyntheticSubAgentToolDefinition(
-      "sub-agent-validate",
-      "validate",
-      "Tests implementations and validates correctness. Use this role for compilation, test runs, terminal commands, verification, and reproduction steps. Do not use this role for save-file edits.",
-    ));
-  }
-  return injected;
-}
-
-function makeSyntheticSubAgentToolDefinition(
-  toolName: string,
-  roleName: string,
-  roleDescription: string,
-): JsonObject {
-  return {
-    name: toolName,
-    description: [
-      "Run a single synchronous sub-agent in the same workspace. Inputs: instruction (string), name (string). Returns the sub-agent's last message and minimal edit metadata. This tool only returns when the sub-agent completed its work.",
-      "",
-      "**IMPORTANT: This tool can be run in parallel.** Multiple sub-agents can execute simultaneously with different names and instructions. Use parallel execution when you have multiple independent tasks that can be completed concurrently.",
-      "",
-      "Available actions:",
-      "• **run** - Execute a sub-agent with the given instruction (waits for completion)",
-      "• **output** - Show the response and file changes (if any) made by a completed sub-agent",
-      "",
-      `**Configuration:**\n- Name: ${roleName}\n- Description: ${roleDescription}`,
-    ].join("\n"),
-    input_schema_json: JSON.stringify({
-      type: "object",
-      properties: {
-        action: {
-          type: "string",
-          enum: ["run", "output"],
-          description:
-            "Action to perform:\n'run' - execute a sub-agent with the given instruction\n'output' - show the response and file changes (if any) made by a completed sub-agent",
-        },
-        name: {
-          type: "string",
-          description:
-            "Name of the sub-agent. Names must be unique and contain no spaces.\nFor 'run': provide a name for the new agent (required).\nFor 'output': provide the name of a completed agent to review (required).",
-        },
-        instruction: {
-          type: "string",
-          description:
-            "Detailed instruction for the sub-agent (required for 'run' action only).\nThe instruction should be clear and complete - the sub-agent will work independently to complete it.",
-        },
-      },
-      required: ["action"],
-    }),
-    tool_safety: 2,
-  };
 }
 
 function buildOpenAITools(ctx: RequestContext): JsonObject[] {
@@ -4488,6 +4396,7 @@ function toolResultIndicatesFailure(
   }
   const lower = content.toLowerCase();
   if (lower.includes("tool call rejected")) return true;
+  if (codebaseRetrievalResultLooksEmpty(lower)) return true;
   const returnCode = content.match(
     /<return-code>\s*(-?\d+)\s*<\/return-code>/i,
   );
@@ -4656,6 +4565,43 @@ function filterRepeatedDirectoryViewToolCalls(
       continue;
     }
     emittedDirectoryViews.add(directoryPath);
+    valid.push(call);
+  }
+  return { valid, repeated };
+}
+
+function filterPreviouslySuccessfulToolCalls(
+  toolCalls: JsonObject[],
+  successfulToolSignatures: Set<string>,
+  fallbackPath?: string,
+  launchCommandFallback?: string,
+  allowedTools?: Set<string>,
+): {
+  valid: JsonObject[];
+  repeated: JsonObject[];
+} {
+  const valid: JsonObject[] = [];
+  const repeated: JsonObject[] = [];
+  for (const call of toolCalls) {
+    const parsed = parseToolCall(
+      call,
+      fallbackPath,
+      launchCommandFallback,
+      allowedTools,
+    );
+    if (!parsed) {
+      valid.push(call);
+      continue;
+    }
+    if (parsed.name !== "codebase-retrieval") {
+      valid.push(call);
+      continue;
+    }
+    const signature = successfulRecoverySignature(parsed);
+    if (signature && successfulToolSignatures.has(signature)) {
+      repeated.push(call);
+      continue;
+    }
     valid.push(call);
   }
   return { valid, repeated };
@@ -5480,6 +5426,85 @@ function currentTaskText(ctx: RequestContext): string {
   ).trim();
 }
 
+function recentEmptyCodebaseRetrievalWorkspace(
+  ctx: RequestContext,
+  workspaceFolder?: string,
+  fallbackPath?: string,
+): string | undefined {
+  const body = objectBody(ctx);
+  const expectedWorkspace = workspaceFolder
+    ? canonicalizePath(workspaceFolder)
+    : "";
+  const toolById = new Map<string, ParsedToolCall>();
+  const rememberToolCalls = (nodes: JsonValue): void => {
+    for (const node of asArray(nodes)) {
+      const call = nodeToolUse(node);
+      if (!call) continue;
+      const parsed = parseToolCall(call, fallbackPath);
+      if (parsed) toolById.set(parsed.id, parsed);
+    }
+  };
+  const matchingEmptyResultWorkspace = (
+    nodes: JsonValue,
+  ): string | undefined => {
+    for (const node of asArray(nodes)) {
+      if (!node || typeof node !== "object" || Array.isArray(node)) continue;
+      const toolResult = (node as JsonObject).tool_result_node;
+      if (
+        !toolResult || typeof toolResult !== "object" ||
+        Array.isArray(toolResult)
+      ) continue;
+      const result = toolResult as JsonObject;
+      const id = typeof result.tool_use_id === "string"
+        ? result.tool_use_id
+        : "";
+      if (!id) continue;
+      const parsed = toolById.get(id);
+      if (!parsed || parsed.name !== "codebase-retrieval") continue;
+      let args: JsonObject;
+      try {
+        const decoded = JSON.parse(parsed.argumentsJson);
+        if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+          continue;
+        }
+        args = decoded as JsonObject;
+      } catch {
+        continue;
+      }
+      const callWorkspace = typeof args.workspace_folder === "string"
+        ? canonicalizePath(args.workspace_folder)
+        : "";
+      if (
+        expectedWorkspace &&
+        callWorkspace &&
+        callWorkspace !== expectedWorkspace &&
+        !pathEqualsOrInside(callWorkspace, expectedWorkspace) &&
+        !pathEqualsOrInside(expectedWorkspace, callWorkspace)
+      ) {
+        continue;
+      }
+      const content = text(result.content);
+      if (codebaseRetrievalResultLooksEmpty(content.toLowerCase())) {
+        return callWorkspace || workspaceFolder;
+      }
+    }
+    return undefined;
+  };
+
+  for (const item of asArray(body.chat_history).slice(-8)) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as JsonObject;
+    rememberToolCalls(record.response_nodes);
+    rememberToolCalls(record.request_nodes);
+    const requestMatch = matchingEmptyResultWorkspace(record.request_nodes);
+    if (requestMatch) return requestMatch;
+    const responseMatch = matchingEmptyResultWorkspace(record.response_nodes);
+    if (responseMatch) return responseMatch;
+  }
+  rememberToolCalls(body.nodes);
+  return matchingEmptyResultWorkspace(body.nodes);
+}
+
 function continuationRecoveryInformationRequest(ctx: RequestContext): string {
   const taskText = currentTaskText(ctx);
   if (taskText && !isContinuationText(taskText)) {
@@ -5530,7 +5555,12 @@ function recoveryToolNodesForToolContinuationStall(
   const retrievalWorkspace = retrievalWorkspaceFolderFromPath(
     workspacePath ?? fallbackPath,
   );
-  if (canUseRetrieval && retrievalWorkspace) {
+  const recentEmptyRetrievalWorkspace = recentEmptyCodebaseRetrievalWorkspace(
+    ctx,
+    retrievalWorkspace,
+    fallbackPath,
+  );
+  if (canUseRetrieval && retrievalWorkspace && !recentEmptyRetrievalWorkspace) {
     return [{
       id: startingId,
       type: 5,
@@ -5546,7 +5576,23 @@ function recoveryToolNodesForToolContinuationStall(
   }
 
   if (canUseView) {
-    const fallbackTarget = fallbackViewTarget(fallbackPath);
+    const emptyRetrievalTarget =
+      recentEmptyRetrievalWorkspace && pathExists(recentEmptyRetrievalWorkspace)
+      ? {
+        path: recentEmptyRetrievalWorkspace,
+        type: directoryExists(recentEmptyRetrievalWorkspace)
+          ? "directory"
+          : "file",
+      }
+      : undefined;
+    const fallbackTarget = recentEmptyRetrievalWorkspace && emptyRetrievalTarget
+      ? emptyRetrievalTarget
+      : workspacePath && pathExists(workspacePath)
+      ? {
+        path: workspacePath,
+        type: directoryExists(workspacePath) ? "directory" : "file",
+      }
+      : fallbackViewTarget(fallbackPath);
     if (fallbackTarget) {
       return [{
         id: startingId,
@@ -6748,7 +6794,14 @@ export async function forwardAugmentJson(
       undefined,
       strictAllowedTools,
     );
-    const candidateToolCalls = directoryFilter.valid;
+    const successfulFilter = filterPreviouslySuccessfulToolCalls(
+      directoryFilter.valid,
+      successfulToolSignatures,
+      fallbackPath,
+      undefined,
+      strictAllowedTools,
+    );
+    const candidateToolCalls = successfulFilter.valid;
     const directoryRecoveryNodes = candidateToolCalls.length === 0 &&
         repeatedFilter.recoveryNodes.length === 0
       ? recoveryToolNodesForRepeatedDirectoryViews(
@@ -6851,6 +6904,13 @@ export async function forwardAugmentJson(
           undefined,
           strictAllowedTools,
         );
+        const successfulFilter = filterPreviouslySuccessfulToolCalls(
+          directoryFilter.valid,
+          successfulToolSignatures,
+          fallbackPath,
+          undefined,
+          strictAllowedTools,
+        );
         const directoryRecoveryNodes = directoryFilter.valid.length === 0 &&
             repeatedFilter.recoveryNodes.length === 0
           ? recoveryToolNodesForRepeatedDirectoryViews(
@@ -6888,13 +6948,13 @@ export async function forwardAugmentJson(
           );
         }
         const invalidToolCalls = invalidToolCallSummaries(
-          directoryFilter.valid,
+          successfulFilter.valid,
           fallbackPath,
           undefined,
           strictAllowedTools,
         );
         const validToolNodes = toolCallsToNodes(
-          directoryFilter.valid,
+          successfulFilter.valid,
           1,
           fallbackPath,
           undefined,
@@ -7879,6 +7939,13 @@ export async function forwardAugmentStream(
             launchCommandFallback,
             strictAllowedTools,
           );
+          const successfulFilter = filterPreviouslySuccessfulToolCalls(
+            directoryFilter.valid,
+            successfulToolSignatures,
+            fallbackPath,
+            launchCommandFallback,
+            strictAllowedTools,
+          );
           const directoryRecoveryNodes = directoryFilter.valid.length === 0 &&
               repeatedFilter.recoveryNodes.length === 0
             ? recoveryToolNodesForRepeatedDirectoryViews(
@@ -7926,7 +7993,7 @@ export async function forwardAugmentStream(
             );
           }
           const invalidToolCalls = invalidToolCallSummaries(
-            directoryFilter.valid,
+            successfulFilter.valid,
             fallbackPath,
             launchCommandFallback,
             strictAllowedTools,
@@ -7937,7 +8004,7 @@ export async function forwardAugmentStream(
               invalidToolCalls,
             });
           }
-          const nonInvalidToolCalls = directoryFilter.valid.filter((call) => {
+          const nonInvalidToolCalls = successfulFilter.valid.filter((call) => {
             const parsed = parseToolCall(
               call,
               fallbackPath,

@@ -34,7 +34,8 @@ export interface IndexedChunkHit {
 }
 
 const indexedBlobs = new Set<string>();
-const checkpoints = new Map<string, string[]>();
+const checkpoints = new Map<string, Map<string, string>>();
+const blobPaths = new Map<string, string>();
 const seenUploads = new Map<
   string,
   { path: string; contentLength: number; seenAt: string }
@@ -111,6 +112,85 @@ function bodyObject(ctx: RequestContext): JsonObject {
   return ctx.body && typeof ctx.body === "object" && !Array.isArray(ctx.body)
     ? ctx.body
     : {};
+}
+
+function stringArray(value: JsonValue | undefined): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function cloneCheckpointState(
+  state?: Map<string, string>,
+): Map<string, string> {
+  return new Map(state?.entries() ?? []);
+}
+
+function checkpointStateFromDelta(
+  checkpointId: string | undefined,
+  addedBlobNames: string[],
+  deletedBlobNames: string[],
+): Map<string, string> {
+  const nextState = cloneCheckpointState(
+    checkpointId ? checkpoints.get(checkpointId) : undefined,
+  );
+  for (const blobName of deletedBlobNames) nextState.delete(blobName);
+  for (const blobName of addedBlobNames) {
+    const filePath = blobPaths.get(blobName) ?? nextState.get(blobName) ?? "";
+    nextState.set(blobName, filePath);
+  }
+  return nextState;
+}
+
+export function rememberBlobPath(blobName: string, path: string): void {
+  const trimmed = path.trim();
+  if (!blobName || !trimmed) return;
+  blobPaths.set(blobName, trimmed);
+}
+
+export function rememberBlobFileInfos(fileInfos: JsonValue[]): void {
+  for (const fileInfo of fileInfos) {
+    if (!fileInfo || typeof fileInfo !== "object" || Array.isArray(fileInfo)) {
+      continue;
+    }
+    const record = fileInfo as JsonObject;
+    const blobName = typeof record.blob_name === "string"
+      ? record.blob_name
+      : "";
+    const filePath = typeof record.file_path === "string"
+      ? record.file_path
+      : "";
+    rememberBlobPath(blobName, filePath);
+  }
+}
+
+export function resolveBlobsetFileInfos(blobset: JsonObject): JsonObject[] {
+  const existingFileInfos = Array.isArray(blobset.file_infos)
+    ? blobset.file_infos.filter((item): item is JsonObject =>
+      Boolean(item) && typeof item === "object" && !Array.isArray(item)
+    )
+    : [];
+  if (existingFileInfos.length > 0) {
+    rememberBlobFileInfos(existingFileInfos);
+    return existingFileInfos.map((fileInfo) =>
+      JSON.parse(JSON.stringify(fileInfo)) as JsonObject
+    );
+  }
+
+  const state = checkpointStateFromDelta(
+    typeof blobset.checkpoint_id === "string" ? blobset.checkpoint_id : undefined,
+    stringArray(blobset.added_blobs),
+    stringArray(blobset.deleted_blobs),
+  );
+  const fileInfos = [...state.entries()]
+    .filter(([, filePath]) => filePath.trim().length > 0)
+    .sort((a, b) => a[1].localeCompare(b[1]) || a[0].localeCompare(b[0]))
+    .map(([blobName, filePath]) => ({
+      blob_name: blobName,
+      file_path: filePath,
+    }));
+  rememberBlobFileInfos(fileInfos);
+  return fileInfos;
 }
 
 async function sha256Hex(input: string): Promise<string> {
@@ -204,45 +284,6 @@ async function upsertBlobMarker(
   if (!response.ok) {
     throw new Error(
       `Qdrant marker upsert failed: ${response.status} ${await response
-        .text()}`,
-    );
-  }
-}
-
-async function upsertOrphanBlobMarkers(
-  config: ProxyConfig,
-  blobNames: string[],
-): Promise<void> {
-  if (blobNames.length === 0) return;
-  await ensureCollection(config);
-  const points = [];
-  for (const blobName of blobNames) {
-    points.push({
-      id: await pointId(`blob-marker:${blobName}`),
-      vector: markerVector(config),
-      payload: {
-        kind: "blob_marker",
-        blob_name: blobName,
-        path: "",
-        content_length: 0,
-        orphan: true,
-        indexed_at: new Date().toISOString(),
-      },
-    });
-  }
-  const response = await qdrantRequest(
-    config,
-    `/collections/${
-      encodeURIComponent(config.qdrantCollection)
-    }/points?wait=true`,
-    {
-      method: "PUT",
-      body: JSON.stringify({ points }),
-    },
-  );
-  if (!response.ok) {
-    throw new Error(
-      `Qdrant orphan marker upsert failed: ${response.status} ${await response
         .text()}`,
     );
   }
@@ -558,25 +599,11 @@ export async function indexFindMissing(
     !existing.has(name) && !indexedBlobs.has(name)
   );
   const unknownSamples = unknown.slice(0, 20);
-  const orphanUnknown = unknown.filter((name) =>
-    !seenUploads.has(name) && !pendingUploads.has(name)
-  );
-  if (orphanUnknown.length > 0) {
-    await upsertOrphanBlobMarkers(config, orphanUnknown);
-    for (const name of orphanUnknown) indexedBlobs.add(name);
-    logInfo(config, "index:find-missing:orphan-markers", {
-      requestId: ctx.requestId,
-      count: orphanUnknown.length,
-      samples: orphanUnknown.slice(0, 20),
-    });
-  }
-  const returnedUnknown = unknown.filter((name) => !orphanUnknown.includes(name));
   logInfo(config, "index:find-missing:end", {
     requestId: ctx.requestId,
     names: names.length,
     existing: existing.size,
-    unknown: returnedUnknown.length,
-    orphanUnknown: orphanUnknown.length,
+    unknown: unknown.length,
     unknownSamples,
     seenUploads: unknownSamples.map((name) => ({
       name,
@@ -584,7 +611,7 @@ export async function indexFindMissing(
     })),
     ms: Date.now() - start,
   });
-  return { unknown_memory_names: returnedUnknown, nonindexed_blob_names: [] };
+  return { unknown_memory_names: unknown, nonindexed_blob_names: [] };
 }
 
 export async function indexBatchUpload(
@@ -597,6 +624,14 @@ export async function indexBatchUpload(
     requestId: ctx.requestId,
     blobs: blobs.length,
   });
+  for (const blob of blobs) {
+    rememberBlobPath(blob.blobName, blob.path);
+    seenUploads.set(blob.blobName, {
+      path: blob.path,
+      contentLength: blob.content.length,
+      seenAt: new Date().toISOString(),
+    });
+  }
   if (config.indexingMode !== "real") {
     return { blob_names: blobs.map((blob) => blob.blobName) };
   }
@@ -607,11 +642,6 @@ export async function indexBatchUpload(
   for (const blob of blobs) {
     const pending = pendingUploads.get(blob.blobName);
     try {
-      seenUploads.set(blob.blobName, {
-        path: blob.path,
-        contentLength: blob.content.length,
-        seenAt: new Date().toISOString(),
-      });
       await deleteBlobPoints(config, [blob.blobName]);
       const chunks = chunkText(config, blob);
       const embeddings = await embedTexts(
@@ -657,16 +687,31 @@ export async function indexCheckpoint(
       typeof name === "string"
     )
     : [];
+  const baseCheckpointId = typeof blobs.checkpoint_id === "string"
+    ? blobs.checkpoint_id
+    : undefined;
   if (config.indexingMode === "real") await deleteBlobPoints(config, deleted);
   for (const name of deleted) indexedBlobs.delete(name);
   for (const name of added) indexedBlobs.add(name);
+  const nextState = checkpointStateFromDelta(baseCheckpointId, added, deleted);
   const checkpointId = `checkpoint_${crypto.randomUUID()}`;
-  checkpoints.set(checkpointId, [...indexedBlobs]);
+  checkpoints.set(checkpointId, nextState);
   return { new_checkpoint_id: checkpointId };
 }
 
 export function resolveCheckpointBlobNames(checkpointId: string): string[] {
-  return checkpoints.get(checkpointId) ?? [];
+  const state = checkpoints.get(checkpointId);
+  return state ? [...state.keys()] : [];
+}
+
+export function resetIndexerStateForTest(): void {
+  indexedBlobs.clear();
+  checkpoints.clear();
+  blobPaths.clear();
+  seenUploads.clear();
+  pendingUploads.clear();
+  pointIdCache.clear();
+  collectionReady = undefined;
 }
 
 export async function searchIndexedChunks(

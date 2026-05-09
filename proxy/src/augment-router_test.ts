@@ -3,6 +3,7 @@ import {
   resetFakeAgentsForTest,
   resetIndexedCommitBlobsetsForTest,
 } from "./fake-augment.ts";
+import { resetIndexerStateForTest } from "./indexer.ts";
 import type { JsonObject, ProxyConfig, RequestContext } from "./types.ts";
 
 function assertEquals(actual: unknown, expected: unknown): void {
@@ -112,6 +113,7 @@ Deno.test({
   name: "reset fake agents state",
   fn() {
     resetFakeAgentsForTest();
+    resetIndexerStateForTest();
   },
   sanitizeOps: false,
   sanitizeResources: false,
@@ -178,6 +180,89 @@ Deno.test("indexed commits persist registered blobsets across cache reload", asy
   }
 });
 
+Deno.test("indexed commits expand checkpoint blobsets into file infos", async () => {
+  const cachePath = await Deno.makeTempFile({ suffix: ".json" });
+  try {
+    await withIndexedCommitCache(cachePath, async () => {
+      resetIndexerStateForTest();
+
+      await routeAugment(
+        {
+          ...testConfig(),
+          indexingMode: "capture",
+        },
+        requestContext("batch-upload", {
+          blobs: [{
+            blob_name: "blob-a",
+            path: "/workspace/src/a.ts",
+            content: "export const a = 1;\n",
+          }, {
+            blob_name: "blob-b",
+            path: "/workspace/src/b.ts",
+            content: "export const b = 2;\n",
+          }],
+        }),
+      );
+
+      const checkpointResponse = await routeAugment(
+        {
+          ...testConfig(),
+          indexingMode: "capture",
+        },
+        requestContext("checkpoint-blobs", {
+          blobs: {
+            checkpoint_id: null,
+            added_blobs: ["blob-a", "blob-b"],
+            deleted_blobs: [],
+          },
+        }),
+      );
+      const checkpointBody = await checkpointResponse.json() as JsonObject;
+      const checkpointId = checkpointBody.new_checkpoint_id;
+      if (typeof checkpointId !== "string" || !checkpointId) {
+        throw new Error("expected checkpoint id");
+      }
+
+      const registerResponse = await routeAugment(
+        testConfig(),
+        requestContext("indexed-commits/register-blobset", {
+          commit: {
+            commit_sha: "sha-expanded",
+            commit_time: "2026-05-08T12:00:00.000Z",
+          },
+          blobs: {
+            checkpoint_id: checkpointId,
+            added_blobs: [],
+            deleted_blobs: [],
+          },
+        }),
+      );
+      assertEquals(await registerResponse.json(), { ok: true });
+
+      resetIndexedCommitBlobsetsForTest();
+      const latestResponse = await routeAugment(
+        testConfig(),
+        requestContext("indexed-commits/get-latest-blobset", {
+          commit_shas: ["sha-expanded"],
+        }),
+      );
+      assertEquals(
+        await parseNdjsonResponse(latestResponse),
+        [{
+          commit_sha: "sha-expanded",
+          file_infos: [
+            { blob_name: "blob-a", file_path: "/workspace/src/a.ts" },
+            { blob_name: "blob-b", file_path: "/workspace/src/b.ts" },
+          ],
+        }],
+      );
+    });
+  } finally {
+    await Deno.remove(cachePath).catch(() => undefined);
+    resetIndexerStateForTest();
+  }
+});
+
 Deno.test("list-remote-tools preserves request order", async () => {
   const response = await routeAugment(
     testConfig(),
@@ -226,70 +311,139 @@ Deno.test("check-tool-safety returns a concrete safety response", async () => {
   assertEquals(body.is_safe, true);
 });
 
-Deno.test("cli find-missing bypasses real indexing and qdrant", async () => {
-  const config = {
-    ...testConfig(),
-    indexingMode: "real",
-    qdrantUrl: "http://127.0.0.1:1",
-  };
-  const response = await routeAugment(
-    config,
-    cliRequestContext("find-missing", {
-      model: "",
-      mem_object_names: ["blob-a", "blob-b"],
-    }),
-  );
-  const body = await response.json() as JsonObject;
-  assertEquals(body.unknown_memory_names, []);
-  assertEquals(body.nonindexed_blob_names, []);
-});
-
-Deno.test("cli batch-upload bypasses real indexing and embeddings", async () => {
+Deno.test("cli find-missing in real mode returns unknown blobs instead of faking completion", async () => {
   const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  (globalThis as any).fetch = () => {
-    fetchCalls += 1;
-    throw new Error("qdrant or embedding should not be called");
+  const fetchCalls: string[] = [];
+  (globalThis as any).fetch = async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => {
+    const url = String(input);
+    fetchCalls.push(`${init?.method ?? "GET"} ${url}`);
+    if (url.endsWith("/collections/test_collection")) {
+      return new Response(JSON.stringify({ status: "green" }), { status: 200 });
+    }
+    if (url.endsWith("/collections/test_collection/points")) {
+      return new Response(JSON.stringify({ result: [] }), { status: 200 });
+    }
+    if (url.endsWith("/collections/test_collection/points/scroll")) {
+      return new Response(
+        JSON.stringify({ result: { points: [], next_page_offset: null } }),
+        { status: 200 },
+      );
+    }
+    throw new Error(`unexpected fetch ${url}`);
   };
   try {
     const config = {
       ...testConfig(),
       indexingMode: "real",
-      embedBaseUrl: "http://127.0.0.1:1/v1",
-      qdrantUrl: "http://127.0.0.1:1",
+      qdrantUrl: "http://qdrant.test",
+      qdrantCollection: "test_collection",
+      embedDimensions: 3,
+    };
+    const response = await routeAugment(
+      config,
+      cliRequestContext("find-missing", {
+        model: "",
+        mem_object_names: ["blob-a", "blob-b"],
+      }),
+    );
+    const body = await response.json() as JsonObject;
+    assertEquals(body.unknown_memory_names, ["blob-a", "blob-b"]);
+    assertEquals(body.nonindexed_blob_names, []);
+    assertEquals(fetchCalls.includes("GET http://qdrant.test/collections/test_collection"), true);
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+    resetIndexerStateForTest();
+  }
+});
+
+Deno.test("cli batch-upload in real mode uses embeddings and qdrant", async () => {
+  const originalFetch = globalThis.fetch;
+  const fetchCalls: string[] = [];
+  (globalThis as any).fetch = async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => {
+    const url = String(input);
+    fetchCalls.push(`${init?.method ?? "GET"} ${url}`);
+    if (url === "http://embed.test/v1/embeddings") {
+      return new Response(
+        JSON.stringify({ data: [{ embedding: [0.11, 0.22, 0.33] }] }),
+        { status: 200 },
+      );
+    }
+    if (url.endsWith("/collections/test_collection")) {
+      return new Response(JSON.stringify({ status: "green" }), { status: 200 });
+    }
+    if (url.endsWith("/collections/test_collection/points/delete")) {
+      return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+    }
+    if (url.endsWith("/collections/test_collection/points?wait=true")) {
+      return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  try {
+    const config = {
+      ...testConfig(),
+      indexingMode: "real",
+      embedBaseUrl: "http://embed.test/v1",
+      embedModel: "test-embed",
+      embedDimensions: 3,
+      qdrantUrl: "http://qdrant.test",
+      qdrantCollection: "test_collection",
+      indexChunkChars: 64,
+      indexChunkOverlap: 8,
     };
     const response = await routeAugment(
       config,
       cliRequestContext("batch-upload", {
-        blobs: [
-          {
-            blob_name: "blob-a",
-            path: "/home/vscode/projects/example/a.ts",
-            content: "const a = 1;",
-          },
-        ],
+        blobs: [{
+          blob_name: "blob-a",
+          path: "/home/vscode/projects/example/a.ts",
+          content: "const a = 1;",
+        }],
       }),
     );
     const body = await response.json() as JsonObject;
     assertEquals(body.blob_names, ["blob-a"]);
-    assertEquals(fetchCalls, 0);
+    assertEquals(fetchCalls.includes("POST http://embed.test/v1/embeddings"), true);
+    assertEquals(
+      fetchCalls.includes("PUT http://qdrant.test/collections/test_collection/points?wait=true"),
+      true,
+    );
   } finally {
     (globalThis as any).fetch = originalFetch;
+    resetIndexerStateForTest();
   }
 });
 
-Deno.test("cli checkpoint-blobs bypasses real qdrant delete", async () => {
+Deno.test("cli checkpoint-blobs in real mode applies real delete flow", async () => {
   const originalFetch = globalThis.fetch;
-  let fetchCalls = 0;
-  (globalThis as any).fetch = () => {
-    fetchCalls += 1;
-    throw new Error("qdrant should not be called");
+  const fetchCalls: string[] = [];
+  (globalThis as any).fetch = async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => {
+    const url = String(input);
+    fetchCalls.push(`${init?.method ?? "GET"} ${url}`);
+    if (url.endsWith("/collections/test_collection")) {
+      return new Response(JSON.stringify({ status: "green" }), { status: 200 });
+    }
+    if (url.endsWith("/collections/test_collection/points/delete")) {
+      return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
   };
   try {
     const config = {
       ...testConfig(),
       indexingMode: "real",
-      qdrantUrl: "http://127.0.0.1:1",
+      qdrantUrl: "http://qdrant.test",
+      qdrantCollection: "test_collection",
+      embedDimensions: 3,
     };
     const response = await routeAugment(
       config,
@@ -302,9 +456,13 @@ Deno.test("cli checkpoint-blobs bypasses real qdrant delete", async () => {
     );
     const body = await response.json() as JsonObject;
     assertEquals(typeof body.new_checkpoint_id, "string");
-    assertEquals(fetchCalls, 0);
+    assertEquals(
+      fetchCalls.includes("POST http://qdrant.test/collections/test_collection/points/delete"),
+      true,
+    );
   } finally {
     (globalThis as any).fetch = originalFetch;
+    resetIndexerStateForTest();
   }
 });
 

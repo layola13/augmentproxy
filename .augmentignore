@@ -4,3 +4,4 @@ proxy/.env
 proxy/.env.*
 .git/**
 node_modules/**
+augment.mjs

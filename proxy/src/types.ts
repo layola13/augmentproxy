@@ -95,6 +95,9 @@ export enum AgentExecutionMode {
   Plan = "plan",
   Code = "code",
   Validate = "validate",
+  Docs = "docs",
+  Judge = "judge",
+  SubAgent = "subagent",
   Summary = "summary",
   Title = "title",
   AskExpert = "askexpert",
@@ -123,11 +126,12 @@ export enum RepeatedFailureStage {
 
 export interface ToolPolicy {
   mode: AgentExecutionMode;
+  isSubAgentSession: boolean;
   intent: RequestIntent;
   readOnly: boolean;
   preferToolContinuation: boolean;
   retryStalledContinuation: boolean;
-  allowAgentSwitching: boolean;
+  allowSubAgentsInMainThread: boolean;
   allowedToolNames?: Set<string>;
 }
 

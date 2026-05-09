@@ -152,10 +152,15 @@ QDRANT_URL=http://127.0.0.1:6333
 QDRANT_COLLECTION=augmentproxy_workspace
 ```
 
-Agent / subagent 会话不再依赖 Qdrant。即使 `AUGMENT_INDEXING_MODE=real`，
-来自 Augment CLI / Auggie 的 `/find-missing`、`/batch-upload`、
-`/checkpoint-blobs` 会快速返回，不做 embedding 和 Qdrant 写入，避免大量
-subagents 并发时因为索引探测超时导致 agent 失败。
+当 `AUGMENT_INDEXING_MODE=real` 时，Augment CLI / Auggie 的
+`/find-missing`、`/batch-upload`、`/checkpoint-blobs` 现在会走真实
+indexing 链路：
+- `/find-missing` 会查询 Qdrant 已有 blob marker，返回真正未知的 blobs
+- `/batch-upload` 会调用 embedding 模型并把 chunk 写入 Qdrant
+- `/checkpoint-blobs` 会维护真实 checkpoint 状态，并对删除 blobs 执行删除
+
+Agent / subagent 的对话执行本身不依赖 codebase-retrieval 才能继续，但如果要让
+`codebase-retrieval` 真正命中源码，必须保证这条 indexing 链路可用。
 
 子代理 token 统计接口：
 
@@ -380,31 +385,39 @@ See detailed examples in `proxy/README.md`.
       - `write-process`
       - `kill-process`
       - `list-processes`
-    - 同时强制补出两个升级出口：
-      - `sub-agent-code`
-      - `sub-agent-validate`
-  - 新增“只读子代理误用恢复”：
-    - 如果只读子代理里出现不可用的 `save-file` / `str-replace-editor`，自动改派到 `sub-agent-code`
-    - 如果只读子代理里出现不可用的 `launch-process` / `read-process` / `write-process` / `kill-process`，自动改派到 `sub-agent-validate`
-  - 这个恢复逻辑同时覆盖：
-    - JSON 响应
-    - 流式响应
-    - repeated-failure 死循环恢复
-    - stale `Tool call rejected` 文本恢复
+  - 新增“主线程默认禁用子代理”策略：
+    - 主线程默认不暴露 `sub-agent-*`
+    - 只有用户明确要求 agent / delegation / parallel work，或任务明确需要并行 sidecar，才在主线程暴露 `sub-agent-*`
+    - 仅仅因为任务复杂、需要评估、需要详细计划，不会自动启用 agent 模式
+  - 新增“子代理禁止嵌套派生”策略：
+    - `plan` / `explore` / `docs` / `judge` / `askexpert` 等子代理会话不再继续暴露 `sub-agent-*`
+    - 主线程已有直接工具时，不再把不可用的写入/验证调用偷偷自动改派到另一个子代理
 
 ### 回归测试
 
 - 新增并通过：
   - `spawn-agent preserves inferred mode and session metadata`
-  - `openai does not inject synthetic save-file into read-only sub-agent tool list`
-  - `openai prunes terminal tools and injects code/validate for actual read-only client session`
-  - `codex json unavailable save-file in read-only child switches to sub-agent-code`
-  - `codex json unavailable launch-process in read-only child switches to sub-agent-validate`
-  - `codex json actual read-only client launch-process is rerouted to sub-agent-validate`
+  - `openai main thread hides sub-agents by default`
+  - `openai main thread exposes sub-agents for explicit parallel delegation request`
+  - `openai explicit parallel main-thread request mentions delegation-only guidance`
+  - `openai plan sub-agent is read-only and cannot spawn nested sub-agents`
+  - `arbitrary agent transition: custom docs agent cannot spawn nested sub-agents`
+  - `openai custom judge agent is read-only and cannot spawn nested sub-agents`
+  - `empty codebase-retrieval result suppresses repeated continuation code search loop`
 - 当前验证结果：
   - `deno check proxy/src/openai-adapter.ts proxy/src/augment-router.ts proxy/src/fake-augment.ts proxy/src/openai-adapter_test.ts proxy/src/augment-router_test.ts`
   - `deno test -A proxy/src/augment-router_test.ts proxy/src/openai-adapter_test.ts`
-  - 结果：`108 passed | 0 failed`
+  - 结果：`160 passed | 0 failed`
+  - 新增流式回归：
+    - `openai stream empty codebase-retrieval continuation recovers with workspace view after text-only intent`
+
+- 新增日志诊断脚本：
+  - `proxy/scripts/replay-chat-stream-summary.ts`
+  - 用于 `BODY_TOO_LARGE` 场景下从 `body_summary` 合成最小上下文回放 `chat-stream`
+  - 适合验证这类问题：
+    - 上游只输出 “Let me directly view the key files...”
+    - 前一轮 `codebase-retrieval` 返回 `Found 0 files`
+    - 需要确认 proxy 是否会自动恢复成 `view`
 
 - 客户端原本会按 agent 的 `capabilities` 决定后续可用工具和权限。
 - Proxy 把 `capabilities` 吞掉后，客户端看到的就是一个“没有能力声明”的 agent。
